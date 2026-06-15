@@ -49,3 +49,7 @@ CMakeFiles/*
 # Ai helperfilers
 **/[cC]laude.[mM][dD]
 **/CLAUDE.[mM][dD]
+
+# Merged-fork local build artifacts
+/dist-core/
+/build-merged-fork.bat

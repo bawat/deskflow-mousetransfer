@@ -3,6 +3,12 @@
  * SPDX-FileCopyrightText: (C) 2012 - 2016 Symless Ltd.
  * SPDX-FileCopyrightText: (C) 2011 Chris Schoeneman
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
+ *
+ * Modified 2026-06-15 (Merged-fork): added a "local-inject passthrough" — an
+ * injected mouse event carrying kDeskflowLocalInjectSignature in dwExtraInfo is
+ * delivered to the local OS and NOT relayed (see mouseLLHook below). This file
+ * remains licensed GPL-2.0-only WITH LicenseRef-OpenSSL-Exception. See
+ * MODIFICATIONS.md in the repository root for details.
  */
 
 #include "platform/MSWindowsHook.h"
@@ -15,6 +21,21 @@
 #endif
 
 static const char *g_name = "dfwhook";
+
+// --- Merged-fork extension: local-inject passthrough -------------------------
+//
+// Normally, injected input on the PRIMARY while relaying (cursor on a client) is
+// eaten locally and forwarded to the active client, exactly like real input — so
+// a process on the server cannot deliver a synthetic event to the server's OWN
+// OS once the cursor has left. This is a general "inject local input WITHOUT
+// relaying it" facility for automation built on top of Deskflow: an injector
+// tags its SendInput with this signature in dwExtraInfo, and the hook then passes
+// that one event straight through to the local OS and does not relay it.
+//
+// Deskflow's own fake input never uses this value, so it changes no stock
+// behaviour. The Merged wrapper uses it to end a drag-and-drop on the SOURCE
+// screen after the cursor has crossed, without the release reaching the client.
+static const ULONG_PTR kDeskflowLocalInjectSignature = 0x0DF10CA1; // "DF local"
 
 static DWORD g_processID = 0;
 static DWORD g_threadID = 0;
@@ -583,6 +604,10 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
     MSLLHOOKSTRUCT *info = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
 
     bool const injected = info->flags & LLMHF_INJECTED;
+    // Merged-fork: our own tagged injection goes to the local OS, not the client.
+    if (injected && info->dwExtraInfo == kDeskflowLocalInjectSignature) {
+      return CallNextHookEx(g_mouseLL, code, wParam, lParam);
+    }
     if (!g_isPrimary && injected) {
       return CallNextHookEx(g_mouseLL, code, wParam, lParam);
     }
