@@ -46,10 +46,16 @@ outbound** connection to a chosen local adapter.
   listen socket binds to (`ServerApp::parseArgs`). The **client** had no
   local-bind option — its outbound socket's source address followed OS routing.
 - In `TCPSocket::connect()`, when `core/interface` is non-empty, the socket is
-  bound to that address (with an ephemeral local port, `NetworkAddress(iface, 0)`)
-  before `connectSocket`. Only the client calls `connect()` (the server accepts
-  already-connected sockets and listens via `TCPListenSocket`), so this affects
-  *only* a client's egress and never the server.
+  bound to that address (with an ephemeral local port) before `connectSocket`.
+  Only the client calls `connect()` (the server accepts already-connected sockets
+  and listens via `TCPListenSocket`), so this affects *only* a client's egress and
+  never the server.
+- Address-family match: Deskflow's sockets are dual-stack (`newSocket` clears
+  `IPV6_V6ONLY`), so the socket family equals the destination's. A literal IPv4
+  interface resolves to `AF_INET`, but the socket is frequently `AF_INET6`, and a
+  mismatched `bind()` fails with `WSAEINVAL`. So the patch binds an address of the
+  SAME family as the connect target — trying the plain interface IP first, then its
+  IPv4-mapped IPv6 form (`::ffff:<ip>`).
 - A bind failure is logged and ignored (connection proceeds via the default
   route) so a stale/incorrect selection can't break connectivity.
 

@@ -263,14 +263,33 @@ void TCPSocket::connect(const NetworkAddress &addr)
     // makes a client's traffic leave via the chosen adapter without affecting the server. A bind
     // failure degrades to default OS routing (warn, don't abort) so a stale/wrong selection never
     // breaks connectivity. Stock behaviour is unchanged when core/interface is empty. See MODIFICATIONS.md.
+    //
+    // Family match is the subtle part: Deskflow's sockets are dual-stack (newSocket clears
+    // IPV6_V6ONLY), so the socket family equals the DESTINATION's (the addr passed to connect).
+    // A literal IPv4 interface resolves to AF_INET, but the socket is frequently AF_INET6 — binding
+    // the mismatched family fails with WSAEINVAL. So we bind an address of the SAME family as addr:
+    // try the plain interface IP first, then its IPv4-mapped IPv6 form (::ffff:<ip>).
     if (const auto iface = Settings::value(Settings::Core::Interface).toString(); !iface.isEmpty()) {
-      try {
-        NetworkAddress local(iface.toStdString(), 0);
-        local.resolve();
-        ARCH->bindSocket(m_socket, local.getAddress());
-        LOG_DEBUG("bound client socket to egress interface %s", qPrintable(iface));
-      } catch (const std::exception &e) {
-        LOG_WARN("could not bind client to interface %s: %s (using default route)", qPrintable(iface), e.what());
+      const auto destFamily = ARCH->getAddrFamily(addr.getAddress());
+      const std::string candidates[] = {iface.toStdString(), "::ffff:" + iface.toStdString()};
+      bool bound = false;
+      for (const auto &host : candidates) {
+        try {
+          NetworkAddress local(host, 0);
+          local.resolve();
+          if (ARCH->getAddrFamily(local.getAddress()) != destFamily) {
+            continue; // wrong family for this socket — try the next candidate form
+          }
+          ARCH->bindSocket(m_socket, local.getAddress());
+          LOG_DEBUG("bound client socket egress to %s", host.c_str());
+          bound = true;
+          break;
+        } catch (const std::exception &e) {
+          LOG_DEBUG("egress bind attempt to %s failed: %s", host.c_str(), e.what());
+        }
+      }
+      if (!bound) {
+        LOG_WARN("could not bind client egress to interface %s; using default route", qPrintable(iface));
       }
     }
 
