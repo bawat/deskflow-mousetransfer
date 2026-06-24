@@ -11,6 +11,7 @@
 #include "arch/ArchException.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "common/Settings.h" // MouseTransfer fork patch: read core/interface for the client egress bind
 #include "mt/Lock.h"
 #include "net/NetworkAddress.h"
 #include "net/SocketException.h"
@@ -254,6 +255,23 @@ void TCPSocket::connect(const NetworkAddress &addr)
     if (m_socket == nullptr || m_connected) {
       sendConnectionFailedEvent("busy");
       return;
+    }
+
+    // MouseTransfer fork patch: pin the client's outbound (egress) interface. Stock Deskflow
+    // honours core/interface only on the SERVER (its listen bind); only the client ever calls
+    // connect(), so binding the socket here — to that same key, with an ephemeral local port —
+    // makes a client's traffic leave via the chosen adapter without affecting the server. A bind
+    // failure degrades to default OS routing (warn, don't abort) so a stale/wrong selection never
+    // breaks connectivity. Stock behaviour is unchanged when core/interface is empty. See MODIFICATIONS.md.
+    if (const auto iface = Settings::value(Settings::Core::Interface).toString(); !iface.isEmpty()) {
+      try {
+        NetworkAddress local(iface.toStdString(), 0);
+        local.resolve();
+        ARCH->bindSocket(m_socket, local.getAddress());
+        LOG_DEBUG("bound client socket to egress interface %s", qPrintable(iface));
+      } catch (const std::exception &e) {
+        LOG_WARN("could not bind client to interface %s: %s (using default route)", qPrintable(iface), e.what());
+      }
     }
 
     try {
