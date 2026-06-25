@@ -460,8 +460,18 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     if (m_enableClipboard) {
       // send the clipboard data to new active screen
       for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        const std::string marshalled = m_clipboards[id].m_clipboard.marshall();
         // Hackity hackity hack
-        if (m_clipboards[id].m_clipboard.marshall().size() > (m_maximumClipboardSize * 1024)) {
+        if (marshalled.size() > (m_maximumClipboardSize * 1024)) {
+          continue;
+        }
+        // MouseTransfer: don't push a clipboard that marshals to NOTHING onto the new
+        // active screen. Deskflow only represents text/HTML/bitmap, so a file (CF_HDROP)
+        // copy marshals to NO formats; pushing that empties the active screen's clipboard,
+        // wiping the copied file and greying out Paste. NB a zero-format clipboard marshals
+        // to exactly 4 bytes (a uint32 format-count of 0), NOT to an empty string — so test
+        // size <= 4, not .empty(). File copies are synced out-of-band over SMB.
+        if (marshalled.size() <= 4) {
           continue;
         }
         m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
@@ -1453,6 +1463,24 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
   if (data == clipboard.m_clipboardData) {
     LOG_DEBUG("ignored screen \"%s\" update of clipboard %d (unchanged)", clipboard.m_clipboardOwner.c_str(), id);
     return;
+  }
+
+  // MouseTransfer: a clipboard that marshals to NOTHING (no text/HTML/bitmap — e.g. a
+  // file/CF_HDROP copy Deskflow can't represent) must not be PUSHED to the active screen
+  // (that would empty its clipboard, wiping a copied file and greying out Paste). But we
+  // DO update the server's stored copy to empty: otherwise the stored value keeps STALE
+  // text and a later screen-switch re-pushes it over a peer's freshly-synced file (placed
+  // out-of-band on that screen by the wrapper's clipset), wiping the cross-machine paste.
+  // Clearing it means onScreenSwitch (which skips empty) has nothing stale to push. File
+  // copies sync out-of-band over SMB; this also neutralises the "resending clipboard
+  // data" path above when the wrapper's clipset changes the primary's clipboard.
+  if (data.size() <= 4) {
+    LOG_DEBUG("screen \"%s\" cleared clipboard %d (no syncable data); not propagating", clipboard.m_clipboardOwner.c_str(), id);
+    clipboard.m_clipboardData = data; // drop any stale stored text so it isn't re-pushed
+    for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
+      index->second->setClipboardDirty(id, index->second != sender);
+    }
+    return; // no setClipboard() push — pushing empty wipes; onScreenSwitch skips empty too
   }
 
   // got new data

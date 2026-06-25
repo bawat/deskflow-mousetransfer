@@ -323,12 +323,16 @@ bool MSWindowsScreen::setClipboard(ClipboardID, const IClipboard *src)
     // save clipboard data
     return Clipboard::copy(&dst, src);
   } else {
-    // assert clipboard ownership
-    if (!dst.open(0)) {
-      return false;
-    }
-    dst.empty();
-    dst.close();
+    // MouseTransfer: NO-OP. Deskflow normally blanks the local clipboard here to "assert
+    // ownership" so it can serve the remote owner's data via delayed render. But (a) it
+    // only represents text/HTML/bitmap (it can't even see a file/CF_HDROP copy — the
+    // LocalSystem core reads CF_HDROP as absent), and (b) the MouseTransfer wrapper's file
+    // sync drives a rapid clipboard grab/resend storm; emptying here races that storm and
+    // destroys the user's freshly-copied files, greying out Paste. The real remote
+    // clipboard data still arrives via the (src != nullptr) path on screen switch /
+    // clipboard change, so text/image sync is unaffected — we simply never blank the local
+    // clipboard just to assert ownership. File copies sync out-of-band over SMB.
+    (void)dst;
     return true;
   }
 }

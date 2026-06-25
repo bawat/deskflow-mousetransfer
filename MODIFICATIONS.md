@@ -35,6 +35,39 @@ The wrapper communicates with this core only as a child process (command-line
 arguments, a config file, and standard streams) and as OS-level input events; it
 does not link against or include any Deskflow source.
 
+### Clipboard coexistence with out-of-band file sync (2026-06-25)
+
+**Files:** `src/lib/platform/MSWindowsScreen.cpp`, `src/lib/server/Server.cpp`
+
+The "Merged"/MouseTransfer wrapper syncs **files** across machines out-of-band
+(over SMB, placing CF_HDROP on the peer's clipboard itself). Deskflow's built-in
+clipboard sync only represents **text/HTML/bitmap** — it cannot represent a file
+(CF_HDROP) copy, which marshals to *zero formats*. Left unchanged, Deskflow's
+clipboard-ownership protocol destroyed file copies three ways; these changes make
+the two clipboard mechanisms coexist. Text/HTML/bitmap sync is unchanged.
+
+1. **`MSWindowsScreen::setClipboard(id, nullptr)` is now a no-op.** Deskflow
+   blanked the local clipboard here to "assert ownership" (so it could serve a
+   remote owner's data via delayed render). That empty destroyed a user's
+   freshly-copied files when a remote clipboard *grab* arrived. The real remote
+   data still arrives via the `src != nullptr` path, so nothing is lost; we just
+   never blank the local clipboard purely to assert ownership.
+
+2. **`Server::onScreenSwitch` skips pushing a clipboard with no formats.** A
+   zero-format clipboard marshals to exactly **4 bytes** (a `uint32` format-count
+   of 0), *not* an empty string — so the test is `marshalled.size() <= 4`.
+   Pushing such a clipboard onto the newly-active screen would empty its clipboard
+   and wipe a file the wrapper had just synced there.
+
+3. **`Server::onClipboardChanged` clears (does not propagate) a zero-format
+   clipboard.** Same `size() <= 4` test. The stored copy is set to the empty value
+   (rather than left stale) so a later screen-switch does not re-push *stale text*
+   over a peer's freshly-synced file; the push to the active screen is skipped.
+
+The core never needs to *see* the file formats (the LocalSystem core reads
+CF_HDROP as absent anyway); all three changes act on Deskflow's own
+text/HTML/bitmap marshalling, so they are robust to that blindness.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +
