@@ -153,6 +153,32 @@ event, so it adds nothing to the input hot path. Stock Deskflow sets no such cli
 communicates purely via OS state (`ClipCursor`); it does not link against or modify any
 Deskflow interface.
 
+### Windows 8.0 / 8.1 compatibility (2026-06-26)
+
+**No source change to the fork.** This is a *deployment* note: the `deskflow-core.exe` this
+fork builds (VS2022 + Qt 6.8.1 + OpenSSL/vcpkg) runs on Windows 8.0 and 8.1 (x64) once two
+runtime-dependency problems are handled. Verified end-to-end on a real Windows 8.0 box
+(6.2.9200): server binds + listens and client runs its reconnect loop, both stay up.
+
+The wall was found by diffing every import of `deskflow-core.exe`, `Qt6Core.dll`,
+`msvcp140*.dll`, `vcruntime140*.dll`, `concrt140.dll`, and the redist `ucrtbase.dll` against
+the *actual* exports of a live Win8.0 `kernel32`/`kernelbase`/`user32`/etc. The core itself,
+the MSVC runtime, and the 10.0.19041 redist UCRT all have **zero** Win8-missing imports. The
+sole blocker is a single function:
+
+- `Qt6Core.dll` statically imports `kernel32!SetThreadDescription` (Windows 10 1607+ only; Qt
+  6.5+ uses it to name worker threads for debuggers, purely cosmetic). On Win8 the loader
+  aborts with `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139) before `main()`.
+- Plus the Universal CRT is absent on a fresh Win8 (it is built into Win10), giving the earlier
+  `STATUS_DLL_NOT_FOUND` (0xC0000135) until the UCRT is deployed app-locally.
+
+Fix (no rebuild): `win8/patch-qt6core-win8.ps1` rewrites that one import-by-name entry in a
+*copy* of the shipped `Qt6Core.dll` to call `kernel32!GetThreadId` instead (same thread-HANDLE
+first arg, return ignored by Qt, harmless on x64 - thread naming silently no-ops), and ship the
+UCRT + MSVC runtime app-locally. Full instructions and the exact file list are in
+`win8/README.md`. The clean no-patch alternative is to build the core against Qt 6.2 LTS (the
+last Qt that supports 8.1 and resolves `SetThreadDescription` dynamically).
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +
