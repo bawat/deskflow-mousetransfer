@@ -32,6 +32,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>  // MouseTransfer: switch-request file poll
+#include <iterator> // MouseTransfer: istreambuf_iterator
 
 using namespace deskflow::server;
 
@@ -138,6 +140,25 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
     LOG_NOTE("default screen lock is on, locking cursor to screen");
     m_lockedToScreen = true;
   }
+
+  // MouseTransfer: start polling the wrapper's switch-request file (see the member comment). The path
+  // comes from MOUSETRANSFER_SWITCHFILE, else "switchreq" relative to the CWD (the launcher sets the
+  // core's CWD to its bundle dir, where the wrapper writes the file). Seed m_switchReqLast from the
+  // current contents so a stale request from a previous session doesn't fire on startup.
+  if (const char *env = std::getenv("MOUSETRANSFER_SWITCHFILE"); env != nullptr && *env != '\0') {
+    m_switchReqFile = env;
+  } else {
+    m_switchReqFile = "switchreq";
+  }
+  {
+    std::ifstream in(m_switchReqFile);
+    if (in) {
+      std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      m_switchReqLast = content;
+    }
+  }
+  m_switchReqTimer = m_events->newTimer(0.15, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_switchReqTimer, [this](const auto &) { checkSwitchRequest(); });
 }
 
 Server::~Server()
@@ -157,6 +178,11 @@ Server::~Server()
   m_events->removeHandler(PrimaryScreenFakeInputBegin, m_inputFilter);
   m_events->removeHandler(PrimaryScreenFakeInputEnd, m_inputFilter);
   m_events->removeHandler(Timer, this);
+  if (m_switchReqTimer != nullptr) { // MouseTransfer: tear down the switch-request poll timer
+    m_events->removeHandler(Timer, m_switchReqTimer);
+    m_events->deleteTimer(m_switchReqTimer);
+    m_switchReqTimer = nullptr;
+  }
   stopSwitch();
 
   try {
@@ -1320,22 +1346,50 @@ void Server::handleClientCloseTimeout(BaseClientProxy *client)
 void Server::handleSwitchToScreenEvent(const Event &event)
 {
   const auto *info = static_cast<SwitchToScreenInfo *>(event.getData());
+  switchToScreenByName(info->m_screen);
+}
 
-  ClientList::const_iterator index = m_clients.find(info->m_screen);
+// MouseTransfer: centre-switch the cursor to the named screen. Lands it in the CENTRE of the target
+// rather than at its last-known cursor position (jumpToScreen -> getJumpCursorPos), so a "jump cursor
+// to this computer" drops the cursor clearly onto the target — both onto a client and back to the
+// primary — instead of at a seam edge (which feels like it didn't move) or at top-left. Shared by the
+// explicit switchToScreen input-filter action and the switch-request file poll. Ordinary edge
+// crossings take a different path, so their proportional edge mapping is untouched.
+void Server::switchToScreenByName(const std::string &name)
+{
+  ClientList::const_iterator index = m_clients.find(name);
   if (index == m_clients.end()) {
-    LOG_DEBUG1("screen \"%s\" not active", info->m_screen.c_str());
-  } else {
-    // MouseTransfer: land an explicit switchToScreen in the CENTRE of the target screen
-    // rather than at its last-known cursor position (jumpToScreen -> getJumpCursorPos), so a
-    // "jump cursor to this computer" drops the cursor clearly onto the target — both onto a
-    // client and back to the primary — instead of at a seam edge (which feels like it didn't
-    // move) or at top-left. Only EXPLICIT switchToScreen actions reach here; ordinary edge
-    // crossings take a different path, so their proportional edge mapping is untouched.
-    BaseClientProxy *dst = index->second;
-    int32_t dx, dy, dw, dh;
-    dst->getShape(dx, dy, dw, dh);
-    m_active->setJumpCursorPos(m_x, m_y); // remember where we left, as jumpToScreen would
-    switchScreen(dst, dx + dw / 2, dy + dh / 2, false);
+    LOG_DEBUG1("screen \"%s\" not active", name.c_str());
+    return;
+  }
+  BaseClientProxy *dst = index->second;
+  int32_t dx, dy, dw, dh;
+  dst->getShape(dx, dy, dw, dh);
+  m_active->setJumpCursorPos(m_x, m_y); // remember where we left, as jumpToScreen would
+  switchScreen(dst, dx + dw / 2, dy + dh / 2, false);
+}
+
+// MouseTransfer: poll the wrapper's switch-request file. The wrapper writes "<screen> <nonce>"; on a
+// content change we centre-switch to that screen. Reliable regardless of where the cursor currently
+// is (unlike an injected switchToScreen hotkey, which the input filter ignores while the cursor is on
+// a client — so it can't pull the cursor back to the server). Fires from a 150 ms periodic timer.
+void Server::checkSwitchRequest()
+{
+  std::ifstream in(m_switchReqFile);
+  if (!in) {
+    return;
+  }
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (content.empty() || content == m_switchReqLast) {
+    return;
+  }
+  m_switchReqLast = content;
+  // The screen name is the first whitespace-delimited token; the rest is the change-forcing nonce.
+  std::string::size_type end = content.find_first_of(" \t\r\n");
+  std::string name = (end == std::string::npos) ? content : content.substr(0, end);
+  if (!name.empty()) {
+    LOG_DEBUG1("switch-request file asks to jump to \"%s\"", name.c_str());
+    switchToScreenByName(name);
   }
 }
 

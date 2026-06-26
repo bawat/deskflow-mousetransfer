@@ -68,27 +68,33 @@ The core never needs to *see* the file formats (the LocalSystem core reads
 CF_HDROP as absent anyway); all three changes act on Deskflow's own
 text/HTML/bitmap marshalling, so they are robust to that blindness.
 
-### Centre the cursor on an explicit switchToScreen (2026-06-26)
+### Cursor jump: centred switch + a switch-request file poll (2026-06-26)
 
-**Files:** `src/lib/server/Server.cpp`
+**Files:** `src/lib/server/Server.{h,cpp}`
 
-`Server::handleSwitchToScreenEvent` (the handler for an explicit `switchToScreen(name)`
-input-filter action) now drops the cursor in the **centre** of the target screen rather
-than at the target's last-known cursor position (the stock behaviour, via
-`jumpToScreen` -> `getJumpCursorPos`, which lands the cursor at whatever edge it last
-left from — or top-left if never visited).
+Two related changes powering the MouseTransfer wrapper's "jump cursor to this computer"
+feature (move the shared cursor onto a chosen screen from a tray item / hotkey):
 
-The MouseTransfer wrapper uses this for its "jump cursor to this computer" feature: it
-synthesises a `keystroke(F13..F24) = switchToScreen(<screen>)` rule it writes into the
-server layout. With the stock behaviour, a jump onto a client landed at the client's far
-edge / top-left, and a jump back to the primary landed at the **seam edge** (so it looked
-like the cursor hadn't moved). Centring makes the jump land clearly on the target in both
-directions.
+1. **Centred switch.** A new `Server::switchToScreenByName(name)` drops the cursor in the
+   **centre** of the target screen rather than at its last-known cursor position (stock
+   `jumpToScreen` -> `getJumpCursorPos`, which lands at whatever edge it last left from, or
+   top-left if never visited). `handleSwitchToScreenEvent` (the explicit `switchToScreen`
+   input-filter action) now calls it. Without this, a jump onto a client landed at the far
+   edge/top-left and a jump back to the primary landed at the **seam edge** (looking like
+   nothing moved).
 
-Scope is deliberately narrow: only **explicit** `switchToScreen` actions reach this
-handler. Ordinary edge crossings (and `switchInDirection`) use different paths, so their
-proportional edge mapping is unaffected. Stock Deskflow with no `switchToScreen` hotkey
-never reaches the changed branch.
+2. **Switch-request file poll.** A 150 ms periodic timer polls a wrapper-written file
+   (`$MOUSETRANSFER_SWITCHFILE`, else `switchreq` relative to the core's CWD — the launcher
+   sets the core's CWD to its bundle dir). The wrapper writes `"<screen> <nonce>"`; on a
+   content change the server `switchToScreenByName`s to it. This is the RELIABLE trigger:
+   an injected `switchToScreen` hotkey is **not processed by the input filter while the
+   cursor is on a client** (verified — the injected key never reaches the filter in relay
+   mode), so it cannot pull the cursor back to the server. The file poll calls the switch
+   directly on the server's event thread, so it works in both directions.
+
+Scope is narrow: the centred switch only affects **explicit** `switchToScreen` actions and
+the file poll (ordinary edge crossings and `switchInDirection` are untouched), and the file
+poll is inert unless the wrapper writes the file. Stock Deskflow never reaches either.
 
 ### Respect an OS cursor-clip as a lock-to-screen (2026-06-25)
 

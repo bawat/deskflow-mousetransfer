@@ -317,6 +317,10 @@ private:
   void handleClientDisconnected(BaseClientProxy *client);
   void handleClientCloseTimeout(BaseClientProxy *client);
   void handleSwitchToScreenEvent(const Event &event);
+  // MouseTransfer: centre-switch the cursor to a screen by name (shared by the switchToScreen input
+  // filter action and the switch-request file poll); checkSwitchRequest reads the wrapper file.
+  void switchToScreenByName(const std::string &name);
+  void checkSwitchRequest();
   void handleSwitchInDirectionEvent(const Event &event);
   void handleToggleScreenEvent(const Event &);
   void handleKeyboardBroadcastEvent(const Event &event);
@@ -389,6 +393,15 @@ private:
   BaseClientProxy *m_switchScreen = nullptr;
   double m_switchWaitDelay = 0.0;
   EventQueueTimer *m_switchWaitTimer = nullptr;
+
+  // MouseTransfer: poll a wrapper-written "switch request" file so an external process can move the
+  // shared cursor to a named screen (the "jump cursor to this computer" feature). The wrapper writes
+  // "<screen> <nonce>"; when the content changes we centre-switch to that screen. This is the
+  // RELIABLE trigger: an injected switchToScreen hotkey is NOT processed by the input filter while
+  // the cursor is on a client, so it can't pull the cursor back to the server.
+  EventQueueTimer *m_switchReqTimer = nullptr;
+  std::string m_switchReqFile;
+  std::string m_switchReqLast;
 
   // delay for double-tap screen switching
   double m_switchTwoTapDelay = 0.0;
