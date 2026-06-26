@@ -159,6 +159,24 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   }
   m_switchReqTimer = m_events->newTimer(0.15, nullptr);
   m_events->addHandler(EventTypes::Timer, m_switchReqTimer, [this](const auto &) { checkSwitchRequest(); });
+
+  // MouseTransfer: start polling the wrapper's layout-reload-request file (see the member comment).
+  // Seed m_reloadReqLast from the current contents so a stale request doesn't fire a reload on startup
+  // (the layout is already loaded fresh at this point).
+  if (const char *env = std::getenv("MOUSETRANSFER_RELOADFILE"); env != nullptr && *env != '\0') {
+    m_reloadReqFile = env;
+  } else {
+    m_reloadReqFile = "layoutreload";
+  }
+  {
+    std::ifstream in(m_reloadReqFile);
+    if (in) {
+      std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      m_reloadReqLast = content;
+    }
+  }
+  m_reloadReqTimer = m_events->newTimer(0.2, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_reloadReqTimer, [this](const auto &) { checkReloadRequest(); });
 }
 
 Server::~Server()
@@ -182,6 +200,11 @@ Server::~Server()
     m_events->removeHandler(Timer, m_switchReqTimer);
     m_events->deleteTimer(m_switchReqTimer);
     m_switchReqTimer = nullptr;
+  }
+  if (m_reloadReqTimer != nullptr) { // MouseTransfer: tear down the layout-reload poll timer
+    m_events->removeHandler(Timer, m_reloadReqTimer);
+    m_events->deleteTimer(m_reloadReqTimer);
+    m_reloadReqTimer = nullptr;
   }
   stopSwitch();
 
@@ -1391,6 +1414,25 @@ void Server::checkSwitchRequest()
     LOG_DEBUG1("switch-request file asks to jump to \"%s\"", name.c_str());
     switchToScreenByName(name);
   }
+}
+
+void Server::checkReloadRequest()
+{
+  // MouseTransfer: when the wrapper bumps the layout-reload-request file, re-read the external layout
+  // and hot-apply it. We raise ServerAppReloadConfig (the same event SIGHUP uses) rather than calling
+  // setConfig directly, because re-loading the file lives in ServerApp (it owns the config path). The
+  // hot apply (Server::setConfig) keeps connected clients up — only the edge mapping changes.
+  std::ifstream in(m_reloadReqFile);
+  if (!in) {
+    return;
+  }
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (content.empty() || content == m_reloadReqLast) {
+    return;
+  }
+  m_reloadReqLast = content;
+  LOG_DEBUG1("layout-reload-request file changed — reloading external layout");
+  m_events->addEvent(Event(EventTypes::ServerAppReloadConfig, m_events->getSystemTarget()));
 }
 
 void Server::handleSwitchInDirectionEvent(const Event &event)

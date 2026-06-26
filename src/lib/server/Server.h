@@ -321,6 +321,9 @@ private:
   // filter action and the switch-request file poll); checkSwitchRequest reads the wrapper file.
   void switchToScreenByName(const std::string &name);
   void checkSwitchRequest();
+  // MouseTransfer: poll a wrapper-written "layout reload request" file so the wrapper can apply an
+  // edited external layout (changed edge-transition ranges) to the RUNNING server with no restart.
+  void checkReloadRequest();
   void handleSwitchInDirectionEvent(const Event &event);
   void handleToggleScreenEvent(const Event &);
   void handleKeyboardBroadcastEvent(const Event &event);
@@ -402,6 +405,16 @@ private:
   EventQueueTimer *m_switchReqTimer = nullptr;
   std::string m_switchReqFile;
   std::string m_switchReqLast;
+
+  // MouseTransfer: poll a wrapper-written "layout reload request" file (a "<nonce>" the wrapper bumps
+  // after rewriting the external layout). On a change we raise ServerAppReloadConfig, which re-reads
+  // the external layout file and hot-applies it via setConfig() — so an edited edge-transition range
+  // takes effect on the running server with NO restart (clients stay connected). The path comes from
+  // MOUSETRANSFER_RELOADFILE, else "layoutreload" relative to the core's CWD (its bundle dir), the
+  // same convention as the switch-request file.
+  EventQueueTimer *m_reloadReqTimer = nullptr;
+  std::string m_reloadReqFile;
+  std::string m_reloadReqLast;
 
   // delay for double-tap screen switching
   double m_switchTwoTapDelay = 0.0;

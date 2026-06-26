@@ -96,6 +96,28 @@ Scope is narrow: the centred switch only affects **explicit** `switchToScreen` a
 the file poll (ordinary edge crossings and `switchInDirection` are untouched), and the file
 poll is inert unless the wrapper writes the file. Stock Deskflow never reaches either.
 
+### Live layout reload: a reload-request file poll (2026-06-26)
+
+**Files:** `src/lib/server/Server.{h,cpp}`
+
+Powers the MouseTransfer wrapper's **configurable transition-area** feature (drag the
+slice of a screen edge that crosses to a given peer, and where it lands on that peer; see
+the wrapper's `TRANSITION-AREAS-DESIGN.md`). Editing a transition range rewrites the
+external server layout, and this lets the **running** server pick that up with **no
+restart** so the mapping is testable while you drag it (clients stay connected).
+
+A second periodic timer (200 ms), modelled on the switch-request poll above, watches a
+wrapper-written nonce file (`$MOUSETRANSFER_RELOADFILE`, else `layoutreload` relative to
+the core's CWD). On a content change it raises `EventTypes::ServerAppReloadConfig` — the
+**same** event the SIGHUP handler raises — which re-reads the external layout file and
+hot-applies it via the existing `ServerApp::reloadConfig()` -> `Server::setConfig()` path.
+No new apply logic: `Config::read()` does `*this = tmp` (a clean full replace of the live
+config the crossing logic reads), and `setConfig()` reconfigures the primary screen and
+re-sends options to connected clients.
+
+Scope is narrow and inert unless the wrapper writes the file; stock Deskflow never does, so
+`m_reloadReqLast` stays seeded and `checkReloadRequest()` returns early every tick.
+
 ### Respect an OS cursor-clip as a lock-to-screen (2026-06-25)
 
 **Files:** `src/lib/server/Server.cpp`, `src/lib/server/PrimaryClient.{h,cpp}`,
