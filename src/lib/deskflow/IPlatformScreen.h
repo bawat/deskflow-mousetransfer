@@ -145,6 +145,19 @@ public:
   */
   virtual bool isPrimary() const = 0;
 
+  //! Test if the OS cursor is clipped to a sub-region (Merged-fork)
+  /*!
+  Return true iff the OS cursor is confined (e.g. Win32 ClipCursor) to a proper
+  sub-region of the virtual desktop. The default is false; only platforms that can
+  observe such a clip override it. Used to honour an external "lock to this screen"
+  signal (the MouseTransfer wrapper sets it while a focused app is fullscreen). See
+  MODIFICATIONS.md.
+  */
+  virtual bool isCursorClippedToSubRegion() const
+  {
+    return false;
+  }
+
   //@}
   // IKeyState overrides
   void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) override = 0;

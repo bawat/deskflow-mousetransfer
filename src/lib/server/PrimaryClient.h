@@ -96,6 +96,14 @@ public:
   */
   bool isLockedToScreen() const;
 
+  //! Get OS cursor-clip lock state (Merged-fork)
+  /*!
+  Returns true if the OS cursor is confined (ClipCursor) to a sub-region of the
+  virtual desktop, which the MouseTransfer wrapper uses to pin the cursor to this
+  screen while a focused app is fullscreen. See MODIFICATIONS.md.
+  */
+  bool isCursorClippedToSubRegion() const;
+
   //@}
 
   // FIXME -- these probably belong on IScreen

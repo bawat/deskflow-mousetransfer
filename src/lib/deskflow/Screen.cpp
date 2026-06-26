@@ -318,6 +318,11 @@ bool Screen::isLockedToScreen() const
   return false;
 }
 
+bool Screen::isCursorClippedToSubRegion() const
+{
+  return m_screen->isCursorClippedToSubRegion();
+}
+
 int32_t Screen::getJumpZoneSize() const
 {
   if (!m_isPrimary) {

@@ -90,6 +90,7 @@ public:
   void fakeInputEnd() override;
   int32_t getJumpZoneSize() const override;
   bool isAnyMouseButtonDown(uint32_t &buttonID) const override;
+  bool isCursorClippedToSubRegion() const override;
   void getCursorCenter(int32_t &x, int32_t &y) const override;
 
   // ISecondaryScreen overrides

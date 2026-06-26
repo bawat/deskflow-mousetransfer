@@ -68,6 +68,41 @@ The core never needs to *see* the file formats (the LocalSystem core reads
 CF_HDROP as absent anyway); all three changes act on Deskflow's own
 text/HTML/bitmap marshalling, so they are robust to that blindness.
 
+### Respect an OS cursor-clip as a lock-to-screen (2026-06-25)
+
+**Files:** `src/lib/server/Server.cpp`, `src/lib/server/PrimaryClient.{h,cpp}`,
+`src/lib/deskflow/Screen.{h,cpp}`, `src/lib/deskflow/IPlatformScreen.h`,
+`src/lib/platform/MSWindowsScreen.{h,cpp}`
+
+Lets an external process pin the cursor to the current Deskflow screen by simply
+confining the OS cursor with `ClipCursor`. The MouseTransfer wrapper uses this for its
+"lock cursor to screen while a focused app is fullscreen" feature. Without it the
+wrapper's `ClipCursor` cannot stop a switch: Deskflow detects the seam crossing from the
+**absolute** cursor position its low-level hook reports (and that hook clamps any
+out-of-screen position back onto the screen *edge*, inside the 1px jump zone), and when
+`disableLockToScreen = true` (the wrapper's seamless-drag mode) every native lock path is
+short-circuited off.
+
+- A new platform query `isCursorClippedToSubRegion()` is added to `IPlatformScreen` with
+  a **default `return false`** (so non-Windows screens need no change) and overridden in
+  `MSWindowsScreen` to return true when `GetClipCursor` reports the cursor confined to a
+  *proper sub-region* of the virtual desktop (1px slack, so an unconfined clip — which
+  equals the full virtual screen — never counts). It is forwarded through
+  `deskflow::Screen` and `PrimaryClient` exactly like the existing `isLockedToScreen()`.
+- `Server::isLockedToScreen()` consults it **first** (before the `disableLockToScreen`
+  short-circuit) and returns true when a sub-region clip is in effect. Because the whole
+  switch machinery already gates on `isLockedToScreen()` (via `isSwitchOkay()`), this
+  suppresses screen switches in **both** directions — cursor-on-primary→secondary *and*
+  cursor-on-secondary→primary — so it works whether the fullscreen machine is the server
+  or (told over the wrapper's control channel to set its own clip) the server acting for
+  a fullscreen client.
+
+It is only consulted when a switch is being considered (near an edge), not on every mouse
+event, so it adds nothing to the input hot path. Stock Deskflow sets no such clip, so
+`GetClipCursor` equals the full virtual screen and this is always a no-op. The wrapper
+communicates purely via OS state (`ClipCursor`); it does not link against or modify any
+Deskflow interface.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +

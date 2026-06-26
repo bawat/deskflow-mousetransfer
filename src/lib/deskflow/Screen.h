@@ -237,6 +237,13 @@ public:
   */
   bool isLockedToScreen() const;
 
+  //! Get OS cursor-clip lock state (Merged-fork)
+  /*!
+  Returns true if the OS cursor is confined (ClipCursor) to a sub-region of the
+  virtual desktop. See MODIFICATIONS.md.
+  */
+  bool isCursorClippedToSubRegion() const;
+
   //! Get jump zone size
   /*!
   Return the jump zone size, the size of the regions on the edges of

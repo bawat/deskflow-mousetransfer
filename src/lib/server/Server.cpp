@@ -330,6 +330,16 @@ bool Server::isLockedToScreenServer() const
 
 bool Server::isLockedToScreen() const
 {
+  // Merged-fork: an external process (the MouseTransfer wrapper, while a focused app is fullscreen)
+  // can pin the cursor to the current screen simply by confining the OS cursor with ClipCursor. We
+  // honour that as a lock-to-screen even when disableLockToScreen is set (the wrapper's seamless-drag
+  // mode), and BEFORE that short-circuit. This is the only lock signal that survives disableLockToScreen,
+  // and it suppresses BOTH primary->secondary and secondary->primary switches (isSwitchOkay reads this).
+  // See MODIFICATIONS.md.
+  if (m_primaryClient->isCursorClippedToSubRegion()) {
+    return true;
+  }
+
   if (m_disableLockToScreen) {
     return false;
   }

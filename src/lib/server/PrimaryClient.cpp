@@ -69,6 +69,11 @@ bool PrimaryClient::isLockedToScreen() const
   return m_screen->isLockedToScreen();
 }
 
+bool PrimaryClient::isCursorClippedToSubRegion() const
+{
+  return m_screen->isCursorClippedToSubRegion();
+}
+
 void *PrimaryClient::getEventTarget() const
 {
   return m_screen->getEventTarget();

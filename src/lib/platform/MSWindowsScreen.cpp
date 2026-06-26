@@ -685,6 +685,25 @@ bool MSWindowsScreen::isAnyMouseButtonDown(uint32_t &buttonID) const
   return false;
 }
 
+bool MSWindowsScreen::isCursorClippedToSubRegion() const
+{
+  // Merged-fork: report whether the OS cursor is confined (ClipCursor) to a PROPER sub-region of
+  // the virtual desktop. The MouseTransfer wrapper does this while a focused app is fullscreen, as a
+  // "lock the cursor to this screen" signal. Unconfined, GetClipCursor returns the full virtual
+  // screen bounds (not a sub-region); a px of slack absorbs any rounding so that never counts.
+  RECT clip;
+  if (!GetClipCursor(&clip)) {
+    return false;
+  }
+  const int slack = 1;
+  const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  return clip.left > vx + slack || clip.top > vy + slack || //
+         clip.right < vx + vw - slack || clip.bottom < vy + vh - slack;
+}
+
 void MSWindowsScreen::getCursorCenter(int32_t &x, int32_t &y) const
 {
   x = m_xCenter;
