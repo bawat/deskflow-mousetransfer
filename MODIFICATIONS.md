@@ -68,6 +68,28 @@ The core never needs to *see* the file formats (the LocalSystem core reads
 CF_HDROP as absent anyway); all three changes act on Deskflow's own
 text/HTML/bitmap marshalling, so they are robust to that blindness.
 
+### Centre the cursor on an explicit switchToScreen (2026-06-26)
+
+**Files:** `src/lib/server/Server.cpp`
+
+`Server::handleSwitchToScreenEvent` (the handler for an explicit `switchToScreen(name)`
+input-filter action) now drops the cursor in the **centre** of the target screen rather
+than at the target's last-known cursor position (the stock behaviour, via
+`jumpToScreen` -> `getJumpCursorPos`, which lands the cursor at whatever edge it last
+left from — or top-left if never visited).
+
+The MouseTransfer wrapper uses this for its "jump cursor to this computer" feature: it
+synthesises a `keystroke(F13..F24) = switchToScreen(<screen>)` rule it writes into the
+server layout. With the stock behaviour, a jump onto a client landed at the client's far
+edge / top-left, and a jump back to the primary landed at the **seam edge** (so it looked
+like the cursor hadn't moved). Centring makes the jump land clearly on the target in both
+directions.
+
+Scope is deliberately narrow: only **explicit** `switchToScreen` actions reach this
+handler. Ordinary edge crossings (and `switchInDirection`) use different paths, so their
+proportional edge mapping is unaffected. Stock Deskflow with no `switchToScreen` hotkey
+never reaches the changed branch.
+
 ### Respect an OS cursor-clip as a lock-to-screen (2026-06-25)
 
 **Files:** `src/lib/server/Server.cpp`, `src/lib/server/PrimaryClient.{h,cpp}`,

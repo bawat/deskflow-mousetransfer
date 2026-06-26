@@ -1325,7 +1325,17 @@ void Server::handleSwitchToScreenEvent(const Event &event)
   if (index == m_clients.end()) {
     LOG_DEBUG1("screen \"%s\" not active", info->m_screen.c_str());
   } else {
-    jumpToScreen(index->second);
+    // MouseTransfer: land an explicit switchToScreen in the CENTRE of the target screen
+    // rather than at its last-known cursor position (jumpToScreen -> getJumpCursorPos), so a
+    // "jump cursor to this computer" drops the cursor clearly onto the target — both onto a
+    // client and back to the primary — instead of at a seam edge (which feels like it didn't
+    // move) or at top-left. Only EXPLICIT switchToScreen actions reach here; ordinary edge
+    // crossings take a different path, so their proportional edge mapping is untouched.
+    BaseClientProxy *dst = index->second;
+    int32_t dx, dy, dw, dh;
+    dst->getShape(dx, dy, dw, dh);
+    m_active->setJumpCursorPos(m_x, m_y); // remember where we left, as jumpToScreen would
+    switchScreen(dst, dx + dw / 2, dy + dh / 2, false);
   }
 }
 
