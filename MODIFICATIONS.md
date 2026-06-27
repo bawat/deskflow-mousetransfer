@@ -179,6 +179,22 @@ UCRT + MSVC runtime app-locally. Full instructions and the exact file list are i
 `win8/README.md`. The clean no-patch alternative is to build the core against Qt 6.2 LTS (the
 last Qt that supports 8.1 and resolves `SetThreadDescription` dynamically).
 
+### Left-button-up stdout marker for cross-machine drop (2026-06-27)
+
+`Server::onMouseUp(ButtonID)` (`src/lib/server/Server.cpp`) now emits one extra log line,
+`LOG_INFO("mousetransfer lbutton up")`, when the released button is `kButtonLeft`. **Additive
+logging only — no behaviour change** (the relay path is untouched).
+
+Why: the MouseTransfer wrapper completes a cross-machine Explorer-window drag-and-drop on the
+user's mouse release. On a slow cross-client path (e.g. a Windows 8 laptop two seams away) the
+release was unreliable to detect: the receiver's button STATE stays up for the whole ghost ride,
+Deskflow's relayed up EVENT to that client is occasionally dropped, and on the SERVER both the
+wrapper's own low-level hook and `GetAsyncKeyState` are suppressed by the relay while the cursor is
+on a client. The server's core, however, is the input source and always sees the real release here.
+Surfacing it on stdout (which the wrapper already tails as a black box) gives the wrapper a reliable
+release signal; the server then drives the drop to the active-screen peer over its own control
+channel. Verified live .12/.18/.65: the `.12→.65` cross-client drop lands on the first release.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +

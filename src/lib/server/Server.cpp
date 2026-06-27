@@ -1736,6 +1736,15 @@ void Server::onMouseDown(ButtonID id)
 void Server::onMouseUp(ButtonID id)
 {
   LOG_DEBUG1("onMouseUp id=%d", id);
+  // MouseTransfer: emit a stable, parseable marker on the LEFT-button release. The server core is the
+  // input source, so it always sees the real release here — whereas the wrapper's own low-level hook
+  // and GetAsyncKeyState are both suppressed by the relay while the cursor is on a client, and the
+  // injected up relayed to a slow cross-client receiver can be lost. The wrapper tails this stdout
+  // line (reliably) and uses it to complete a cross-machine window drop. Additive log only; no
+  // behaviour change. (kButtonLeft == 1.)
+  if (id == kButtonLeft) {
+    LOG_INFO("mousetransfer lbutton up");
+  }
   assert(m_active != nullptr);
 
   // relay
