@@ -212,6 +212,13 @@ private:
   bool isDeskAccessible(const Desk *desk) const;
   void handleCheckDesk();
 
+  // EVENT_SYSTEM_DESKTOPSWITCH WinEvent callback: re-syncs key state on a desktop switch (the
+  // event-driven fix for the Ctrl+Alt+Del / secure-desktop stuck-modifier). See enable().
+  static void CALLBACK onDesktopSwitchEvent(
+      HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild,
+      DWORD idEventThread, DWORD dwmsEventTime
+  );
+
   // communication with desk threads
   void waitForDesk() const;
   void sendMessage(UINT, WPARAM, LPARAM) const;
@@ -273,6 +280,11 @@ private:
   // keyboard stuff
   IJob *m_updateKeys;
   HKL m_keyLayout;
+
+  // EVENT_SYSTEM_DESKTOPSWITCH WinEvent hook (event-driven key resync on desktop switch) + the
+  // single instance its static callback routes through. Installed/removed in enable()/disable().
+  HWINEVENTHOOK m_desktopEventHook = nullptr;
+  static MSWindowsDesks *s_instance;
 
   // options
   bool m_leaveForegroundOption;
