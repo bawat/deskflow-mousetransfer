@@ -246,6 +246,22 @@ cursor crossed a seam, proving the resync works and only the trigger was missing
 installs successfully on the elevated UIAccess core. (Superseded an interim per-200 ms unconditional
 `updateKeys()` poll, reverted in favour of this event-driven trigger.)
 
+**Required companion fix — `pollPressedKeys()` must read GLOBAL key state.** Live testing showed the
+WinEvent fired but the modifier *still* didn't clear. Root cause: `KeyState::updateKeyState()` rebuilds
+the shadow key array `m_keys` from `MSWindowsKeyState::pollPressedKeys()`, which used **`GetKeyboardState`
+— a THREAD-LOCAL API** (it reflects only the input the calling thread's message queue has processed).
+The resync runs on the desk thread, whose queue never saw the Ctrl+Alt key-UP that the SAS routed to the
+secure desktop, so `GetKeyboardState` there reports Ctrl+Alt stuck DOWN permanently and the resync
+overwrote the latched modifier with the same stale value. (`pollActiveModifiers()` derives the Ctrl/Alt/
+Shift bits from `m_keys` via `isKeyDown`, so it inherits the staleness.) Confirmed by the wrapper's kbdiag
+at the SAS instant: `async=[]` (GetAsyncKeyState, global, clean) vs `logical=[LCTRL,LALT]` (GetKeyState,
+thread-local, stuck). Fix: `pollPressedKeys()` now reads **`GetAsyncKeyState`** (the global, real-time
+physical+injected state, clean after the SAS) instead of `GetKeyboardState`, so the resync clears the
+stale modifier from any thread. `pollPressedKeys()` is only called by `updateKeyState()`, so the change is
+scoped to the resync. This is also why the earlier screen-transition resync appeared to work: crossing a
+seam runs `AttachThreadInput`, which syncs the thread's keyboard state first — the new global poll removes
+that dependency.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +

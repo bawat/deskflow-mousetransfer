@@ -843,14 +843,17 @@ int32_t MSWindowsKeyState::pollActiveGroup() const
 
 void MSWindowsKeyState::pollPressedKeys(KeyButtonSet &pressedKeys) const
 {
-  BYTE keyState[256];
-  if (!GetKeyboardState(keyState)) {
-    LOG_WARN("keyboard state is unexpected");
-    LOG_DEBUG("function 'GetKeyboardState' returned false on 'pollPressedKeys'");
-    return;
-  }
+  // MouseTransfer fix (stuck-AltGr via Ctrl+Alt+Del): use GetAsyncKeyState (the GLOBAL, real-time
+  // physical+injected key state) rather than GetKeyboardState (which is THREAD-LOCAL — it reflects
+  // only the input this thread's message queue has processed). This function is the source of truth
+  // for updateKeyState() (the resync), which can run on the desk thread; that thread never saw the
+  // Ctrl+Alt key-UP that Ctrl+Alt+Del routed to the Winlogon secure desktop, so its GetKeyboardState
+  // reports Ctrl+Alt stuck DOWN forever and the resync would overwrite the latched modifier with the
+  // same stale value (the bug). GetAsyncKeyState reads the true OS state (clean after the SAS), so the
+  // resync now clears the stale modifier from ANY thread. Only updateKeyState() calls this, so the
+  // change is scoped to the resync; the high bit (0x8000) is the current-down state.
   for (KeyButton i = 1; i < 256; ++i) {
-    if ((keyState[i] & 0x80) != 0) {
+    if ((GetAsyncKeyState(i) & 0x8000) != 0) {
       KeyButton keyButton = virtualKeyToButton(i);
       if (keyButton != 0) {
         pressedKeys.insert(keyButton);
