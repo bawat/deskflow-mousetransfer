@@ -195,6 +195,30 @@ Surfacing it on stdout (which the wrapper already tails as a black box) gives th
 release signal; the server then drives the drop to the active-screen peer over its own control
 channel. Verified live .12/.18/.65: the `.12→.65` cross-client drop lands on the first release.
 
+### Re-sync key state on screen transition (fix chronic stuck-AltGr / stuck modifier) (2026-06-28)
+
+`MSWindowsScreen::enter()` and `::leave()` (`src/lib/platform/MSWindowsScreen.cpp`) now call
+`m_keyState->updateKeyState()` in the **primary** branch (on `leave()` just before
+`saveModifiers()`, so the saved + relayed state is corrected; on `enter()` after clearing the
+primary key-down list). `updateKeyState()` rebuilds the internal modifier model
+(`m_activeModifiers` / `m_mask`) from `pollPressedKeys()` + `pollActiveModifiers()` (OS ground
+truth) and **injects no key events** — it only corrects Deskflow's tracking.
+
+Why: the long-standing Synergy/Barrier/Deskflow "keyboard switches / accented characters after
+crossing the seam" bug (Deskflow #6599 / #8864 / #9011). Deskflow's internal modifier state can
+latch a modifier whose release didn't unwind cleanly — classically AltGr (modelled as Ctrl+Alt),
+where Windows fabricates a phantom Left-Ctrl (scancode `0x21D`) that leaves Ctrl "down" internally
+while the OS reports it up. With AltGr believed-held, the primary maps **every** captured key
+through the AltGr 3rd level, so the secondary reproduces accented vowels (a→á …; consonants/digits
+have no AltGr glyph so they pass through). The desync is invisible to the OS (`GetAsyncKeyState`
+reads clean), so it can only be fixed inside the core. Confirmed live 2026-06-28 by a client-side
+low-level keyboard-hook capture showing every relayed vowel injected wrapped in Left-Ctrl+Left-Alt
+while consonants were plain, with the OS modifier state clean on all machines. This mirrors
+input-leap's flush-on-transition fix (PR #1972); it self-heals at the next seam crossing.
+**Behaviour change is limited to clearing a stale internal modifier on a screen switch** — a
+genuinely-held key is re-captured from the OS poll, so legitimate cross-seam modifier use is
+unaffected.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +

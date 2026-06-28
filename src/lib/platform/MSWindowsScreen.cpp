@@ -246,6 +246,11 @@ void MSWindowsScreen::enter()
     nextMark();
 
     m_primaryKeyDownList.clear();
+
+    // MouseTransfer fix (stuck-AltGr / internal modifier desync): re-sync the key state to the real
+    // OS keyboard on return, so local typing on the server is clean even if a modifier latched
+    // internally while the cursor was away. See leave() for the full rationale.
+    m_keyState->updateKeyState();
   } else {
     // Entering a secondary screen. Ensure that no screensaver is active
     // and that the screen is not in powersave mode.
@@ -296,6 +301,21 @@ void MSWindowsScreen::leave()
 
     // all messages prior to now are invalid
     nextMark();
+
+    // MouseTransfer fix (stuck-AltGr / internal modifier desync): re-sync the key state to the real
+    // OS keyboard state BEFORE we start relaying. Deskflow's internal modifier model
+    // (m_activeModifiers / m_mask) can latch a modifier whose release didn't unwind cleanly --
+    // classically AltGr (modelled as Ctrl+Alt), where Windows fabricates a phantom Left-Ctrl
+    // (scancode 0x21D) that leaves Ctrl "down" internally while the OS shows it up. A stale AltGr
+    // makes the primary map EVERY captured key through the AltGr 3rd level, so the client reproduces
+    // accented vowels (a->aacute, etc.; consonants/digits have no AltGr glyph so they pass through)
+    // -- the chronic "keyboard switching" bug (Deskflow #6599/#8864/#9011). updateKeyState() rebuilds
+    // the modifier map from pollActiveModifiers() (OS ground truth, which is clean), clearing the
+    // phantom; it injects no key events. Confirmed via a client-side key-injection capture (see the
+    // wrapper repo's keyboard-flip-investigation-findings.md). Mirrors input-leap PR #1972's
+    // flush-on-transition. Runs before saveModifiers() so the saved + relayed state is the corrected
+    // one.
+    m_keyState->updateKeyState();
 
     // remember the modifier state.  this is the modifier state
     // reflected in the internal keyboard state.
