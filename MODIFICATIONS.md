@@ -262,6 +262,23 @@ scoped to the resync. This is also why the earlier screen-transition resync appe
 seam runs `AttachThreadInput`, which syncs the thread's keyboard state first — the new global poll removes
 that dependency.
 
+**THE actual fix — hook `g_keyState` re-sync bit test (`MSWindowsHook.cpp`).** The visible symptom
+(relayed keys translated as AltGr after Ctrl+Alt+Del) is driven by the low-level keyboard hook's OWN
+key-state array `g_keyState`, used in `keyboardHookHandler` to decide AltGr translation (`ToUnicode`) for
+**relayed** keys (local typing is unaffected — the OS translates that with its own clean state).
+`keyboardGetState()` is meant to re-sync `g_keyState` from the global `GetAsyncKeyState` whenever the
+current key is down — but the gate was `if (key & 0x80)`, and `GetAsyncKeyState` reports "down" in the HIGH
+bit `0x8000`, not `0x80` (the loop right below correctly uses `key < 0`). So the re-sync almost never ran;
+`g_keyState` drifted on any missed event. Ctrl+Alt+Del is the worst case: the SAS routes the Ctrl/Alt
+key-UP to the Winlogon secure desktop the hook can't see, so `g_keyState[Ctrl]`/`[Alt]` latch `0x80`
+forever and every relayed key is translated through the AltGr (Ctrl+Alt) layer. Fix: test `key < 0`, so the
+re-sync fires on each key-down and clears the stale modifier from the global state on the very next
+keystroke — event-driven, no polling. Confirmed by the exact user-reported behaviour: local typing on the
+server is fine (OS state clean); relayed typing breaks; pressing Ctrl clears it (the Ctrl key-up updates
+`g_keyState[Ctrl]=0` incrementally, breaking the both-Ctrl-and-Alt AltGr condition). This is the primary
+fix; the EVENT_SYSTEM_DESKTOPSWITCH resync + `pollPressedKeys`-global change above remain as belt-and-
+suspenders for the `m_keys`/`m_mask` path.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +

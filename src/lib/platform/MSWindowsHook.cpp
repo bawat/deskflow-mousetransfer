@@ -181,7 +181,15 @@ static void keyboardGetState(BYTE keys[256], DWORD vkCode, bool kf_up)
   // Test whether GetAsyncKeyState() is being honest with us
   key = GetAsyncKeyState(vkCode);
 
-  if (key & 0x80) {
+  // MouseTransfer fix: GetAsyncKeyState reports "key down" in the HIGH bit (0x8000), not 0x80 (and
+  // the loop below correctly uses `key < 0`). The original `key & 0x80` is always false for a normal
+  // key-down, so g_keyState was almost never re-synced from the real OS state — it drifted on any
+  // missed event. The worst case is Ctrl+Alt+Del: the Secure Attention Sequence routes the Ctrl/Alt
+  // key-UP to the Winlogon secure desktop, which this hook never sees, so g_keyState[Ctrl]/[Alt] stay
+  // latched 0x80 forever and EVERY relayed key is then translated through the AltGr (Ctrl+Alt) layer
+  // (accented vowels on the client). Testing `key < 0` (the high bit) makes the re-sync fire on each
+  // key-down, clearing the stale modifier from the global GetAsyncKeyState on the very next keystroke.
+  if (key < 0) {
     // The only time we know for sure that GetAsyncKeyState() is working
     // is when it tells us that the current key is down.
     // In this case, update g_keyState to reflect what GetAsyncKeyState()
