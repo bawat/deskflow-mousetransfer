@@ -863,6 +863,21 @@ void MSWindowsDesks::handleCheckDesk()
     BOOL running;
     SystemParametersInfo(SPI_GETSCREENSAVERRUNNING, 0, &running, FALSE);
     PostThreadMessage(m_threadID, DESKFLOW_MSG_SCREEN_SAVER, running, 0);
+
+    // MouseTransfer fix (stuck-AltGr via Ctrl+Alt+Del / UAC secure desktop): unconditionally
+    // re-sync the key state to the OS on every desk-timer tick (~200ms). The Secure Attention
+    // Sequence routes the Ctrl+Alt key-UP to the Winlogon secure desktop, which our low-level hook
+    // cannot see, so the core's internal modifier state latches Ctrl+Alt (AltGr) and every relayed
+    // key is then mapped through the AltGr 3rd level (accented vowels on the client). The existing
+    // desk-switch resync (checkDesk, above) CANNOT catch this on the elevated core: OpenInputDesktop()
+    // returns NULL on/after the secure desktop, so the desktop NAME never changes (stays "") and the
+    // `name != m_activeDeskName` gate in checkDesk never fires. Resyncing here is gate-free:
+    // updateKeys() -> updateKeysCB() -> updateKeyState() rebuilds the modifier mask from
+    // GetKeyboardState() (OS ground truth, which is clean) and pushes any release fixes to the active
+    // client, so a lost modifier-up self-corrects within one tick with no seam crossing required.
+    // Cheap (a single GetKeyboardState poll) and safe: it only releases keys the OS reports up, so
+    // genuinely-held keys and legitimate cross-seam modifier use are unaffected.
+    updateKeys();
   }
 }
 

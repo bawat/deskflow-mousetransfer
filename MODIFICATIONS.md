@@ -219,6 +219,23 @@ input-leap's flush-on-transition fix (PR #1972); it self-heals at the next seam 
 genuinely-held key is re-captured from the OS poll, so legitimate cross-seam modifier use is
 unaffected.
 
+**Follow-up (gate-free timer resync, for the Ctrl+Alt+Del / UAC case):** the screen-transition
+resync only fires on a seam crossing. The most common *trigger* for the stuck modifier is
+**Ctrl+Alt+Del** (the Secure Attention Sequence): Windows routes the Ctrl+Alt key-UP to the Winlogon
+secure desktop, which the hook cannot see, so the modifier latches with no crossing involved.
+Upstream's own desk-switch resync (PR #9069, `MSWindowsDesks::checkDesk`) is supposed to catch this
+but **cannot on the elevated (UIAccess) core**: `OpenInputDesktop()` returns NULL on/after the secure
+desktop, so `getDesktopName()` returns `""`, the desktop name never changes, and the
+`name != m_activeDeskName` gate never fires → `updateKeys()` is never called. Fix:
+`MSWindowsDesks::handleCheckDesk()` now calls `updateKeys()` **unconditionally on the primary** every
+desk-timer tick (~200 ms), independent of desktop-name detection. `updateKeys()` →
+`MSWindowsScreen::updateKeysCB()` → `KeyState::updateKeyState()` rebuilds the modifier mask from
+`GetKeyboardState()` (OS ground truth) and sends release fixes to the active client, so a lost
+modifier-up self-corrects within ~200 ms with no seam crossing. Cheap (one keyboard-state poll) and
+safe (only releases keys the OS reports up). Confirmed root cause live 2026-06-28 (user identified
+Ctrl+Alt+Del as the trigger; the stuck state cleared mid-sentence the instant the cursor crossed a
+seam, proving the resync works and only the trigger was missing).
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +
