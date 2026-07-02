@@ -68,6 +68,21 @@ The core never needs to *see* the file formats (the LocalSystem core reads
 CF_HDROP as absent anyway); all three changes act on Deskflow's own
 text/HTML/bitmap marshalling, so they are robust to that blindness.
 
+4. **`MSWindowsScreen::onClipboardChange` fires the grab on every non-Deskflow
+   clipboard change** (2026-07-02), not only on the owned→unowned transition.
+   The transition form depended on the ownership-assert blank that change (1)
+   removed: without that write the screen was almost never "owned", so
+   `m_ownClipboard` stayed false and user copies never reached the server as
+   `ClipboardGrabbed`. Clipboard OWNERSHIP then froze on the primary, whose
+   stored (stale) clipboard was re-pushed onto every screen the cursor entered —
+   silently replacing files the user had just copied there (invisible to the
+   core), i.e. "copied a file, Paste greyed out after a crossing". Firing the
+   grab unconditionally restores the ownership flow: the server re-marks the
+   owner and **empties its stored copy** (`handleClipboardGrabbed`), so nothing
+   stale is ever re-pushed, and a text copy made on a *client* syncs again (its
+   leave-time data send is no longer rejected as mis-sequenced). Redundant grabs
+   are protocol-safe and cost one tiny message per user copy.
+
 ### Cursor jump: centred switch + a switch-request file poll (2026-06-26)
 
 **Files:** `src/lib/server/Server.{h,cpp}`

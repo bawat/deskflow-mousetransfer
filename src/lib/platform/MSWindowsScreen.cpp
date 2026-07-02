@@ -1382,12 +1382,22 @@ void MSWindowsScreen::onClipboardChange()
   // now notify client that somebody changed the clipboard (unless
   // we're the owner).
   if (!MSWindowsClipboard::isOwnedByDeskflow()) {
+    // MouseTransfer: fire the grab on EVERY non-Deskflow clipboard change, not only on the
+    // owned->unowned transition. The transition form relied on the "blank the clipboard to
+    // assert ownership" write that the file-sync coexistence patch removed (setClipboard's
+    // nullptr no-op, see MODIFICATIONS.md) - without that write this screen was almost never
+    // "owned", m_ownClipboard stayed false, and user copies here never reached the server as
+    // grabs. Clipboard OWNERSHIP then froze on the primary, whose stored (stale) clipboard was
+    // re-pushed onto every screen the cursor entered, silently replacing files the user had
+    // just copied there (Deskflow cannot see CF_HDROP). Redundant grabs are protocol-safe:
+    // Server::handleClipboardGrabbed re-marks the same owner and EMPTIES its stored copy -
+    // exactly what keeps stale data from being re-pushed - and ignores mis-sequenced ones.
     if (m_ownClipboard) {
       LOG_DEBUG("clipboard changed: lost ownership");
       m_ownClipboard = false;
-      sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
-      sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardSelection);
     }
+    sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
+    sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardSelection);
   } else if (!m_ownClipboard) {
     LOG_DEBUG("clipboard changed: %s owned", kAppId);
     m_ownClipboard = true;
