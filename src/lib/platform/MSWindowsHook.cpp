@@ -201,6 +201,27 @@ static void keyboardGetState(BYTE keys[256], DWORD vkCode, bool kf_up)
     }
   }
 
+  // MouseTransfer fix #2: the gated full re-sync above only fires when GetAsyncKeyState(vkCode)
+  // reports the CURRENT key down — but inside a low-level keyboard hook the event has NOT yet entered
+  // the system, so GetAsyncKeyState(vkCode) commonly still reads UP and the gate never opens. After
+  // Ctrl+Alt+Del (whose Ctrl/Alt key-UP goes to the Winlogon secure desktop this hook can't see) the
+  // phantom g_keyState[Ctrl]/[Alt] therefore stay latched and every relayed key is translated through
+  // the AltGr (Ctrl+Alt) layer — accented vowels on the client. GetAsyncKeyState for a key that is NOT
+  // the current event, however, DOES reliably report that key's true global state. So unconditionally
+  // re-sync the modifier keys (the only ones that drive the ToUnicode AltGr layer) from the global
+  // state every call; a phantom Ctrl/Alt is cleared the instant the next key is typed.
+  {
+    static const int kMods[] = {VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU,  VK_LMENU,  VK_RMENU,
+                                VK_SHIFT,   VK_LSHIFT,    VK_RSHIFT,   VK_LWIN,  VK_RWIN};
+    for (int m : kMods) {
+      if (m == (int)vkCode) {
+        continue; // don't fight the current-key state just set above
+      }
+      g_keyState[m] = (GetAsyncKeyState(m) < 0) ? 0x80u : 0;
+    }
+    g_keyState[VK_SHIFT] = g_keyState[VK_LSHIFT] | g_keyState[VK_RSHIFT];
+  }
+
   // copy g_keyState to keys
   for (int i = 0; i < 256; ++i) {
     keys[i] = g_keyState[i];

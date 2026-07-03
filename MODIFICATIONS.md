@@ -321,6 +321,29 @@ still reported; (2) if even that is null, return an **empty** `std::string()` so
 `current server language is not installed on client`. Stock Deskflow bug (upstream `AppUtilWindows.cpp`
 is identical) — upstream cherry-pick candidate like `ca93bbf8b`.
 
+### Unconditional modifier re-sync — the actual persistent-AltGr fix (2026-07-03)
+
+**File:** `src/lib/platform/MSWindowsHook.cpp` (`keyboardGetState`). Supersedes the effectiveness of
+`ca93bbf8b`'s gate for the AltGr-latch case.
+
+`ca93bbf8b` corrected the re-sync bit test (`key & 0x80` → `key < 0`) but left the re-sync **gated**
+on `GetAsyncKeyState(vkCode) < 0` — i.e. it only re-syncs `g_keyState` from the global state when the
+*current* key reads down. Inside a `WH_KEYBOARD_LL` hook the event has **not yet entered the system**,
+so `GetAsyncKeyState(vkCode)` for the key being pressed commonly still reads **up**, the gate never
+opens, and after Ctrl+Alt+Del (whose Ctrl/Alt key-UP goes to the Winlogon secure desktop the hook can't
+see) the phantom `g_keyState[Ctrl]`/`[Alt]` stay latched. `keyboardHookHandler` then runs
+`ToUnicode(...)` with those keys held, baking the AltGr third level into the relayed **KeyID** itself —
+verified live: the primary sent `id=0x00e1` ('á') for a plain `a` press, with a clean modifier mask.
+
+Fix: after the existing gated block, **unconditionally** re-sync the modifier keys
+(`VK_[LR]CONTROL`/`VK_[LR]MENU`/`VK_[LR]SHIFT`/`VK_[LR]WIN` and their aggregates) from
+`GetAsyncKeyState` on every `keyboardGetState` call, skipping only the current-event key.
+`GetAsyncKeyState` for a key that is *not* the current event reliably reports that key's true global
+state, so a phantom Ctrl/Alt is cleared the instant the next key is typed — the primary then sends
+`id=0x0061` ('a') again. Verified live .12/.18/.65: identical Ctrl+Alt+Del, `aeiou` relayed as
+`0x61 0x65 0x69 0x6f 0x75` instead of `0x00e1 0x00e9 0x00ed 0x00f3 0x00fa`. Also a stock Deskflow bug —
+upstream cherry-pick candidate.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +
