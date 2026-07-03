@@ -69,4 +69,13 @@ public:
   static int installScreenSaver();
 
   static int uninstallScreenSaver();
+
+  //! Re-sync the hook's internal key-state shadow from the real global key state.
+  /*!
+  Call on a desktop switch (Ctrl+Alt+Del / UAC / lock) to clear a phantom modifier whose
+  key-UP was delivered to the Winlogon secure desktop the hook never saw. Must NOT be called
+  per-keystroke: while relaying, held modifiers are swallowed and GetAsyncKeyState under-reports
+  them, so a per-key resync would drop a genuinely-held Shift/Ctrl.
+  */
+  static void resyncKeyState();
 };

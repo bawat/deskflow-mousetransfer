@@ -922,6 +922,12 @@ void CALLBACK MSWindowsDesks::onDesktopSwitchEvent(
   if (s_instance != nullptr) {
     LOG_INFO("desktop switch — resyncing key state");
     s_instance->updateKeys();
+    // Also re-sync the low-level keyboard hook's OWN g_keyState shadow (separate from the m_keys/
+    // m_mask path updateKeys() rebuilds). That shadow drives the AltGr ToUnicode translation of
+    // RELAYED keys; a Ctrl+Alt+Del leaves its Ctrl/Alt latched (the key-UP went to the secure
+    // desktop). Doing it here, on the switch, is the safe moment — no key is being swallowed, so
+    // GetAsyncKeyState reads true idle state (a per-keystroke resync would drop a held modifier).
+    MSWindowsHook::resyncKeyState();
   }
 }
 
