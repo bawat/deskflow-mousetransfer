@@ -160,12 +160,26 @@ std::string AppUtilWindows::getCurrentLanguageCode()
   std::string code("", 2);
 
   auto hklLayout = getCurrentKeyboardLayout();
+  if (!hklLayout) {
+    // The Winlogon secure desktop (Ctrl+Alt+Del / UAC prompt) has no foreground window this
+    // process can read, so getCurrentKeyboardLayout() (GetGUIThreadInfo(0)) returns null for the
+    // duration of the switch. Fall back to THIS thread's own input layout, which stays valid,
+    // rather than reporting no language at all for every keystroke relayed during that window.
+    hklLayout = GetKeyboardLayout(0);
+  }
   if (hklLayout) {
     auto localLayoutID = MAKELCID(LOWORD(hklLayout), SORT_DEFAULT);
     GetLocaleInfoA(localLayoutID, LOCALE_SISO639LANGNAME, &code[0], static_cast<int>(code.size()));
+    return code;
   }
 
-  return code;
+  // Still could not determine any layout: return an EMPTY code, NOT the two NUL bytes `code`
+  // holds. A non-empty "\0\0" makes ServerProxy::setActiveServerLanguage() treat it as a real
+  // (but uninstalled) server language, cache it as m_serverLanguage, and degrade EVERY subsequent
+  // relayed keystroke's translation — the accented / vowel-mangled characters seen on a client
+  // after a Ctrl+Alt+Del. An empty string takes the client's "active server language is empty"
+  // branch, which leaves the last known-good server language in place.
+  return std::string();
 }
 
 HKL AppUtilWindows::getCurrentKeyboardLayout() const
