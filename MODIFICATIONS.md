@@ -294,6 +294,33 @@ server is fine (OS state clean); relayed typing breaks; pressing Ctrl clears it 
 fix; the EVENT_SYSTEM_DESKTOPSWITCH resync + `pollPressedKeys`-global change above remain as belt-and-
 suspenders for the `m_keys`/`m_mask` path.
 
+### Don't poison the server language when the layout read fails (2026-07-03)
+
+**File:** `src/lib/deskflow/win32/AppUtilWindows.cpp` (`getCurrentLanguageCode`). Commit `606c64c6b`.
+
+The **second facet** of the same Ctrl+Alt+Del trigger, distinct from the `g_keyState` modifier latch
+above and NOT covered by it — which is why the "accented vowels on a client after Ctrl+Alt+Del" symptom
+recurred on cores that already had `ca93bbf8b`. `Server::handleKeyDownEvent` calls
+`getCurrentLanguageCode()` on **every** keystroke and ships the result to the client with the key.
+That function reads the foreground window's HKL via `getCurrentKeyboardLayout()`
+(`GetGUIThreadInfo(0, &gti)`). While the **Winlogon secure desktop** is up (Ctrl+Alt+Del / a UAC
+prompt) this process cannot read that desktop's foreground, so `gti.hwndActive` is null, the function
+logs `failed to determine current keyboard layout` and returns `nullptr`. `getCurrentLanguageCode()`
+then fell through returning its pre-initialised `std::string code("", 2)` — **two NUL bytes, size 2,
+NOT empty**. On the client, `ServerProxy::setActiveServerLanguage()` sees a non-empty (`"\0\0"`)
+language, so it takes the *populated* branch: caches it as `m_serverLanguage`, finds it "not installed
+on client", and degrades every subsequent relayed keystroke's translation (accented / vowel-mangled
+characters). The state persists because the client only overwrites `m_serverLanguage` when a *different*
+non-empty language arrives.
+
+Fix, in `getCurrentLanguageCode()`: (1) on a null foreground layout, fall back to `GetKeyboardLayout(0)`
+— this thread's own input layout, which stays valid across the desktop switch — so a real `"en"` is
+still reported; (2) if even that is null, return an **empty** `std::string()` so the client takes its
+`active server language is empty` branch and **keeps the last known-good language** instead of caching
+`"\0\0"`. Observable signal that it worked: after a Ctrl+Alt+Del the client no longer logs
+`current server language is not installed on client`. Stock Deskflow bug (upstream `AppUtilWindows.cpp`
+is identical) — upstream cherry-pick candidate like `ca93bbf8b`.
+
 ## Building
 
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +
