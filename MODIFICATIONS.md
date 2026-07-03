@@ -321,27 +321,34 @@ still reported; (2) if even that is null, return an **empty** `std::string()` so
 `current server language is not installed on client`. Stock Deskflow bug (upstream `AppUtilWindows.cpp`
 is identical) — upstream cherry-pick candidate like `ca93bbf8b`.
 
-### Unconditional modifier re-sync — the actual persistent-AltGr fix (2026-07-03)
+### Re-sync the hook key-state on a desktop switch — the actual persistent-AltGr fix (2026-07-03)
 
-**File:** `src/lib/platform/MSWindowsHook.cpp` (`keyboardGetState`). Supersedes the effectiveness of
-`ca93bbf8b`'s gate for the AltGr-latch case.
+**Files:** `src/lib/platform/MSWindowsHook.{h,cpp}` (`resyncKeyState`) + `MSWindowsDesks.cpp`
+(`onDesktopSwitchEvent`). Commit `e71ac1d32`. Supersedes the effectiveness of `ca93bbf8b`'s gate for
+the AltGr-latch case.
 
-`ca93bbf8b` corrected the re-sync bit test (`key & 0x80` → `key < 0`) but left the re-sync **gated**
-on `GetAsyncKeyState(vkCode) < 0` — i.e. it only re-syncs `g_keyState` from the global state when the
-*current* key reads down. Inside a `WH_KEYBOARD_LL` hook the event has **not yet entered the system**,
-so `GetAsyncKeyState(vkCode)` for the key being pressed commonly still reads **up**, the gate never
-opens, and after Ctrl+Alt+Del (whose Ctrl/Alt key-UP goes to the Winlogon secure desktop the hook can't
-see) the phantom `g_keyState[Ctrl]`/`[Alt]` stay latched. `keyboardHookHandler` then runs
-`ToUnicode(...)` with those keys held, baking the AltGr third level into the relayed **KeyID** itself —
-verified live: the primary sent `id=0x00e1` ('á') for a plain `a` press, with a clean modifier mask.
+**The bug.** `keyboardHookHandler` runs `ToUnicode(..., g_keyState)` to build the relayed **KeyID** for
+a key typed on the primary while the cursor is on a client. If `g_keyState[Ctrl]`/`[Alt]` are latched,
+`a` is baked into the KeyID as `á` (`id=0x00e1`) with a *clean* modifier mask, and the client faithfully
+types the accent. `ca93bbf8b` corrected the re-sync bit test (`key & 0x80` → `key < 0`) but left the
+re-sync **gated on `GetAsyncKeyState(vkCode) < 0`** (the current key reading down), which inside a
+`WH_KEYBOARD_LL` hook is usually still **up** (the event hasn't entered the system yet), so the gate
+never opens and after Ctrl+Alt+Del the phantom `g_keyState[Ctrl]`/`[Alt]` stay latched.
 
-Fix: after the existing gated block, **unconditionally** re-sync the modifier keys
-(`VK_[LR]CONTROL`/`VK_[LR]MENU`/`VK_[LR]SHIFT`/`VK_[LR]WIN` and their aggregates) from
-`GetAsyncKeyState` on every `keyboardGetState` call, skipping only the current-event key.
-`GetAsyncKeyState` for a key that is *not* the current event reliably reports that key's true global
-state, so a phantom Ctrl/Alt is cleared the instant the next key is typed — the primary then sends
-`id=0x0061` ('a') again. Verified live .12/.18/.65: identical Ctrl+Alt+Del, `aeiou` relayed as
-`0x61 0x65 0x69 0x6f 0x75` instead of `0x00e1 0x00e9 0x00ed 0x00f3 0x00fa`. Also a stock Deskflow bug —
+**The trap that makes this subtle** (a first attempt, `110e92360`, resynced modifiers from
+`GetAsyncKeyState` on *every* keystroke and REGRESSED — it broke relayed capital letters). While the
+primary is relaying, the physical modifier keys are **swallowed** by the hook, so `GetAsyncKeyState`
+**under-reports a genuinely-held modifier**. A per-keystroke resync therefore drops a held Shift/Ctrl
+(no capitals). `g_keyState` is in fact maintained accurately by the hook's own key up/down events; the
+ONLY case it drifts is a key-UP eaten by a desktop switch.
+
+**The fix.** Expose `MSWindowsHook::resyncKeyState()` (a full `g_keyState[i] = GetAsyncKeyState(i)`
+refresh) and call it **only** from the `EVENT_SYSTEM_DESKTOPSWITCH` handler (`onDesktopSwitchEvent`,
+already present from `d6a08dd71`). The desktop switch is the one moment `g_keyState` can drift AND the
+one moment `GetAsyncKeyState` is trustworthy — no key is being pressed/swallowed, so it reads the true
+idle physical state and copying it clears the phantom Ctrl/Alt without ever touching a held modifier
+during normal typing. Keeps BOTH the stuck-AltGr fix and Shift capitals. Verified live .12/.18/.65:
+identical Ctrl+Alt+Del, `aeiou` relayed clean AND `Shift`+letter produces capitals. Stock Deskflow bug —
 upstream cherry-pick candidate.
 
 ## Building
