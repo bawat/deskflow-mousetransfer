@@ -16,6 +16,15 @@
 
 #include <cstring>
 
+// Graceful keepalive (MouseTransfer fork, FINDINGS #16): how many CONSECUTIVE flatline windows (each
+// = the heartbeat death alarm, default kKeepAliveRate*kKeepAlivesUntilDeath = 9s) a STILL-CONNECTED
+// client may miss before we assume it dead. A momentarily CPU-saturated client (its single-threaded
+// event loop can't emit a heartbeat in time) is kept + logged rather than dropped, avoiding the
+// disconnect->reconnect FLAP that breaks the cursor relay; any data from the client resets the count.
+// A genuinely-closed TCP still drops immediately via handleDisconnect. 3 windows ~= 27s of TOTAL
+// silence before a client is declared dead.
+static const int kMaxMissedHeartbeats = 3;
+
 //
 // ClientProxy1_0
 //
@@ -141,7 +150,8 @@ void ClientProxy1_0::handleData()
     n = getStream()->read(code, 4);
   }
 
-  // restart heartbeat timer
+  // restart heartbeat timer; the client just sent data, so it is responsive - clear the missed count.
+  m_missedHeartbeats = 0;
   resetHeartbeatTimer();
 }
 
@@ -197,8 +207,23 @@ void ClientProxy1_0::handleWriteError()
 
 void ClientProxy1_0::handleFlatline()
 {
-  // didn't get a heartbeat fast enough.  assume client is dead.
-  LOG_IPC("client \"%s\" is dead", getName().c_str());
+  // A missed heartbeat used to mean "assume dead + disconnect" IMMEDIATELY (9s) - too aggressive for a
+  // momentarily CPU-saturated client whose event loop can't emit a heartbeat in time, causing a
+  // needless disconnect->reconnect FLAP that breaks the cursor relay (MouseTransfer fork, FINDINGS #16:
+  // the rig's 2-vCPU guests flapped ~1000x under browser+product load). GRACEFUL: a flatline means
+  // "slow / busy", NOT dead - keep the still-connected client and give it another window, up to
+  // kMaxMissedHeartbeats CONSECUTIVE silent windows. Any data from the client (a heartbeat or real
+  // input) resets the count in handleData. Only PERSISTENT total silence is fatal here; a genuinely
+  // closed TCP still drops immediately via handleDisconnect/handleWriteError, unaffected.
+  if (++m_missedHeartbeats < kMaxMissedHeartbeats) {
+    LOG_WARN(
+        "client \"%s\" slow/unresponsive (%d/%d missed heartbeats) - keeping (still connected)", getName().c_str(),
+        m_missedHeartbeats, kMaxMissedHeartbeats
+    );
+    resetHeartbeatTimer(); // give it another window instead of dropping
+    return;
+  }
+  LOG_IPC("client \"%s\" is dead (%d missed heartbeats)", getName().c_str(), m_missedHeartbeats);
   disconnect();
 }
 

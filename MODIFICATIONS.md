@@ -356,3 +356,22 @@ upstream cherry-pick candidate.
 Standard upstream build (see `doc/dev/build.md`). On Windows: CMake + Ninja +
 Qt 6.7+ + OpenSSL (via vcpkg). `deskflow-core` is the only target the wrapper
 needs.
+
+### Graceful keepalive: don't drop a slow-but-connected client (2026-07-13)
+
+**Files:** `src/lib/server/ClientProxy1_0.cpp`, `src/lib/server/ClientProxy1_0.h`
+
+Stock Deskflow's server drops a client the instant it misses the heartbeat death window
+(`kKeepAliveRate` 3s × `kKeepAlivesUntilDeath` 3 = **9s**): `ClientProxy1_0::handleFlatline()`
+logged `"client is dead"` and `disconnect()`ed immediately, WITHOUT checking whether the TCP
+connection was still alive. On a momentarily CPU-saturated client (whose single-threaded event
+loop can't emit a heartbeat within 9s) this caused a needless **disconnect → reconnect flap**, a
+cursor-relay outage each cycle (observed on the MouseTransfer 2-vCPU test-rig guests: ~1000 flaps
+under browser+product load).
+
+`handleFlatline()` now treats a flatline as **"slow / busy, still connected"** rather than dead:
+it keeps the client and gives it another window, up to `kMaxMissedHeartbeats` (3) CONSECUTIVE
+silent windows (~27s of total silence) before declaring it dead. Any data from the client (a
+heartbeat echo or real input) resets the count in `handleData()`. A genuinely closed TCP still
+drops immediately via the separate `handleDisconnect()`/`handleWriteError()` paths, unchanged. Net:
+a transiently slow client is no longer flapped, while a truly-dead one is still dropped.

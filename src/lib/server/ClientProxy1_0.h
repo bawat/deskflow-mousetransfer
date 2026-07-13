@@ -98,6 +98,10 @@ private:
   ClientInfo m_info;
   double m_heartbeatAlarm;
   EventQueueTimer *m_heartbeatTimer = nullptr;
+  // Consecutive missed heartbeat windows for the GRACEFUL flatline handling (MouseTransfer fork,
+  // FINDINGS #16): a momentarily slow/CPU-saturated client is kept instead of dropped; reset to 0 on
+  // any data from the client (handleData). See ClientProxy1_0::handleFlatline.
+  int m_missedHeartbeats = 0;
   MessageParser m_parser = &ClientProxy1_0::parseHandshakeMessage;
   IEventQueue *m_events;
 };
