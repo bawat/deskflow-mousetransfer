@@ -35,6 +35,45 @@ The wrapper communicates with this core only as a child process (command-line
 arguments, a config file, and standard streams) and as OS-level input events; it
 does not link against or include any Deskflow source.
 
+#### Extended to the keyboard hook (2026-07-26)
+
+**File:** `src/lib/platform/MSWindowsHook.cpp`
+
+The 2026-06-15 change covered only the mouse. `keyboardLLHook` now performs the
+*same* check on `KBDLLHOOKSTRUCT::dwExtraInfo`: an injected key event carrying
+`kDeskflowLocalInjectSignature` is passed straight through with
+`CallNextHookEx`, so it reaches the local OS and is not eaten/relayed. The two
+hooks are now symmetric — same constant, same meaning, same three lines.
+
+Without it, a synthetic keystroke delivered on a machine whose core is relaying
+(cursor on another screen) is swallowed by the core and forwarded to that other
+screen instead of landing locally. That breaks two wrapper features that inject
+keys deliberately: picture-in-picture keyboard passthrough (type into the machine
+whose screen you are watching) and relaying a paired machine's own physical
+keyboard to whichever screen is active.
+
+Deskflow's own internal synthesis escape hatch
+(`DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY` / `g_fakeServerInput`) is deliberately
+*not* reused: it is armed with a `PostThreadMessage` to Deskflow's own hook
+thread and is unreachable from an external process — which is precisely why the
+mouse side needed the cross-process `dwExtraInfo` tag in the first place.
+
+Stock Deskflow never injects with this signature, so all existing keyboard
+behaviour is unchanged.
+
+**Note on `g_isPrimary` (documentation only, no behaviour change).** Both hooks
+also contain a `!g_isPrimary && injected` passthrough branch that looks like it
+should bypass relaying on client machines. `g_isPrimary` is declared
+`static BOOL g_isPrimary = TRUE` in `MSWindowsHook.cpp` and, as of this revision,
+is **never assigned anywhere in the tree** — `MSWindowsScreen` drives
+primary-vs-secondary behaviour entirely through
+`m_hook.setMode(kHOOK_RELAY_EVENTS / kHOOK_WATCH_JUMP_ZONE / kHOOK_DISABLE)`.
+The condition is therefore always false and both branches are dead on Windows
+regardless of role, which makes the `dwExtraInfo` tag the only working bypass for
+either hook. The dead branches are left untouched (removing upstream code buys
+nothing); a comment in the file records this so nobody builds role-dependent
+injection logic on top of them.
+
 ### Clipboard coexistence with out-of-band file sync (2026-06-25)
 
 **Files:** `src/lib/platform/MSWindowsScreen.cpp`, `src/lib/server/Server.cpp`

@@ -6,7 +6,8 @@
  *
  * Modified 2026-06-15 (Merged-fork): added a "local-inject passthrough" — an
  * injected mouse event carrying kDeskflowLocalInjectSignature in dwExtraInfo is
- * delivered to the local OS and NOT relayed (see mouseLLHook below). This file
+ * delivered to the local OS and NOT relayed (see mouseLLHook below). Extended
+ * 2026-07-26 to the KEYBOARD hook (keyboardLLHook), symmetrically. This file
  * remains licensed GPL-2.0-only WITH LicenseRef-OpenSSL-Exception. See
  * MODIFICATIONS.md in the repository root for details.
  */
@@ -35,6 +36,14 @@ static const char *g_name = "dfwhook";
 // Deskflow's own fake input never uses this value, so it changes no stock
 // behaviour. The Merged wrapper uses it to end a drag-and-drop on the SOURCE
 // screen after the cursor has crossed, without the release reaching the client.
+//
+// The signature is honoured by BOTH low-level hooks: mouseLLHook (2026-06-15,
+// MSLLHOOKSTRUCT::dwExtraInfo) and keyboardLLHook (2026-07-26,
+// KBDLLHOOKSTRUCT::dwExtraInfo). The keyboard half lets an external process
+// deliver a synthetic KEYSTROKE to this machine while Deskflow relays — the
+// wrapper's picture-in-picture keyboard passthrough types into the machine whose
+// screen is being viewed, and a paired machine's own keyboard can drive the
+// active screen, neither of which can work if the core eats the injected key.
 static const ULONG_PTR kDeskflowLocalInjectSignature = 0x0DF10CA1; // "DF local"
 
 static DWORD g_processID = 0;
@@ -483,6 +492,30 @@ static LRESULT CALLBACK keyboardLLHook(int code, WPARAM wParam, LPARAM lParam)
     KBDLLHOOKSTRUCT *info = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
 
     bool const injected = info->flags & LLKHF_INJECTED;
+    // Merged-fork: our own tagged injection goes to the local OS, not the client. This is the exact
+    // symmetric twin of the check in mouseLLHook below (added 2026-06-15) — the SAME signature, the
+    // SAME meaning — so an external automation process can deliver a synthetic KEYSTROKE to this
+    // machine's OS while Deskflow is relaying, instead of having it eaten and forwarded to the
+    // active client. KBDLLHOOKSTRUCT carries dwExtraInfo just like MSLLHOOKSTRUCT, so the injector
+    // tags KEYBDINPUT::dwExtraInfo identically.
+    //
+    // Deskflow's own internal synthesis escape hatch (DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY /
+    // g_fakeServerInput, in keyboardHookHandler above) is deliberately NOT reused for this: it is
+    // armed by a PostThreadMessage to Deskflow's OWN hook thread, which an external process cannot
+    // reach. That is exactly why the mouse side needed the cross-process dwExtraInfo tag, and the
+    // keyboard side needs the same one.
+    //
+    // NOTE for future readers: do NOT rely on the `!g_isPrimary && injected` branch below (or its
+    // twin in mouseLLHook) as a client-side bypass. `g_isPrimary` is declared `static BOOL
+    // g_isPrimary = TRUE` at the top of this file and is never assigned anywhere in the tree
+    // (MSWindowsScreen drives primary-vs-secondary behaviour entirely through
+    // m_hook.setMode(kHOOK_RELAY_EVENTS/kHOOK_WATCH_JUMP_ZONE/kHOOK_DISABLE)), so the condition is
+    // always false and the branch is dead on Windows regardless of role. The tag check above is
+    // therefore the ONE working bypass, uniformly, for both hooks and both roles. Left in place
+    // untouched because removing upstream code earns nothing here.
+    if (injected && info->dwExtraInfo == kDeskflowLocalInjectSignature) {
+      return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
+    }
     if (!g_isPrimary && injected) {
       return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
     }
