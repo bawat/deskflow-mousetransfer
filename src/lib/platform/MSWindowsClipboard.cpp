@@ -201,9 +201,17 @@ bool MSWindowsClipboard::isOwnedByDeskflow()
   return isFormatOnClipboard(getOwnershipFormat());
 }
 
-// MouseTransfer: IsClipboardFormatAvailable() MISREPORTS REGISTERED clipboard formats when the
-// core runs elevated (LocalSystem + UIAccess, which is how the MouseTransfer wrapper starts it so
-// it can drive UAC prompts). Measured on Windows 10 19045 with the core's own instrumentation:
+// MouseTransfer: IsClipboardFormatAvailable() MISREPORTS a REGISTERED clipboard format placed by a
+// LOWER-PRIVILEGE process when the reader runs elevated (LocalSystem + UIAccess, which is how the
+// MouseTransfer wrapper starts the core so it can drive UAC prompts).
+//
+// Scope, measured rather than assumed: a format this process placed ITSELF is visible normally — so
+// Deskflow's own echo suppression has always worked (no client ever announced a grab after writing a
+// received clipboard) — and two same-integrity processes see each other's formats fine. Only the
+// cross-privilege direction fails, which is the direction a wrapper needs and one stock Deskflow
+// never exercises.
+//
+// Measured on Windows 10 19045 with the core's own instrumentation:
 //
 //   MTDIAG isOwnedByDeskflow: cached=C242 fresh=C242 availCached=0 availFresh=0 formats=[000D C242]
 //
@@ -217,8 +225,9 @@ bool MSWindowsClipboard::isOwnedByDeskflow()
 //   - "Deskflow Ownership" set by another process was invisible, so the elevated core treated every
 //     such write as a foreign clipboard change and fired ClipboardGrabbed — defeating the ownership
 //     protocol and propagating content that was explicitly marked as already-synced.
-//   - "HTML Format" (MSWindowsClipboardHTMLConverter) is likewise a REGISTERED format, so has()
-//     could not see HTML on the clipboard under elevation and HTML sync silently degraded.
+//   - "HTML Format" (MSWindowsClipboardHTMLConverter) is likewise a REGISTERED format, and the apps
+//     that publish HTML run unelevated, so has() would not see it and HTML sync degrades to plain
+//     text. Inferred from the same measured mechanism; not separately reproduced.
 //
 // EnumClipboardFormats is truthful in both contexts, so it is the authority; the cheap
 // IsClipboardFormatAvailable call is kept as a fast path so unelevated behaviour is byte-identical.

@@ -78,10 +78,18 @@ injection logic on top of them.
 
 **Files:** `src/lib/platform/MSWindowsClipboard.{h,cpp}`
 
-`IsClipboardFormatAvailable()` **misreports REGISTERED clipboard formats** when the
-core runs elevated (LocalSystem + UIAccess — how the MouseTransfer wrapper starts it
-so it can drive UAC prompts). Measured on Windows 10 19045 with the core's own
-temporary instrumentation:
+`IsClipboardFormatAvailable()` **misreports a REGISTERED clipboard format that was
+placed by a LOWER-PRIVILEGE process**, when the reader runs elevated (LocalSystem +
+UIAccess — how the MouseTransfer wrapper starts the core so it can drive UAC prompts).
+
+Scope matters, and was measured rather than assumed. A format the elevated core placed
+**itself** is visible to it normally, so Deskflow's own echo-suppression has always
+worked: across the whole server log, no client ever announced a grab after writing a
+received clipboard. Two same-integrity processes also see each other's formats fine.
+Only the cross-privilege direction fails — which is exactly the direction a wrapper
+needs, and one stock Deskflow never exercises.
+
+Measured on Windows 10 19045 with the core's own temporary instrumentation:
 
 ```
 MTDIAG isOwnedByDeskflow: cached=C242 fresh=C242 availCached=0 availFresh=0 formats=[000D C242]
@@ -102,8 +110,10 @@ tagged"*:
    — defeating its own ownership protocol and re-publishing content that had been
    explicitly marked as already-synced.
 2. **`HTML Format` is likewise a REGISTERED format** (`MSWindowsClipboardHTMLConverter`),
-   so `has()` could not see HTML on the clipboard under elevation and HTML clipboard
-   sync silently degraded to plain text.
+   and normal apps that publish HTML (browsers, editors) run unelevated — the same
+   cross-privilege direction — so `has()` would not see HTML on the clipboard and HTML
+   sync degrades to plain text. *Inferred from the measured mechanism and fixed by the
+   same change; not separately reproduced.*
 
 Fix: a new `MSWindowsClipboard::isFormatOnClipboard()` used by `isOwnedByDeskflow()`
 and `has()`. It keeps `IsClipboardFormatAvailable` as a fast path — so unelevated
