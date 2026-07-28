@@ -15,8 +15,6 @@
 #include <cstring>
 #include <fstream>
 
-size_t ClipboardChunk::s_expectedSize = 0;
-
 bool ClipboardChunk::diagEnabled()
 {
   // Delegates to the shared gate in `base` so the net layer can use the same switch without
@@ -73,7 +71,7 @@ ClipboardChunk *ClipboardChunk::end(ClipboardID id, uint32_t sequence)
 }
 
 TransferState
-ClipboardChunk::assemble(deskflow::IStream *stream, std::string &dataCached, ClipboardID &id, uint32_t &sequence)
+ClipboardChunk::assemble(deskflow::IStream *stream, Assembly (&state)[kClipboardEnd], ClipboardID &id, uint32_t &sequence)
 {
   using enum TransferState;
   uint8_t mark;
@@ -83,26 +81,36 @@ ClipboardChunk::assemble(deskflow::IStream *stream, std::string &dataCached, Cli
     return Error;
   }
 
+  // Validate the id BEFORE indexing, not just in the DataEnd branch as before -- `id` comes
+  // straight off the wire and is about to select a buffer.
+  if (id >= kClipboardEnd) {
+    LOG_ERR("clipboard transmission failed: invalid clipboard id %d", id);
+    return Error;
+  }
+  Assembly &a = state[id];
+
   if (mark == ChunkType::DataStart) {
-    s_expectedSize = QString::fromStdString(data).toULong();
+    a.expectedSize = QString::fromStdString(data).toULong();
     LOG_DEBUG("start receiving clipboard data");
-    dataCached.clear();
+    a.data.clear();
     return Started;
   } else if (mark == ChunkType::DataChunk) {
-    dataCached.append(data);
+    a.data.append(data);
     return TransferState::InProgress;
   } else if (mark == ChunkType::DataEnd) {
     // validate
-    if (id >= kClipboardEnd) {
-      return Error;
-    } else if (s_expectedSize != dataCached.size()) {
-      LOG_ERR("corrupted clipboard data, expected size=%d actual size=%d", s_expectedSize, dataCached.size());
+    if (a.expectedSize != a.data.size()) {
+      LOG_ERR("corrupted clipboard data, expected size=%d actual size=%d", a.expectedSize, a.data.size());
+      // RESET on error. Previously the buffer was left populated, so a corrupt transfer poisoned
+      // the size check of the next one that arrived without an intervening DataStart.
+      a.reset();
       return Error;
     }
     return Finished;
   }
 
   LOG_ERR("clipboard transmission failed: unknown error");
+  a.reset();
   return Error;
 }
 

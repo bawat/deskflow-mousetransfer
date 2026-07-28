@@ -250,7 +250,8 @@ int SecureSocket::secureRead(void *buffer, int size, int &read)
     LOG_DEBUG2("reading secure socket");
     read = SSL_read(m_ssl->m_ssl, buffer, size);
 
-    static int retry;
+    // Per-socket, was `static int retry;` -- see the member declaration for why that mattered.
+    int &retry = m_sslReadRetry;
 
     // Check result will cleanup the connection in the case of a fatal
     checkResult(read, retry);
@@ -278,7 +279,8 @@ int SecureSocket::secureWrite(const void *buffer, int size, int &wrote)
 
     wrote = SSL_write(m_ssl->m_ssl, buffer, size);
 
-    static int retry;
+    // Per-socket, was `static int retry;` -- see the member declaration for why that mattered.
+    int &retry = m_sslWriteRetry;
 
     // Check result will cleanup the connection in the case of a fatal
     checkResult(wrote, retry);
@@ -436,7 +438,9 @@ int SecureSocket::secureAccept(int socket)
   LOG_DEBUG2("accepting secure socket");
   int r = SSL_accept(m_ssl->m_ssl);
 
-  static int retry;
+  // Per-socket, was `static int retry;`. This one was the most dangerous of the four: the
+  // `retry == 0` branch below decides the handshake is COMPLETE and sets m_secureReady.
+  int &retry = m_sslAcceptRetry;
 
   checkResult(r, retry);
 
@@ -499,7 +503,9 @@ int SecureSocket::secureConnect(int socket)
   SSL_set1_host(m_ssl->m_ssl, name.c_str());
   int r = SSL_connect(m_ssl->m_ssl);
 
-  static int retry;
+  // Per-socket, was `static int retry;`. As with secureAccept, the branches below treat this
+  // counter as this connection's handshake state.
+  int &retry = m_sslConnectRetry;
 
   checkResult(r, retry);
 

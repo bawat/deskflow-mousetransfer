@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "deskflow/ClipboardChunk.h"
 #include "deskflow/ClipboardTypes.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/languages/LanguageManager.h"
@@ -127,4 +128,9 @@ private:
   std::string m_serverLanguage = "";
   bool m_isUserNotifiedAboutLanguageSyncError = false;
   deskflow::languages::LanguageManager m_languageManager;
+
+  // Per-connection, per-clipboard reassembly state. Was a `static std::string dataCached` inside
+  // setClipboard() -- ONE buffer shared by both clipboard ids and every ServerProxy in the
+  // process. See ClipboardChunk::Assembly for the corruption that caused.
+  ClipboardChunk::Assembly m_clipboardAssembly[kClipboardEnd];
 };

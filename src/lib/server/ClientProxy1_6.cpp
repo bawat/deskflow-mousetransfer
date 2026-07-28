@@ -73,20 +73,18 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
 bool ClientProxy1_6::recvClipboard()
 {
   // parse message
-  static std::string dataCached;
   ClipboardID id;
   uint32_t seq;
 
-  if (auto r = ClipboardChunk::assemble(getStream(), dataCached, id, seq); r == TransferState::Started) {
-    size_t size = ClipboardChunk::getExpectedSize();
-    LOG_DEBUG("receiving clipboard %d size=%d", id, size);
+  if (auto r = ClipboardChunk::assemble(getStream(), m_clipboardAssembly, id, seq); r == TransferState::Started) {
+    LOG_DEBUG("receiving clipboard %d size=%d", id, m_clipboardAssembly[id].expectedSize);
   } else if (r == TransferState::Finished) {
     LOG(
         (CLOG_DEBUG "received client \"%s\" clipboard %d seqnum=%d, size=%d", getName().c_str(), id, seq,
-         dataCached.size())
+         m_clipboardAssembly[id].data.size())
     );
     // save clipboard
-    m_clipboard[id].m_clipboard.unmarshall(dataCached, 0);
+    m_clipboard[id].m_clipboard.unmarshall(m_clipboardAssembly[id].data, 0);
     m_clipboard[id].m_sequenceNumber = seq;
 
     // notify

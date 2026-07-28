@@ -113,6 +113,19 @@ private:
   int m_writeRetrySize = 0;
   std::vector<uint8_t> m_writeBuffer;
 
+  // OpenSSL "want read/write/connect/accept" retry counters, one per operation. These were also
+  // FUNCTION-LOCAL STATICS (four separate `static int retry;`) shared by every TLS socket, and they
+  // are NOT merely untidy: checkResult() does `retry++` for every "want" case rather than assigning,
+  // so the count accumulated across unrelated sockets, and ssl_mutex_ is a per-INSTANCE member so
+  // nothing serialised them either. secureAccept/secureConnect then branch on `retry == 0` to decide
+  // a handshake is complete -- meaning one socket finishing could make another socket mid-handshake
+  // conclude it was secure, or a socket whose accept succeeded could stall because someone else had
+  // left the counter positive. Per-operation so their independent semantics are preserved.
+  int m_sslReadRetry = 0;
+  int m_sslWriteRetry = 0;
+  int m_sslAcceptRetry = 0;
+  int m_sslConnectRetry = 0;
+
   // MouseTransfer diagnostic: count reads so the FIRST few on any TLS socket can be traced. The
   // first bytes a freshly connected socket delivers are the whole question in the 2026-07-28
   // clipboard-chunk storm -- the server is proven to write only a 15-byte greeting, yet the client

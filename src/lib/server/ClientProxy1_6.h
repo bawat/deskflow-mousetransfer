@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "deskflow/ClipboardChunk.h"
 #include "server/ClientProxy1_5.h"
 
 class Server;
@@ -27,4 +28,10 @@ public:
 
 private:
   IEventQueue *m_events;
+
+  // Per-connection, per-clipboard reassembly state. Was a `static std::string dataCached` inside
+  // recvClipboard() -- ONE buffer shared by both clipboard ids AND EVERY CONNECTED CLIENT, so two
+  // clients sending clipboards at once interleaved into a single buffer. See
+  // ClipboardChunk::Assembly.
+  ClipboardChunk::Assembly m_clipboardAssembly[kClipboardEnd];
 };

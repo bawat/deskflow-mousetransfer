@@ -520,21 +520,19 @@ void ServerProxy::leave()
 void ServerProxy::setClipboard()
 {
   // parse
-  static std::string dataCached;
   ClipboardID id;
   uint32_t seq;
 
-  auto r = ClipboardChunk::assemble(m_stream, dataCached, id, seq);
+  auto r = ClipboardChunk::assemble(m_stream, m_clipboardAssembly, id, seq);
 
   if (r == TransferState::Started) {
-    size_t size = ClipboardChunk::getExpectedSize();
-    LOG_DEBUG("receiving clipboard %d size=%d", id, size);
+    LOG_DEBUG("receiving clipboard %d size=%d", id, m_clipboardAssembly[id].expectedSize);
   } else if (r == TransferState::Finished) {
-    LOG_DEBUG("received clipboard %d size=%d", id, dataCached.size());
+    LOG_DEBUG("received clipboard %d size=%d", id, m_clipboardAssembly[id].data.size());
 
     // forward
     Clipboard clipboard;
-    clipboard.unmarshall(dataCached, 0);
+    clipboard.unmarshall(m_clipboardAssembly[id].data, 0);
     m_client->setClipboard(id, &clipboard);
 
     LOG_INFO("clipboard was updated");

@@ -593,3 +593,49 @@ this outage (each call memsets and refills it), but it is the same hazard class 
 
 Full investigation, the deterministic repro and the refuted theories: the wrapper repo's
 `claudemd/clipboard.md` and `seeyoulater/testtasks/clipboard-chunk-storm-repro.md`.
+
+### Audit: every other shared-mutable-state instance of the same class (2026-07-29)
+
+After fixing `SecureSocket::doWrite`, the fork was swept for the same bug class — per-connection or
+per-instance state held in process-wide storage. Six more live instances were found and fixed; the
+rest of the codebase is clean.
+
+**`SecureSocket`: four more `static int retry;`** (in `secureRead`, `secureWrite`, `secureAccept`,
+`secureConnect`). These are worse than they look. `checkResult()` does **`retry++`** for every
+"want read/write/connect/accept" case rather than assigning, so the counter ACCUMULATED across
+unrelated sockets, and `ssl_mutex_` is a per-INSTANCE member so nothing serialised them either.
+`secureAccept` and `secureConnect` then branch on `retry == 0` to decide a TLS handshake is
+complete:
+
+```cpp
+if (retry == 0) {          // "if not fatal and no retry, state is good"
+  ...verify fingerprint...
+  m_secureReady = true;
+}
+```
+
+So one socket completing its handshake could make a different socket, still mid-handshake, conclude
+it was secure — or a socket whose `SSL_accept` had succeeded could stall because an unrelated socket
+had left the counter positive. Now four per-operation members
+(`m_sslReadRetry` / `m_sslWriteRetry` / `m_sslAcceptRetry` / `m_sslConnectRetry`).
+
+**Clipboard reassembly: `ClipboardChunk::s_expectedSize` plus a `static std::string dataCached` in
+BOTH `ServerProxy::setClipboard` (client side) and `ClientProxy1_6::recvClipboard` (server side).**
+Between them, one buffer and one expected-size served every clipboard id and every connection — on
+the server, every connected CLIENT — so two overlapping transfers appended into a single buffer and
+were checked against a single size. That is the outage's other half, the observed
+`corrupted clipboard data, expected size=8294452 actual size=17113192` (exactly two whole transfers
+plus one 512 KB chunk). Replaced by `ClipboardChunk::Assembly`, an array held per connection and
+indexed by clipboard id, so a transfer for clipboard 0 cannot disturb clipboard 1 and one connection
+cannot disturb another. Two robustness fixes ride along: the clipboard id is validated BEFORE it is
+used to index (it comes straight off the wire), and the buffer is RESET on error — previously a
+corrupt transfer was left in place and poisoned the size check of the next one to arrive without an
+intervening DataStart.
+
+**Assessed and left alone** (genuinely process-global, not per-instance state):
+`MSWindowsClipboard::s_ownershipFormat` (a `RegisterClipboardFormat` id, identical process-wide by
+definition), `MSWindowsScreen::s_windowInstance` (the module `HINSTANCE`),
+`OSXScreen::s_testedForGHOM`/`s_hasGHOM` (a one-time OS capability probe), the Meyers singletons in
+`I18N`/`Settings`, and `MSWindowsScreen`'s `bogusZoneSize` (declared `static` but never written — a
+constant in disguise). A scan for file-scope mutable statics across `net`/`deskflow`/`server`/
+`client`/`base`/`io`/`mt` came back empty.
