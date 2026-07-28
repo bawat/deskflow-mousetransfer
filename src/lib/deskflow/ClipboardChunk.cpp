@@ -13,6 +13,7 @@
 #include "io/IStream.h"
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 size_t ClipboardChunk::s_expectedSize = 0;
 
@@ -20,9 +21,22 @@ bool ClipboardChunk::diagEnabled()
 {
   // Function-local static: computed on first use, thread-safe initialisation guaranteed by the
   // standard, and no dependency on static init order across translation units.
+  //
+  // A SENTINEL FILE is the primary switch, not just the environment variable, and that is
+  // operational rather than stylistic. The elevated core inherits its environment from the
+  // LocalSystem launcher, and that launcher SURVIVES a core swap (the swap works by bumping the
+  // `coremode` nonce and letting the launcher respawn the core) -- so setting a machine
+  // environment variable does NOT reach the core without also restarting the launcher chain,
+  // which is exactly the kind of extra step that duplicates processes. A file needs no restart
+  // at all: first use is the first chunk send, long after startup, so dropping the file in
+  // enables tracing on a core that is already running. It also matches the fork's existing
+  // file-driven controls (`switchreq`, `coremode`, `layoutreload`), which live in the same
+  // directory -- the core's CWD, set by the launcher to the bundle dir.
   static const bool on = [] {
-    const char *env = std::getenv("MOUSETRANSFER_CLIPDIAG");
-    return env != nullptr && *env == '1';
+    if (const char *env = std::getenv("MOUSETRANSFER_CLIPDIAG"); env != nullptr && *env == '1') {
+      return true;
+    }
+    return static_cast<bool>(std::ifstream("clipdiag"));
   }();
   return on;
 }

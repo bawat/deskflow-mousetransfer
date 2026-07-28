@@ -532,7 +532,7 @@ restarting the SERVER's core cleared it.
    leading candidate fix, and fixing and measuring in the same build would destroy the evidence
    that the fix is the right one.
 
-(2) and (3) are gated on `MOUSETRANSFER_CLIPDIAG=1` (`ClipboardChunk::diagEnabled()`, evaluated
+(2) and (3) are switched on by a `clipdiag` SENTINEL FILE in the core's working directory (the
 once) and emit at NOTE when enabled, falling back to DEBUG1 otherwise — deployed cores run at the
 DEFAULT log level, so DEBUG1 alone would have made them invisible on exactly the machines that
 need observing. Per 512 KB chunk, never per frame, so the cost is negligible even when on.
