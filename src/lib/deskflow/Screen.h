@@ -244,6 +244,13 @@ public:
   */
   bool isCursorClippedToSubRegion() const;
 
+  //! Get whether this screen's clipboard holds content WE placed (Merged-fork)
+  /*!
+  Returns true if the clipboard content here was written by the clipboard-sync
+  mechanism rather than copied by a local app. See MODIFICATIONS.md.
+  */
+  bool isClipboardOwnedByUs() const;
+
   //! Get jump zone size
   /*!
   Return the jump zone size, the size of the regions on the edges of

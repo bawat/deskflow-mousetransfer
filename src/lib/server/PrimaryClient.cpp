@@ -74,6 +74,11 @@ bool PrimaryClient::isCursorClippedToSubRegion() const
   return m_screen->isCursorClippedToSubRegion();
 }
 
+bool PrimaryClient::isClipboardOwnedByUs() const
+{
+  return m_screen->isClipboardOwnedByUs();
+}
+
 void *PrimaryClient::getEventTarget() const
 {
   return m_screen->getEventTarget();

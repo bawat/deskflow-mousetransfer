@@ -705,6 +705,16 @@ bool MSWindowsScreen::isAnyMouseButtonDown(uint32_t &buttonID) const
   return false;
 }
 
+bool MSWindowsScreen::isClipboardOwnedByUs() const
+{
+  // Merged-fork: does this screen's clipboard currently hold content the sync mechanism placed,
+  // rather than something a local app copied? That is exactly what the "Deskflow Ownership" marker
+  // records, and it is the same question onClipboardChange asks before deciding whether to grab.
+  // Exposing it lets Server::onScreenSwitch apply the SAME rule to its leave-time re-read, so the
+  // announce and fetch paths cannot disagree. See MODIFICATIONS.md.
+  return MSWindowsClipboard::isOwnedByDeskflow();
+}
+
 bool MSWindowsScreen::isCursorClippedToSubRegion() const
 {
   // Merged-fork: report whether the OS cursor is confined (ClipCursor) to a PROPER sub-region of

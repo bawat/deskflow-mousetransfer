@@ -158,6 +158,24 @@ public:
     return false;
   }
 
+  //! Test if this screen's clipboard currently holds content WE placed (Merged-fork)
+  /*!
+  Return true iff the clipboard content on this screen was written by the clipboard-sync
+  mechanism itself rather than copied by a local application — on Windows, the presence of
+  the "Deskflow Ownership" marker. The default is false, which preserves stock behaviour on
+  platforms that cannot observe it.
+
+  Used to stop the server re-publishing content it (or a wrapper) has already synced: the
+  ownership marker gates the ANNOUNCE path (onClipboardChange suppresses the grab), and this
+  gates the matching FETCH path in Server::onScreenSwitch. Without it the two disagree — a
+  screen that grabbed once stays m_clipboardOwner, so every later leave re-reads and
+  re-publishes whatever is on the clipboard now, marker or no marker. See MODIFICATIONS.md.
+  */
+  virtual bool isClipboardOwnedByUs() const
+  {
+    return false;
+  }
+
   //@}
   // IKeyState overrides
   void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) override = 0;

@@ -486,7 +486,20 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
 
     // update the primary client's clipboards if we're leaving the
     // primary screen.
-    if (m_active == m_primaryClient && m_enableClipboard) {
+    //
+    // MouseTransfer: ...unless what is on that clipboard was placed by clipboard sync itself
+    // rather than copied by a local app. The "Deskflow Ownership" marker already gates the
+    // ANNOUNCE path (MSWindowsScreen::onClipboardChange suppresses the grab for such content);
+    // without the same check here the two paths DISAGREE. This re-read is gated only on
+    // m_clipboardOwner, which is assigned at grab time and then sticks — so a screen that
+    // grabbed once re-publishes whatever is on its clipboard at EVERY later leave, marker or
+    // no marker. Stock Deskflow never notices: the only content it writes locally came from
+    // the server, so the re-read marshals identical bytes and onClipboardChanged's
+    // "data == m_clipboardData" dedup swallows it. It matters the moment anything places
+    // DIFFERENT content and tags it as already-synced (the MouseTransfer wrapper writing a
+    // peer's clipboard), which is precisely what the marker is asserting must not spread.
+    // Defaults false off-Windows, so stock behaviour elsewhere is unchanged.
+    if (m_active == m_primaryClient && m_enableClipboard && !m_primaryClient->isClipboardOwnedByUs()) {
       for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         const ClipboardInfo &clipboard = m_clipboards[id];
         if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {

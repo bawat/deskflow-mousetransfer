@@ -323,6 +323,11 @@ bool Screen::isCursorClippedToSubRegion() const
   return m_screen->isCursorClippedToSubRegion();
 }
 
+bool Screen::isClipboardOwnedByUs() const
+{
+  return m_screen->isClipboardOwnedByUs();
+}
+
 int32_t Screen::getJumpZoneSize() const
 {
   if (!m_isPrimary) {

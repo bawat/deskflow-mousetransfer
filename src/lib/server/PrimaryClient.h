@@ -104,6 +104,13 @@ public:
   */
   bool isCursorClippedToSubRegion() const;
 
+  //! Test if this screen's clipboard holds content the sync mechanism placed (Merged-fork)
+  /*!
+  Returns true if the clipboard here was written by clipboard sync rather than copied by a
+  local app, so the server must not re-publish it on leave. See MODIFICATIONS.md.
+  */
+  bool isClipboardOwnedByUs() const;
+
   //@}
 
   // FIXME -- these probably belong on IScreen

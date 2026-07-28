@@ -125,10 +125,38 @@ clipboard-change notification, exactly when every other watcher is looking too �
 single attempt lost that race often enough to make the fix look intermittent
 (measured 1-in-5 before the retry, 10-in-10 alternating trials after).
 
-**Not sufficient on its own for "write without propagating":** `Server::onScreenSwitch`
-separately re-reads and re-publishes the primary's clipboard on every leave whenever
-the server still records that screen as `m_clipboardOwner`, regardless of grabs. That
-path is platform-agnostic and unchanged here.
+**Not sufficient on its own for "write without propagating"** — see the next entry.
+
+### Clipboard ownership gates the FETCH path too (2026-07-28)
+
+**Files:** `src/lib/server/Server.cpp`, `src/lib/deskflow/IPlatformScreen.h`,
+`src/lib/deskflow/Screen.{h,cpp}`, `src/lib/server/PrimaryClient.{h,cpp}`,
+`src/lib/platform/MSWindowsScreen.{h,cpp}`
+
+Two paths publish the primary's clipboard, and only one consulted the ownership marker:
+
+| path | trigger | gated on |
+|---|---|---|
+| announce | `MSWindowsScreen::onClipboardChange` → grab | `!isOwnedByDeskflow()` ✅ |
+| fetch | `Server::onScreenSwitch` → `onClipboardChanged` | `m_clipboardOwner` only ❌ |
+
+`m_clipboardOwner` is assigned at grab time and then sticks, so a screen that grabbed
+once re-reads and re-publishes whatever is on its clipboard at **every later leave** —
+marker or no marker.
+
+Stock Deskflow never notices, which is why this was not a pre-existing bug: the only
+content it writes locally came from the server, so the re-read marshals identical bytes
+and the `data == m_clipboardData` dedup in `onClipboardChanged` swallows it. It matters
+the moment something places **different** content and tags it as already-synced — a
+wrapper writing a peer's clipboard — which is exactly what the marker asserts must not
+spread.
+
+Fix: gate that block on a new `isClipboardOwnedByUs()`, plumbed the same way as the
+existing `isCursorClippedToSubRegion()` query (`IPlatformScreen` default **false** →
+`Screen` → `PrimaryClient` → `MSWindowsScreen`, which answers with
+`MSWindowsClipboard::isOwnedByDeskflow()`). Non-Windows platforms take the default, so
+stock behaviour there is untouched. Now one rule holds on both paths: **content the sync
+mechanism placed is never re-published.**
 
 ### Clipboard coexistence with out-of-band file sync (2026-06-25)
 
