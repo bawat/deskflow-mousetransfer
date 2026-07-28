@@ -7,6 +7,7 @@
 
 #include "deskflow/PacketStreamFilter.h"
 #include "base/IEventQueue.h"
+#include "base/Log.h"
 #include "deskflow/ProtocolTypes.h"
 
 #include <cstring>
@@ -115,6 +116,12 @@ bool PacketStreamFilter::readPacketSize()
     m_buffer.pop(sizeof(buffer));
     m_size =
         ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16) | ((uint32_t)buffer[2] << 8) | (uint32_t)buffer[3];
+    // MouseTransfer diagnostic: the packet LENGTH prefix this filter just parsed. A greeting
+    // packet is 11; the clipboard chunk seen in the storm is 524,291. Logged with the filter
+    // address because those addresses are REUSED across connections, so identity matters.
+    if (mtDiagEnabled()) {
+      LOG_NOTE("clipdiag: packet length parsed: %u on filter=%p", m_size, static_cast<void *>(this));
+    }
     if (m_size > PROTOCOL_MAX_MESSAGE_LENGTH) {
       m_events->addEvent(Event(EventTypes::StreamInputFormatError, getEventTarget()));
       return false;

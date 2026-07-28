@@ -129,6 +129,23 @@ TCPSocket::JobResult SecureSocket::doRead()
   if (bytesRead > 0) {
     bool wasEmpty = (m_inputBuffer.getSize() == 0);
 
+    // MouseTransfer diagnostic: what did this socket ACTUALLY receive first? The server is proven
+    // to write only a 15-byte greeting to a freshly accepted connection, yet a client parses a
+    // 524,291-byte packet length off one. NB the `buffer` above is `static` -- shared by every TLS
+    // socket in the process, unlike TCPSocket::doRead's plain local -- which is a prime suspect for
+    // one connection's bytes landing in another's input buffer, so log the ADDRESS too.
+    if (++m_diagReads <= 3 && mtDiagEnabled()) {
+      char hex[3 * 12 + 1] = {0};
+      const int show = bytesRead < 12 ? bytesRead : 12;
+      for (int i = 0; i < show; ++i) {
+        snprintf(hex + i * 3, 4, "%02x ", buffer[i]);
+      }
+      LOG_NOTE(
+          "clipdiag: TLS READ #%u: sock=%p bytes=%d bufaddr=%p first: %s", m_diagReads,
+          static_cast<void *>(getSocket()), bytesRead, static_cast<void *>(buffer), hex
+      );
+    }
+
     // slurp up as much as possible
     do {
       m_inputBuffer.write(buffer, bytesRead);

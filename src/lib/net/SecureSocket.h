@@ -95,5 +95,11 @@ private:
   std::unique_ptr<Ssl> m_ssl;
   bool m_secureReady = false;
   bool m_fatal = false;
+
+  // MouseTransfer diagnostic: count reads so the FIRST few on any TLS socket can be traced. The
+  // first bytes a freshly connected socket delivers are the whole question in the 2026-07-28
+  // clipboard-chunk storm -- the server is proven to write only a 15-byte greeting, yet the client
+  // parses a 524,291-byte packet length. Counter only; no behaviour.
+  uint32_t m_diagReads = 0;
   SecurityLevel m_securityLevel = SecurityLevel::Encrypted;
 };
