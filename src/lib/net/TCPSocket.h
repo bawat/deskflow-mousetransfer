@@ -147,4 +147,10 @@ private:
   IEventQueue *m_events;
   CondVar<bool> m_flushed;
   SocketMultiplexer *m_socketMultiplexer;
+
+  // MouseTransfer diagnostic: count writes so the FIRST few on any socket can be traced whatever
+  // their size. The size threshold alone (>=4096) was deliberately chosen to keep mouse motion out
+  // of the log, but it also hid the ~15-byte greeting -- which is precisely the write that decides
+  // whether the hello reached the socket the client just connected on. Counter only; no behaviour.
+  uint32_t m_diagWrites = 0;
 };

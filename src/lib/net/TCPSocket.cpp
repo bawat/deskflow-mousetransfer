@@ -181,9 +181,12 @@ void TCPSocket::write(const void *buffer, uint32_t n)
     // 512 KB while input messages are tens of bytes, so this threshold separates them cleanly and
     // keeps the trace free during normal use. Answers "did anything actually WRITE this data to
     // the new connection, or was it already sitting in the buffer?".
-    if (n >= 4096 && mtDiagEnabled()) {
+    // Log LARGE writes (clipboard chunks are 512 KB) and, whatever the size, the first few writes
+    // on any socket -- the greeting is ~15 bytes and is the one that matters at connection time.
+    ++m_diagWrites;
+    if ((n >= 4096 || m_diagWrites <= 4) && mtDiagEnabled()) {
       LOG_NOTE(
-          "clipdiag: socket WRITE: sock=%p n=%u buffered-after=%u", static_cast<void *>(m_socket), n,
+          "clipdiag: socket WRITE #%u: sock=%p n=%u buffered-after=%u", m_diagWrites, static_cast<void *>(m_socket), n,
           m_outputBuffer.getSize()
       );
     }

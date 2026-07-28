@@ -153,6 +153,17 @@ void ClientListener::handleClientAccepted(IDataSocket *socket)
   deskflow::IStream *stream = new PacketStreamFilter(m_events, socket, false);
   assert(m_server != nullptr);
 
+  // MouseTransfer diagnostic: bind the whole chain for ONE accepted connection --
+  // socket -> stream -> unknown-proxy. Without this the socket-level trace and the proxy-level
+  // trace cannot be joined up, and the question under investigation is precisely whether the
+  // greeting written by the proxy below lands on the socket that was just accepted here, or on
+  // some other (stale, or address-reused) one.
+  if (mtDiagEnabled()) {
+    LOG_NOTE(
+        "clipdiag: ACCEPTED chain: sock=%p stream=%p", static_cast<void *>(socket), static_cast<void *>(stream)
+    );
+  }
+
   // create proxy for unknown client
   auto *client = new ClientProxyUnknown(stream, 30.0, m_server, m_events);
 

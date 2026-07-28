@@ -44,6 +44,12 @@ ClientProxyUnknown::ClientProxyUnknown(deskflow::IStream *stream, double timeout
   const auto helloMessage = protocol + kMsgHelloArgs;
 
   LOG_INFO("saying hello as %s, protocol v%d.%d", protocol.c_str(), kProtocolMajorVersion, kProtocolMinorVersion);
+  // MouseTransfer diagnostic: name the STREAM the greeting is written to. Pair with the
+  // "ACCEPTED chain" line to confirm it is the stream of the connection just accepted, and with
+  // the socket-level WRITE line to confirm it reaches that connection's socket.
+  if (mtDiagEnabled()) {
+    LOG_NOTE("clipdiag: writing HELLO to stream=%p (proxy=%p)", static_cast<void *>(m_stream), static_cast<void *>(this));
+  }
   ProtocolUtil::writef(m_stream, helloMessage.c_str(), kProtocolMajorVersion, kProtocolMinorVersion);
 }
 
