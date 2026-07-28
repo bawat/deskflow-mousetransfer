@@ -11,9 +11,21 @@
 #include "deskflow/ProtocolTypes.h"
 #include "deskflow/ProtocolUtil.h"
 #include "io/IStream.h"
+#include <cstdlib>
 #include <cstring>
 
 size_t ClipboardChunk::s_expectedSize = 0;
+
+bool ClipboardChunk::diagEnabled()
+{
+  // Function-local static: computed on first use, thread-safe initialisation guaranteed by the
+  // standard, and no dependency on static init order across translation units.
+  static const bool on = [] {
+    const char *env = std::getenv("MOUSETRANSFER_CLIPDIAG");
+    return env != nullptr && *env == '1';
+  }();
+  return on;
+}
 
 ClipboardChunk::ClipboardChunk(size_t size) : Chunk(size)
 {
@@ -100,14 +112,32 @@ void ClipboardChunk::send(deskflow::IStream *stream, void *data)
 {
   const auto *clipboardData = static_cast<ClipboardChunk *>(data);
 
-  LOG_DEBUG1("sending clipboard chunk");
-
   const char *chunk = clipboardData->m_chunk;
   ClipboardID id = chunk[0];
   uint32_t sequence;
   std::memcpy(&sequence, &chunk[1], 4);
   uint8_t mark = chunk[5];
   std::string dataChunk(&chunk[6], clipboardData->m_dataSize);
+
+  // MouseTransfer diagnostic: log the DESTINATION STREAM alongside the chunk header, not just
+  // "sending clipboard chunk". These events are queued against a raw proxy pointer
+  // (StreamChunker::sendClipboard posts the whole train up front, EventQueue dispatches by
+  // address), so the question that matters when clipboard data turns up on a connection that
+  // never asked for it is *which stream did this chunk go to* -- which the old line could not
+  // answer. A chunk whose mark is DataChunk arriving on a stream that has seen no DataStart is
+  // a resumed, orphaned transfer.
+  if (diagEnabled()) {
+    LOG_NOTE(
+        "clipdiag: sending clipboard chunk: stream=%p clipboard=%d sequence=%u mark=%d size=%d",
+        static_cast<void *>(stream), static_cast<int>(id), sequence, static_cast<int>(mark),
+        static_cast<int>(dataChunk.size())
+    );
+  } else {
+    LOG_DEBUG1(
+        "sending clipboard chunk: stream=%p clipboard=%d sequence=%u mark=%d size=%d", static_cast<void *>(stream),
+        static_cast<int>(id), sequence, static_cast<int>(mark), static_cast<int>(dataChunk.size())
+    );
+  }
 
   switch (mark) {
   case ChunkType::DataStart:

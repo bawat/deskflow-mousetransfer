@@ -582,6 +582,46 @@ void Client::handleHello()
   if (const auto proto = networkProtocolFromString(QString::fromStdString(protocolName));
       proto == NetworkProtocol::Unknown) {
     LOG_WARN("hello back received with protocol: '%s'", protocolName.c_str());
+    // MouseTransfer diagnostic (2026-07-28 clipboard-chunk storm). The protocol name is a FIXED
+    // 7-byte read (kMsgHello = "%7s%2i%2i"), so `protocolName` is literally the head of whatever
+    // the server put on this stream. Printing it through %s stops at the first NUL, which is why
+    // a clipboard chunk surfaces as just 'DCLP' -- the clipboard-id byte following the code is
+    // zero. That single token cannot distinguish the two situations it might mean, and they call
+    // for opposite actions:
+    //
+    //   * an incompatible PEER  -> the remote build is wrong; upgrading it is the fix.
+    //   * a MIS-FRAMED stream   -> a message BODY arrived where the greeting belongs. Nothing is
+    //                              wrong with either build, the server is mid-write of something
+    //                              else, and no amount of restarting THIS core will help.
+    //
+    // The backlog size separates them: a greeting is 11 bytes, so a large queued size means the
+    // server is streaming a message body at us. Dump both.
+    {
+      std::string hex;
+      hex.reserve(protocolName.size() * 3);
+      for (const unsigned char c : protocolName) {
+        static const char *const digits = "0123456789abcdef";
+        if (!hex.empty()) {
+          hex += ' ';
+        }
+        hex += digits[(c >> 4) & 0x0f];
+        hex += digits[c & 0x0f];
+      }
+      LOG_WARN(
+          "  greeting bytes: %s | %u more byte(s) already queued behind them on this stream", hex.c_str(),
+          m_stream->getSize()
+      );
+      // kMsgDClipboard is "DCLP%1i%4i%1i%s"; only the 4-char code is a literal, so compare that
+      // much. Byte 4 is the clipboard id -- the rest of the header (sequence, chunk mark) lies
+      // past the 7 bytes the hello read consumed, so it is deliberately not decoded here.
+      if (protocolName.size() >= 5 && protocolName.compare(0, 4, kMsgDClipboard, 0, 4) == 0) {
+        LOG_WARN(
+            "  ==> this is CLIPBOARD DATA (kMsgDClipboard) for clipboard %d, not a greeting: the "
+            "server is writing a clipboard chunk stream onto a fresh connection. Restart the SERVER's core.",
+            static_cast<int>(static_cast<unsigned char>(protocolName[4]))
+        );
+      }
+    }
     sendConnectionFailedEvent("got invalid hello message from server");
     cleanupTimer();
     cleanupConnection();

@@ -24,6 +24,33 @@ ClientProxy1_6::ClientProxy1_6(const std::string &name, deskflow::IStream *strea
   m_events->addHandler(EventTypes::ClipboardSending, this, [this](const auto &e) {
     ClipboardChunk::send(getStream(), e.getDataObject());
   });
+  // MouseTransfer diagnostic: pair this with the destructor line below and with
+  // ClipboardChunk::send's stream= field. Together they answer the question the logs could not:
+  // is a ClipboardSending event still being delivered through a proxy that has already been
+  // destroyed, and onto which stream?
+  if (ClipboardChunk::diagEnabled()) {
+    LOG_NOTE(
+        "clipdiag: clientproxy1.6 CONSTRUCTED: proxy=%p stream=%p name=\"%s\"", static_cast<void *>(this),
+        static_cast<void *>(getStream()), getName().c_str()
+    );
+  }
+}
+
+ClientProxy1_6::~ClientProxy1_6()
+{
+  // DELIBERATELY only logging -- this destructor does NOT remove the ClipboardSending handler
+  // registered on `this` in the constructor. Adding that removal is the leading candidate FIX
+  // for the 2026-07-28 clipboard-chunk storm (Server::removeClient clears ScreenShapeChanged /
+  // ClipboardGrabbed / ClipboardChanged but not ClipboardSending, and EventQueue::dispatchEvent
+  // resolves handlers by raw void*), and it is being kept OUT of this instrumentation on
+  // purpose: fixing and measuring in the same build would destroy the evidence that the fix is
+  // the right one. Restore the removal only as a reviewed change, not as a drive-by.
+  if (ClipboardChunk::diagEnabled()) {
+    LOG_NOTE(
+        "clipdiag: clientproxy1.6 DESTROYED: proxy=%p stream=%p name=\"%s\" (ClipboardSending handler NOT removed)",
+        static_cast<void *>(this), static_cast<void *>(getStream()), getName().c_str()
+    );
+  }
 }
 
 void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)

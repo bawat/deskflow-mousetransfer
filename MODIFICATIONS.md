@@ -498,3 +498,41 @@ silent windows (~27s of total silence) before declaring it dead. Any data from t
 heartbeat echo or real input) resets the count in `handleData()`. A genuinely closed TCP still
 drops immediately via the separate `handleDisconnect()`/`handleWriteError()` paths, unchanged. Net:
 a transiently slow client is no longer flapped, while a truly-dead one is still dropped.
+
+### Clipboard-chunk storm diagnostics (2026-07-28)
+
+**Files:** `src/lib/client/Client.cpp`, `src/lib/deskflow/ClipboardChunk.cpp`,
+`src/lib/deskflow/ClipboardChunk.h`, `src/lib/server/ClientProxy1_6.cpp`,
+`src/lib/server/ClientProxy1_6.h`
+
+**Diagnostic only — no behaviour change.** Added while investigating an outage in which every
+client lost the shared cursor for 90+ minutes: a ~8 MB screenshot on the SERVER's clipboard was
+chunked into 512 KB `kMsgDClipboard` messages, and after a client dropped mid-transfer that chunk
+stream began arriving at the head of every NEW connection, ahead of the server's greeting.
+`Client::handleHello` reads a fixed 7-byte protocol name (`kMsgHello` = `"%7s%2i%2i"`), so each
+client read `'DCLP'`, rejected the greeting and retried ~1 Hz forever. A machine that had been
+switched OFF for the whole incident failed identically on its first ever attempt, and only
+restarting the SERVER's core cleared it.
+
+1. `Client::handleHello` — when the protocol name is unrecognised, also log the greeting bytes in
+   hex and `m_stream->getSize()` (how much is already queued behind them), and decode the
+   clipboard id when the bytes are a `kMsgDClipboard` header. The bare token could not distinguish
+   an incompatible PEER (upgrade it) from a MIS-FRAMED stream (a message body arrived where the
+   greeting belongs — nothing is wrong with either build), and those call for opposite actions.
+   Logged at WARN so it is visible at the default log level.
+
+2. `ClipboardChunk::send` — log the DESTINATION STREAM pointer alongside the chunk header
+   (clipboard id, sequence, mark). These events are queued against a raw proxy pointer, so "which
+   stream did this chunk go to" is the question that matters, and the old `"sending clipboard
+   chunk"` line could not answer it.
+
+3. `ClientProxy1_6` — construction/destruction now log the proxy and stream addresses. The
+   destructor is no longer `= default` purely so it can trace. It DELIBERATELY does not remove the
+   `ClipboardSending` handler the constructor registers on `this`; adding that removal is the
+   leading candidate fix, and fixing and measuring in the same build would destroy the evidence
+   that the fix is the right one.
+
+(2) and (3) are gated on `MOUSETRANSFER_CLIPDIAG=1` (`ClipboardChunk::diagEnabled()`, evaluated
+once) and emit at NOTE when enabled, falling back to DEBUG1 otherwise — deployed cores run at the
+DEFAULT log level, so DEBUG1 alone would have made them invisible on exactly the machines that
+need observing. Per 512 KB chunk, never per frame, so the cost is negligible even when on.

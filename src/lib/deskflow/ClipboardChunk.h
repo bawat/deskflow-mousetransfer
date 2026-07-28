@@ -37,6 +37,14 @@ public:
     return s_expectedSize;
   }
 
+  // MouseTransfer diagnostic gate (2026-07-28 clipboard-chunk storm). The chunk-level tracing
+  // this enables is per 512 KB chunk, not per frame, so it is cheap -- but it is OFF unless
+  // MOUSETRANSFER_CLIPDIAG=1 is set in the core's environment, because the core runs at its
+  // DEFAULT log level in the field. That matters: logging these at LOG_DEBUG1 alone made them
+  // invisible on exactly the deployed cores we need to observe, which would have wasted a whole
+  // repro. Evaluated once and cached.
+  static bool diagEnabled();
+
 private:
   static size_t s_expectedSize;
 };
