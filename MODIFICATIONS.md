@@ -74,6 +74,52 @@ either hook. The dead branches are left untouched (removing upstream code buys
 nothing); a comment in the file records this so nobody builds role-dependent
 injection logic on top of them.
 
+### Clipboard format visibility on an ELEVATED core (2026-07-28)
+
+**Files:** `src/lib/platform/MSWindowsClipboard.{h,cpp}`
+
+`IsClipboardFormatAvailable()` **misreports REGISTERED clipboard formats** when the
+core runs elevated (LocalSystem + UIAccess — how the MouseTransfer wrapper starts it
+so it can drive UAC prompts). Measured on Windows 10 19045 with the core's own
+temporary instrumentation:
+
+```
+MTDIAG isOwnedByDeskflow: cached=C242 fresh=C242 availCached=0 availFresh=0 formats=[000D C242]
+```
+
+The atom is correct (a freshly registered atom equals the cached one, and equals the
+atom the *writing* process used), `EnumClipboardFormats` lists `C242` sitting on the
+clipboard — and `IsClipboardFormatAvailable(C242)` still answers "no" for the very
+format it just enumerated. A core running as the normal **user** answers "yes" to the
+identical clipboard, deterministically. Standard formats (`CF_TEXT`, `CF_UNICODETEXT`,
+…) are reported correctly in both contexts; only registered ones are affected.
+
+Two user-visible consequences, both of which presented as *"the core ignores what we
+tagged"*:
+
+1. **`Deskflow Ownership` set by another process was invisible**, so the elevated core
+   treated every such write as a foreign clipboard change and fired `ClipboardGrabbed`
+   — defeating its own ownership protocol and re-publishing content that had been
+   explicitly marked as already-synced.
+2. **`HTML Format` is likewise a REGISTERED format** (`MSWindowsClipboardHTMLConverter`),
+   so `has()` could not see HTML on the clipboard under elevation and HTML clipboard
+   sync silently degraded to plain text.
+
+Fix: a new `MSWindowsClipboard::isFormatOnClipboard()` used by `isOwnedByDeskflow()`
+and `has()`. It keeps `IsClipboardFormatAvailable` as a fast path — so unelevated
+behaviour is byte-identical — and falls back to an `EnumClipboardFormats` scan, which
+is truthful in both contexts. The scan reuses an already-open clipboard when the caller
+holds one (`has()`, the unit tests), and otherwise opens it with a **bounded retry**
+(10 × 5 ms): the clipboard is a single-holder lock and this runs from the
+clipboard-change notification, exactly when every other watcher is looking too — a
+single attempt lost that race often enough to make the fix look intermittent
+(measured 1-in-5 before the retry, 10-in-10 alternating trials after).
+
+**Not sufficient on its own for "write without propagating":** `Server::onScreenSwitch`
+separately re-reads and re-publishes the primary's clipboard on every leave whenever
+the server still records that screen as `m_clipboardOwner`, regardless of grabs. That
+path is platform-agnostic and unchanged here.
+
 ### Clipboard coexistence with out-of-band file sync (2026-06-25)
 
 **Files:** `src/lib/platform/MSWindowsScreen.cpp`, `src/lib/server/Server.cpp`

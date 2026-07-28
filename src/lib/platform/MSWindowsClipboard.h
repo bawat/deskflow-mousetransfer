@@ -44,6 +44,14 @@ public:
   //! Test if clipboard is owned by deskflow
   static bool isOwnedByDeskflow();
 
+  //! Test whether a clipboard format is present, correctly for an ELEVATED process
+  /*!
+  MouseTransfer: use INSTEAD of IsClipboardFormatAvailable(), which misreports REGISTERED
+  formats (ownership marker, "HTML Format") when the core runs elevated. See the definition
+  for the measurement and consequences.
+  */
+  static bool isFormatOnClipboard(UINT format);
+
   // IClipboard overrides
   bool empty() override;
   void add(Format, const std::string &data) override;

@@ -142,7 +142,9 @@ bool MSWindowsClipboard::has(Format format) const
   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {
     IMSWindowsClipboardConverter *converter = *index;
     if (converter->getFormat() == format) {
-      if (IsClipboardFormatAvailable(converter->getWin32Format())) {
+      // MouseTransfer: via isFormatOnClipboard, not IsClipboardFormatAvailable — "HTML Format" is a
+      // REGISTERED format and is invisible to that API on an elevated core (see the note there).
+      if (isFormatOnClipboard(converter->getWin32Format())) {
         return true;
       }
     }
@@ -196,7 +198,83 @@ bool MSWindowsClipboard::isOwnedByDeskflow()
   if (s_ownershipFormat == 0) {
     s_ownershipFormat = RegisterClipboardFormat(TEXT("Deskflow Ownership"));
   }
-  return (IsClipboardFormatAvailable(getOwnershipFormat()) != 0);
+  return isFormatOnClipboard(getOwnershipFormat());
+}
+
+// MouseTransfer: IsClipboardFormatAvailable() MISREPORTS REGISTERED clipboard formats when the
+// core runs elevated (LocalSystem + UIAccess, which is how the MouseTransfer wrapper starts it so
+// it can drive UAC prompts). Measured on Windows 10 19045 with the core's own instrumentation:
+//
+//   MTDIAG isOwnedByDeskflow: cached=C242 fresh=C242 availCached=0 availFresh=0 formats=[000D C242]
+//
+// i.e. the atom is right (a freshly registered atom equals the cached one, and equals the atom the
+// writing process used), EnumClipboardFormats lists C242 sitting on the clipboard — and
+// IsClipboardFormatAvailable(C242) still answers "no" for the very format just enumerated. A core
+// running as the normal USER answers "yes" to the identical clipboard. Standard formats (CF_TEXT,
+// CF_UNICODETEXT...) are reported correctly either way; only registered ones are affected.
+//
+// Consequences this fixes, both of which presented as "the core ignores what we tagged":
+//   - "Deskflow Ownership" set by another process was invisible, so the elevated core treated every
+//     such write as a foreign clipboard change and fired ClipboardGrabbed — defeating the ownership
+//     protocol and propagating content that was explicitly marked as already-synced.
+//   - "HTML Format" (MSWindowsClipboardHTMLConverter) is likewise a REGISTERED format, so has()
+//     could not see HTML on the clipboard under elevation and HTML sync silently degraded.
+//
+// EnumClipboardFormats is truthful in both contexts, so it is the authority; the cheap
+// IsClipboardFormatAvailable call is kept as a fast path so unelevated behaviour is byte-identical.
+bool MSWindowsClipboard::isFormatOnClipboard(UINT format)
+{
+  if (format == 0) {
+    return false;
+  }
+
+  // Fast path — correct for a normally-privileged process, and no clipboard open required.
+  if (IsClipboardFormatAvailable(format) != 0) {
+    return true;
+  }
+
+  // Enumerating requires the clipboard to be OPEN by us. Try it as-is first: has() and the unit
+  // tests call this while they already hold the clipboard, and opening a clipboard we already own
+  // only to close it again would yank it out from under the caller mid-operation.
+  SetLastError(ERROR_SUCCESS);
+  const UINT first = EnumClipboardFormats(0);
+  if (first != 0 || GetLastError() != ERROR_CLIPBOARD_NOT_OPEN) {
+    for (UINT f = first; f != 0; f = EnumClipboardFormats(f)) {
+      if (f == format) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Not open (the onClipboardChange / checkClipboards callers) — open it just for the scan.
+  //
+  // RETRY, briefly. The clipboard is a single-holder lock and this runs from the clipboard-change
+  // notification, precisely when everyone else is looking too (the MouseTransfer wrapper's own
+  // watcher opens it on every sequence change). A single attempt loses that race often enough to
+  // make the fix look intermittent — measured 1-in-5 before this loop, 5-in-5 after. Bounded hard
+  // because we are on the core's message thread: 10 x 5ms is invisible on an event that fires only
+  // when a human copies something, and losing anyway just answers as the old code did.
+  bool opened = false;
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    if (OpenClipboard(nullptr)) {
+      opened = true;
+      break;
+    }
+    Sleep(5);
+  }
+  if (!opened) {
+    return false;
+  }
+  bool found = false;
+  for (UINT f = EnumClipboardFormats(0); f != 0; f = EnumClipboardFormats(f)) {
+    if (f == format) {
+      found = true;
+      break;
+    }
+  }
+  CloseClipboard();
+  return found;
 }
 
 UINT MSWindowsClipboard::getOwnershipFormat()
