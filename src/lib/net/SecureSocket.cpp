@@ -109,8 +109,13 @@ void SecureSocket::secureAccept()
 TCPSocket::JobResult SecureSocket::doRead()
 {
   using enum JobResult;
-  static uint8_t buffer[4096];
-  static const auto bufferSize = std::size(buffer);
+  // Deliberately a plain LOCAL, matching TCPSocket::doRead. This was `static uint8_t buffer[4096]`
+  // -- one receive buffer shared by every TLS socket in the process. It was not the cause of the
+  // 2026-07-28 outage (each call memsets and refills it before use), but it is the same hazard
+  // class as the write-side statics that WERE, and there is no reason for it: 4 KB of stack costs
+  // nothing and the plaintext path has always done it this way.
+  uint8_t buffer[4096];
+  const auto bufferSize = std::size(buffer);
   memset(buffer, 0, bufferSize);
   int bytesRead = 0;
   int status = 0;
@@ -129,11 +134,11 @@ TCPSocket::JobResult SecureSocket::doRead()
   if (bytesRead > 0) {
     bool wasEmpty = (m_inputBuffer.getSize() == 0);
 
-    // MouseTransfer diagnostic: what did this socket ACTUALLY receive first? The server is proven
-    // to write only a 15-byte greeting to a freshly accepted connection, yet a client parses a
-    // 524,291-byte packet length off one. NB the `buffer` above is `static` -- shared by every TLS
-    // socket in the process, unlike TCPSocket::doRead's plain local -- which is a prime suspect for
-    // one connection's bytes landing in another's input buffer, so log the ADDRESS too.
+    // MouseTransfer diagnostic: what did this socket ACTUALLY receive first? This is the trace
+    // that caught the 2026-07-28 outage -- a freshly connected socket whose FIRST read began
+    // `00 08 00 0e 44 43 4c 50` (a 524,302-byte clipboard chunk) instead of the 15-byte greeting
+    // the server had written to it. Keep the buffer address in the line: it is what makes a
+    // shared-buffer bug visible at a glance.
     if (++m_diagReads <= 3 && mtDiagEnabled()) {
       char hex[3 * 12 + 1] = {0};
       const int show = bytesRead < 12 ? bytesRead : 12;
@@ -183,26 +188,30 @@ TCPSocket::JobResult SecureSocket::doRead()
 TCPSocket::JobResult SecureSocket::doWrite()
 {
   using enum JobResult;
-  static bool s_retry = false;
-  static int s_retrySize = 0;
-  static int s_staticBufferSize = 0;
-  static void *s_staticBuffer = nullptr;
+
+  // NOTE: the pending-write state below used to be four FUNCTION-LOCAL STATICS shared by every TLS
+  // socket in the process. See the members' declaration in SecureSocket.h for the outage that
+  // caused. They are per-socket now; do NOT "simplify" them back.
+  //
+  // OpenSSL additionally requires that a retried SSL_write be handed the SAME buffer contents at
+  // the same address as the call that returned WANT_WRITE, which is why the retry path must not
+  // re-peek the output buffer -- and precisely why sharing one buffer between sockets was fatal
+  // rather than merely untidy.
 
   // write data
   int bufferSize = 0;
   int bytesWrote = 0;
   int status = 0;
 
-  if (s_retry) {
-    bufferSize = s_retrySize;
+  if (m_writeRetry) {
+    bufferSize = m_writeRetrySize;
   } else {
     bufferSize = m_outputBuffer.getSize();
     if (bufferSize != 0) {
-      if (bufferSize > s_staticBufferSize) {
-        s_staticBuffer = realloc(s_staticBuffer, bufferSize);
-        s_staticBufferSize = bufferSize;
+      if (static_cast<size_t>(bufferSize) > m_writeBuffer.size()) {
+        m_writeBuffer.resize(static_cast<size_t>(bufferSize));
       }
-      memcpy(s_staticBuffer, m_outputBuffer.peek(bufferSize), bufferSize);
+      memcpy(m_writeBuffer.data(), m_outputBuffer.peek(bufferSize), bufferSize);
     }
   }
 
@@ -211,14 +220,14 @@ TCPSocket::JobResult SecureSocket::doWrite()
   }
 
   if (isSecureReady()) {
-    status = secureWrite(s_staticBuffer, bufferSize, bytesWrote);
+    status = secureWrite(m_writeBuffer.data(), bufferSize, bytesWrote);
     if (status > 0) {
-      s_retry = false;
+      m_writeRetry = false;
     } else if (status < 0) {
       return Break;
     } else if (status == 0) {
-      s_retry = true;
-      s_retrySize = bufferSize;
+      m_writeRetry = true;
+      m_writeRetrySize = bufferSize;
       return New;
     }
   } else {

@@ -10,8 +10,10 @@
 #include "net/SecurityLevel.h"
 #include "net/TCPSocket.h"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 class Event;
 class IEventQueue;
@@ -95,6 +97,21 @@ private:
   std::unique_ptr<Ssl> m_ssl;
   bool m_secureReady = false;
   bool m_fatal = false;
+
+  // Pending-write state for doWrite(). These were FUNCTION-LOCAL STATICS (s_retry / s_retrySize /
+  // s_staticBuffer / s_staticBufferSize), i.e. ONE set shared by every TLS socket in the process,
+  // which is what caused the 2026-07-28 outage: a socket that got SSL_ERROR_WANT_WRITE latched
+  // s_retry with its own payload still in the shared buffer, and if that connection then died
+  // nothing cleared them -- so the NEXT socket's doWrite took the retry branch, used the DEAD
+  // connection's size, never copied its own output buffer, and transmitted the dead connection's
+  // data down the new connection. Per-socket members make that structurally impossible.
+  //
+  // A vector rather than the old realloc'd raw pointer: it is released with the socket, so the
+  // buffer cannot outlive its owner and there is nothing to leak (the static version had already
+  // needed one leak fix upstream, "#6488 Fixed a memory leak in the TLS socket code").
+  bool m_writeRetry = false;
+  int m_writeRetrySize = 0;
+  std::vector<uint8_t> m_writeBuffer;
 
   // MouseTransfer diagnostic: count reads so the FIRST few on any TLS socket can be traced. The
   // first bytes a freshly connected socket delivers are the whole question in the 2026-07-28

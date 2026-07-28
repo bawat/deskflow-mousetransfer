@@ -536,3 +536,60 @@ restarting the SERVER's core cleared it.
 once) and emit at NOTE when enabled, falling back to DEBUG1 otherwise — deployed cores run at the
 DEFAULT log level, so DEBUG1 alone would have made them invisible on exactly the machines that
 need observing. Per 512 KB chunk, never per frame, so the cost is negligible even when on.
+
+### FIX: SecureSocket's per-socket write state (was function-local statics) (2026-07-29)
+
+**Files:** `src/lib/net/SecureSocket.cpp`, `src/lib/net/SecureSocket.h`
+
+**This is a real upstream bug, not a MouseTransfer-specific tweak** — it predates this fork
+(`git log -S s_staticBuffer` traces the block to `665bd91db "#5628 Move SSL socket code from plugin
+to lib/net"`). Worth reporting to Deskflow.
+
+`SecureSocket::doWrite()` kept its pending-write state in FOUR function-local statics —
+`s_retry`, `s_retrySize`, `s_staticBuffer`, `s_staticBufferSize` — i.e. **one set shared by every
+TLS socket in the process**:
+
+```cpp
+if (s_retry) {
+  bufferSize = s_retrySize;          // another socket's SIZE...
+} else {
+  bufferSize = m_outputBuffer.getSize();
+  memcpy(s_staticBuffer, m_outputBuffer.peek(bufferSize), bufferSize);
+}
+status = secureWrite(s_staticBuffer, bufferSize, bytesWrote);   // ...and its DATA
+if (status == 0) { s_retry = true; s_retrySize = bufferSize; return New; }
+```
+
+When a socket backs up, `SSL_write` returns `WANT_WRITE`, and the retry branch exists because
+OpenSSL requires a retried write to be handed the same buffer contents again. But the latch is
+GLOBAL: a socket that hit `WANT_WRITE` set `s_retry` with its own payload still in the shared
+buffer, and **if that connection then died, nothing cleared either**. The next socket's `doWrite`
+took the retry branch, used the DEAD connection's size, never copied its own output buffer, and
+transmitted the dead connection's data down the new connection. `discardWrittenData()` then popped
+from the new socket's own buffer, corrupting that too.
+
+Observed 2026-07-28 as a total, non-self-healing KVM outage: a large clipboard on the server backed
+a socket up, a client died mid-transfer, and from then on EVERY newly accepted connection received
+a 524,302-byte clipboard chunk where its 11-byte greeting belonged, so every client rejected the
+greeting and retried at ~1 Hz forever. Only restarting the server's core cleared it, because the
+statics live for the life of the process. Caught on the wire — first read of a brand-new socket:
+
+```
+HEALTHY : bytes=15    first: 00 00 00 0b 42 61 72 72 69 65 72 00   len=11,     "Barrier"
+FAILING : bytes=4096  first: 00 08 00 0e 44 43 4c 50 00 00 00 00   len=524302, "DCLP"
+```
+
+`TCPSocket::doWrite()` (the plaintext path) never had this — it peeks its own buffer. The
+asymmetry was the bug.
+
+The state is now per-socket members (`m_writeRetry`, `m_writeRetrySize`, `m_writeBuffer`). The
+buffer is a `std::vector<uint8_t>` rather than the old realloc'd raw pointer, so it is released
+with its socket and cannot outlive it — the static version had already needed one leak fix upstream
+(`a56abf68d "#6488 Fixed a memory leak in the TLS socket code"`).
+
+`SecureSocket::doRead()`'s `static uint8_t buffer[4096]` — also shared process-wide, where
+`TCPSocket::doRead` uses a plain local — is made a plain local in the same change. It did NOT cause
+this outage (each call memsets and refills it), but it is the same hazard class for no benefit.
+
+Full investigation, the deterministic repro and the refuted theories: the wrapper repo's
+`claudemd/clipboard.md` and `seeyoulater/testtasks/clipboard-chunk-storm-repro.md`.
