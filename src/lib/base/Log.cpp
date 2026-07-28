@@ -11,6 +11,8 @@
 #include "common/Constants.h"
 
 #include <cstdarg>
+#include <cstdlib>
+#include <fstream>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -281,4 +283,17 @@ void Log::output(LogLevel priority, const char *msg)
       break;
     }
   }
+}
+
+bool mtDiagEnabled()
+{
+  // Function-local static: computed on first use, thread-safe initialisation guaranteed by the
+  // standard, and no dependency on static init order across translation units.
+  static const bool on = [] {
+    if (const char *env = std::getenv("MOUSETRANSFER_CLIPDIAG"); env != nullptr && *env == '1') {
+      return true;
+    }
+    return static_cast<bool>(std::ifstream("clipdiag"));
+  }();
+  return on;
 }

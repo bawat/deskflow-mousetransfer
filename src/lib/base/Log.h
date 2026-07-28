@@ -220,3 +220,19 @@ otherwise it expands to a call that doesn't.
 #define LOG_DEBUG(...) LOG((CLOG_DEBUG __VA_ARGS__))
 #define LOG_DEBUG1(...) LOG((CLOG_DEBUG1 __VA_ARGS__))
 #define LOG_DEBUG2(...) LOG((CLOG_DEBUG2 __VA_ARGS__))
+
+//! MouseTransfer diagnostic gate (2026-07-28 clipboard-chunk storm)
+/*!
+Returns true when the extra chunk/socket-lifetime tracing is enabled. Switched on by a `clipdiag`
+SENTINEL FILE in the process's working directory (the bundle dir, beside `switchreq` / `coremode` /
+`layoutreload`), or by MOUSETRANSFER_CLIPDIAG=1. Evaluated once and cached.
+
+Prefer the FILE. The elevated core inherits its environment from the LocalSystem launcher, and that
+launcher SURVIVES a core swap (the swap bumps the `coremode` nonce and lets the launcher respawn the
+core), so a machine environment variable never reaches the core without also restarting the launcher
+chain -- an extra step that risks duplicating processes. A file needs no restart of anything.
+
+Lives in `base` so the `net` layer can use it without inverting the layering by including
+`deskflow/`.
+*/
+bool mtDiagEnabled();

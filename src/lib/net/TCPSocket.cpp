@@ -53,6 +53,11 @@ TCPSocket::TCPSocket(IEventQueue *events, SocketMultiplexer *socketMultiplexer, 
   assert(m_socket != nullptr);
 
   LOG_DEBUG("opening new socket: %08X", m_socket);
+  // MouseTransfer diagnostic: pair this with the CLOSING line to expose ArchSocket pointer REUSE
+  // across connections -- the same pattern the stream addresses already showed.
+  if (mtDiagEnabled()) {
+    LOG_NOTE("clipdiag: socket OPENED: sock=%p", static_cast<void *>(m_socket));
+  }
 
   // socket starts in connected state
   init();
@@ -89,6 +94,21 @@ void TCPSocket::close()
   setJob(nullptr);
 
   Lock lock(&m_mutex);
+
+  // MouseTransfer diagnostic (2026-07-28 clipboard-chunk storm). Report how much UNSENT output
+  // is being thrown away here. This is the decisive measurement for "where do the clipboard
+  // bytes that land on a FRESH connection come from": if a dying connection discards a large
+  // buffer then that data really was still pending, and the question becomes how any of it
+  // survives; if it discards nothing, the bytes were already handed to the OS and the search
+  // moves to the TLS layer / socket-handle reuse. Logged with the ArchSocket pointer so
+  // successive connections can be told apart -- and so pointer REUSE is visible, which is
+  // exactly the pattern the stream addresses already showed.
+  if (mtDiagEnabled()) {
+    LOG_NOTE(
+        "clipdiag: socket CLOSING: sock=%p discarding %u unsent byte(s) of output, connected=%d",
+        static_cast<void *>(m_socket), m_outputBuffer.getSize(), static_cast<int>(m_connected)
+    );
+  }
 
   // clear buffers and enter disconnected state
   if (m_connected) {
@@ -155,6 +175,18 @@ void TCPSocket::write(const void *buffer, uint32_t n)
     // copy data to the output buffer
     wasEmpty = (m_outputBuffer.getSize() == 0);
     m_outputBuffer.write(buffer, n);
+
+    // MouseTransfer diagnostic: log only LARGE writes. Every mouse motion is a write, so logging
+    // all of them would flood the log and bury the one line that matters; a clipboard chunk is
+    // 512 KB while input messages are tens of bytes, so this threshold separates them cleanly and
+    // keeps the trace free during normal use. Answers "did anything actually WRITE this data to
+    // the new connection, or was it already sitting in the buffer?".
+    if (n >= 4096 && mtDiagEnabled()) {
+      LOG_NOTE(
+          "clipdiag: socket WRITE: sock=%p n=%u buffered-after=%u", static_cast<void *>(m_socket), n,
+          m_outputBuffer.getSize()
+      );
+    }
 
     // there's data to write
     m_flushed = false;
