@@ -445,11 +445,19 @@ int SecureSocket::secureAccept(int socket)
   checkResult(r, retry);
 
   if (isFatal()) {
-    // tell user and sleep so the socket isn't hammered.
+    // SEC-08b (MouseTransfer fork, 2026-08-03): this used to `Arch::sleep(1)` HERE, on the shared
+    // SocketMultiplexer service thread — the ONE thread servicing every socket in the process,
+    // including live KVM connections. So a single failed handshake froze all input relay for a full
+    // second, and ~10 back-to-back reached the flatline window and dropped clients: an
+    // unauthenticated ~1 packet/second DoS against the whole mesh, needing no certificate at all
+    // (upstream deskflow#8214, closed without the mechanism ever named; the sleep survived to
+    // v1.26.0). The sleep was pointless as well as harmful — serviceAccept returns nullptr on a
+    // fatal accept (status < 0), so the multiplexer TEARS THIS SOCKET DOWN; there is no same-socket
+    // "hammering" to throttle, and every new attacker connection is a fresh socket accepted, failed
+    // and closed in microseconds. Removed: a fatal handshake must never block the shared thread.
     LOG_ERR("failed to accept secure socket");
     LOG_WARN("client connection may not be secure");
     m_secureReady = false;
-    Arch::sleep(1);
     retry = 0;
     return -1; // Failed, error out
   }

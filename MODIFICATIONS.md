@@ -639,3 +639,20 @@ definition), `MSWindowsScreen::s_windowInstance` (the module `HINSTANCE`),
 `I18N`/`Settings`, and `MSWindowsScreen`'s `bogusZoneSize` (declared `static` but never written — a
 constant in disguise). A scan for file-scope mutable statics across `net`/`deskflow`/`server`/
 `client`/`base`/`io`/`mt` came back empty.
+
+## SEC-08b — a fatal TLS handshake no longer freezes the whole mesh (2026-08-03)
+
+`SecureSocket::secureAccept` slept a full second (`Arch::sleep(1)`) on a FATAL handshake, on the shared
+`SocketMultiplexer` service thread — the one thread servicing every socket in the process, live KVM
+connections included. So a single failed handshake froze all input relay for a second, and ~10
+back-to-back reached the flatline window and dropped clients: an **unauthenticated ~1 packet/second DoS
+against the whole mesh**, needing no certificate at all (a plaintext connect to the KVM port 24800 is
+enough — confirmed live 2026-08-03, a 60 s flood stuttered the cursor and dropped a client). Matches
+upstream [deskflow#8214](https://github.com/deskflow/deskflow/issues/8214) ("Non-TLS client interrupts
+mouse cursor for connected TLS clients"), **Closed without the mechanism named**; the sleep survived to
+v1.26.0. **Removed the sleep** — `serviceAccept` returns `nullptr` on a fatal accept (`status < 0`), so
+the multiplexer TEARS THE SOCKET DOWN: there is no same-socket "hammering" to throttle, and each
+attacker connection is a fresh socket accepted, failed and closed in microseconds. The neighbouring
+`s_retryDelay` (10 ms) sleeps on the non-fatal WANT_READ/WANT_WRITE retry path are left as-is (100×
+smaller, on the legitimate in-progress-handshake path, and the retry job only re-fires on readability).
+**To be reported upstream** with the mechanism spelled out.
