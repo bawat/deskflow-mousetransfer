@@ -656,3 +656,32 @@ attacker connection is a fresh socket accepted, failed and closed in microsecond
 `s_retryDelay` (10 ms) sleeps on the non-fatal WANT_READ/WANT_WRITE retry path are left as-is (100×
 smaller, on the legitimate in-progress-handshake path, and the retry job only re-fires on readability).
 **To be reported upstream** with the mechanism spelled out.
+
+## SEC-08 — rejected handshakes no longer leak the socket (cherry-picked from upstream, 2026-08-03)
+
+A fingerprint-REJECTED TLS handshake on the SERVER leaked resources per connection — a Winsock handle,
+an `SSL`, an `SSL_CTX` holding the RSA-4096 cert/key, the object's buffers, and an un-removed
+event-handler entry. The rejected socket sat in `ClientListener::m_clientSockets` with no
+`SocketDisconnected` subscriber, because the `PacketStreamFilter`/`ClientProxyUnknown` scaffolding is
+only built in `handleClientAccepted`, which a rejected handshake never reaches; `SocketMultiplexer`
+deletes only the JOB, and `ArchSocket` refcounting means `closesocket()` is never called. Pre-auth
+reachable — `verifyIgnoreCertCallback` returns 1 unconditionally, so any self-signed cert completes the
+TLS handshake and the fingerprint pin (the only gate) runs AFTER accept + insertion — so a slow flood of
+untrusted-cert connections exhausts the server. The CLIENT role never leaked: `Client::connect` adopts a
+`PacketStreamFilter` and subscribes `SocketDisconnected`, so its chain unwinds; the server's pre-accept
+path had none of that scaffolding. Present verbatim through v1.26.0 and our fork HEAD.
+
+**Fix: cherry-picked upstream's own two commits** (they postdate v1.26.0 and, crucially, landed BEFORE
+upstream's breaking log refactor, so they lift out with no dependency on it):
+- `220bf3178` — "correctly deletes sockets that failed to become clients": adds an additive event
+  `ClientListenerDisconnectedOnAccept`, fired by `SecureSocket::serviceAccept` on a fatal accept
+  (`status < 0`), handled in `ClientListener::handleClientConnecting` by a new `removeClientSocket()`
+  (erase from `m_clientSockets` + `removeHandlers(getEventTarget())` + `delete`).
+- `d392547fd` — "ClientProxyUnknownFailure should also remove its client socket": covers the sibling
+  case where the unknown-client handshake fails, deleting the underlying socket when the stream filter
+  did not adopt it (`StreamFilter::adoptedStream()`).
+
+Applied clean onto our fork: SEC-08b touched `secureAccept` (not `serviceAccept`), and none of our other
+patches touch `ClientListener`. Verify: the server's open-handle count stays FLAT under a flood of
+fingerprint-rejected connections (valid TLS, untrusted cert — the unthrottled reject path, not garbage
+bytes).
