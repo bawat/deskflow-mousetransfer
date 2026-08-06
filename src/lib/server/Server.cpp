@@ -356,13 +356,21 @@ void Server::getClients(std::vector<std::string> &list) const
   }
 }
 
+std::string Server::canonicalName(const std::string &name) const
+{
+  // Extracted from getName() so that code holding a NAME rather than a proxy -- the clipboard
+  // lane's greeting arrives with a name off the wire, and ClientProxy1_6 has only its own -- can
+  // reach the same mapping. Behaviour is unchanged: an unknown name maps to itself.
+  std::string canonical = m_config->getCanonicalName(name);
+  if (canonical.empty()) {
+    canonical = name;
+  }
+  return canonical;
+}
+
 std::string Server::getName(const BaseClientProxy *client) const
 {
-  std::string name = m_config->getCanonicalName(client->getName());
-  if (name.empty()) {
-    name = client->getName();
-  }
-  return name;
+  return canonicalName(client->getName());
 }
 
 uint32_t Server::getActivePrimarySides() const

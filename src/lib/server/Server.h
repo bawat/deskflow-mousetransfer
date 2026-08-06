@@ -199,6 +199,17 @@ public:
     return *m_clipboardLane;
   }
 
+  //! The CONFIGURATION's spelling of a screen name
+  /*!
+  Config lookups are CASELESS and resolve aliases, so the name a client announces about itself is
+  not necessarily the name the configuration (and therefore m_clients, and therefore a clipboard
+  lane session) knows it by. Anything that arrives from the wire, or from a proxy's own getName(),
+  has to come through here before it can be matched against them -- otherwise an aliased or
+  differently-cased screen silently fails every lookup. Falls back to \p name when the
+  configuration has never heard of it, exactly as getName() always has.
+  */
+  std::string canonicalName(const std::string &name) const;
+
   //! Get number of connected clients
   /*!
   Returns the number of connected clients, including the server itself.

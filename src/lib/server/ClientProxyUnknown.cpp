@@ -231,13 +231,21 @@ void ClientProxyUnknown::handleLaneHello()
   // connection from a peer whose main session is already up; nothing we do or fail to do may reach
   // that session.
   int16_t laneVersion = 0;
-  std::string name;
+  std::string announced;
   std::string token;
-  if (!ProtocolUtil::readf(m_stream, kMsgMTLaneHello + 4, &laneVersion, &name, &token)) {
+  if (!ProtocolUtil::readf(m_stream, kMsgMTLaneHello + 4, &laneVersion, &announced, &token)) {
     LOG_DEBUG("clipboard lane refused: malformed lane greeting");
     sendFailure();
     return;
   }
+
+  // The name off the wire is what the CLIENT calls itself. Every session was opened under the
+  // CONFIGURATION's spelling (Server::getName -> Config::getCanonicalName: a caseless lookup that
+  // also resolves aliases), and so are m_clients and the teardown in removeClient. Matching the
+  // announced string directly would therefore refuse the lane of any screen the config spells
+  // differently or knows by an alias -- silently, at DEBUG, with clipboard sync dead in both
+  // directions and nothing else wrong. Canonicalise once, here, and use only that below.
+  const std::string name = m_server->canonicalName(announced);
 
   auto &lane = m_server->clipboardLane();
 
