@@ -12,6 +12,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "base/NetworkProtocol.h"
+#include "client/ClipboardLaneDialer.h"
 #include "client/ServerProxy.h"
 #include "common/Settings.h"
 #include "deskflow/Clipboard.h"
@@ -20,14 +21,28 @@
 #include "deskflow/ProtocolTypes.h"
 #include "deskflow/ProtocolUtil.h"
 #include "deskflow/Screen.h"
-#include "deskflow/StreamChunker.h"
 #include "net/IDataSocket.h"
 #include "net/ISocketFactory.h"
+#include "net/LaneConn.h"
 #include "net/SecureSocket.h"
 #include "net/TCPSocket.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <utility>
+
+namespace {
+
+//! The name the client's lane manager keys its ONE session by
+/*!
+The manager is keyed by peer screen name because a SERVER has many peers. A client has exactly one,
+and the protocol never tells it what that peer is called -- kMsgHello carries a product name and a
+version, nothing else -- so there is no real name available to use. A fixed key is therefore both
+correct and unambiguous: every lane log line on a client refers to this one connection.
+*/
+constexpr const char *kLaneServerPeer = "server";
+
+} // namespace
 
 //
 // Client
@@ -47,6 +62,14 @@ Client::Client(
   assert(m_socketFactory != nullptr);
   assert(m_screen != nullptr);
 
+  // MouseTransfer: the clipboard lane. Built here rather than on demand so that clipboardLane() is
+  // always valid, and destroyed with this object -- its destructor stops and joins the lane worker.
+  // The cap starts at whatever the default clipboard limit is and is kept in step by setOptions().
+  m_clipboardLane = std::make_unique<deskflow::ClipboardLaneManager>(m_events, maxClipboardBytes());
+  m_clipboardLane->setReceiveHandler([this](const deskflow::LaneClipboardInfo &info) {
+    handleLaneClipboard(info);
+  });
+
   // register suspend/resume event handlers
   m_events->addHandler(EventTypes::ScreenSuspend, getEventTarget(), [this](const auto &) { handleSuspend(); });
   m_events->addHandler(EventTypes::ScreenResume, getEventTarget(), [this](const auto &) { handleResume(); });
@@ -61,6 +84,9 @@ Client::~Client()
   cleanupScreen();
   cleanupConnecting();
   cleanupConnection();
+  // The dialer holds the socket factory, so it must be gone before the factory is. cleanupConnection
+  // has already destroyed it; this is the guarantee rather than the mechanism.
+  m_laneDialer.reset();
   delete m_socketFactory;
 }
 
@@ -304,7 +330,24 @@ void Client::setOptions(const OptionsList &options)
     LOG_NOTE("clipboard sharing is disabled because the server set the maximum clipboard size to 0");
   }
 
+  // MouseTransfer: keep the lane's ceiling in step with the limit the server just set, exactly as
+  // the server keeps its own manager in step. The lane refuses to send or accept anything larger.
+  m_clipboardLane->setMaxPayloadBytes(maxClipboardBytes());
+
   m_screen->setOptions(options);
+}
+
+size_t Client::maxClipboardBytes() const
+{
+  // m_maximumClipboardSize is KILOBYTES (kOptionClipboardSharingSize) and defaults to INT_MAX, i.e.
+  // "no limit". Multiplying that by 1024 is fine on a 64-bit size_t and overflows on a 32-bit one,
+  // which would silently turn "no limit" into a very small one -- so saturate instead of wrapping.
+  // Same reasoning, same code, as Server::maxClipboardBytes().
+  constexpr size_t kBytesPerKb = 1024;
+  if (m_maximumClipboardSize > SIZE_MAX / kBytesPerKb) {
+    return SIZE_MAX;
+  }
+  return m_maximumClipboardSize * kBytesPerKb;
 }
 
 std::string Client::getName() const
@@ -350,6 +393,67 @@ void Client::sendClipboard(ClipboardID id)
       m_server->onClipboardChanged(id, &clipboard);
     }
   }
+}
+
+void Client::onClipboardLaneAdvert(int16_t laneVersion, std::string token)
+{
+  // The dial needs the address the main connection actually succeeded on, already resolved: a lane
+  // must never perform name resolution, because that blocks and this is the thread that delivers
+  // input. m_serverAddress is exactly that by the time an advert can arrive.
+  if (!m_laneDialer) {
+    m_laneDialer = std::make_unique<ClipboardLaneDialer>(
+        m_events, m_socketFactory, m_serverAddress, m_name,
+        m_useSecureNetwork ? SecurityLevel::PeerAuth : SecurityLevel::PlainText,
+        [this](IDataSocket *socket) { bindNetworkInterface(socket); },
+        [this](std::unique_ptr<deskflow::LaneConn> conn) {
+          m_clipboardLane->attach(kLaneServerPeer, std::move(conn));
+        }
+    );
+  }
+
+  // A fresh advert supersedes whatever came before: openLocalSession() replaces the session and
+  // tears down any lane hanging off the old one, so a stale connection can never outlive the token
+  // that authorised it. The token itself goes no further than the dialer, and is never logged.
+  m_clipboardLane->openLocalSession(kLaneServerPeer);
+  m_laneDialer->advertised(laneVersion, std::move(token));
+}
+
+deskflow::ClipboardLaneManager::SendResult
+Client::sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::string payload)
+{
+  const auto result = m_clipboardLane->send(kLaneServerPeer, id, sequenceNumber, std::move(payload));
+
+  // The lazy half of the retry policy (MT-CLIPBOARD-LANE-DESIGN.md §2): a clipboard we could not
+  // deliver is the moment it becomes worth trying again. Cheap and idempotent -- it does nothing at
+  // all unless the dialer is idle with a token, so it cannot interrupt an attempt in flight or pull
+  // a backoff forward.
+  if (result == deskflow::ClipboardLaneManager::SendResult::NoLane && m_laneDialer) {
+    m_laneDialer->nudge();
+  }
+  return result;
+}
+
+void Client::handleLaneClipboard(const deskflow::LaneClipboardInfo &info)
+{
+  if (m_server == nullptr) {
+    // The main session ended between the worker posting this and us being called. Dropping it is
+    // the whole recovery -- there is nowhere to apply a clipboard to.
+    LOG_DEBUG("clipboard lane: dropping clipboard %d, the server connection is gone", static_cast<int>(info.m_id));
+    return;
+  }
+
+  // Routed through the proxy rather than applied here, so that a lane clipboard lands in exactly
+  // the same state, through exactly the same code, as one that arrived in-stream.
+  m_server->applyLaneClipboard(info.m_id, info.m_sequenceNumber, info.m_data);
+}
+
+void Client::cleanupLane()
+{
+  // The dialer first: it is the only thing that could still be opening a connection, and there is
+  // no session left for one to attach to. Destroying it abandons any attempt in flight.
+  m_laneDialer.reset();
+  // Stops and joins the lane worker if there is one. A no-op when there never was a lane.
+  m_clipboardLane->closeSession(kLaneServerPeer);
 }
 
 void Client::sendEvent(EventTypes type)
@@ -444,6 +548,12 @@ void Client::cleanupConnecting()
 
 void Client::cleanupConnection()
 {
+  // MouseTransfer: the lane belongs to the main session and dies with it. Deliberately OUTSIDE the
+  // stream check below -- every route that ends a connection passes through here, and some of them
+  // arrive with the stream already gone. A reconnect brings its own advert and its own token, and
+  // that is what opens the next lane.
+  cleanupLane();
+
   if (m_stream != nullptr) {
     using enum EventTypes;
     m_events->removeHandler(StreamInputReady, m_stream->getEventTarget());

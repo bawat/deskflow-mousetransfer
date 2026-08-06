@@ -49,6 +49,17 @@ public:
   bool onGrabClipboard(ClipboardID);
   void onClipboardChanged(ClipboardID, const IClipboard *);
 
+  //! Apply a clipboard that arrived over the lane (MouseTransfer fork)
+  /*!
+  Does exactly what setClipboard()'s completion branch does -- unmarshalls, hands the clipboard to
+  the client and logs "clipboard was updated" -- for data that came in over the dedicated lane
+  instead of in-stream. Deliberately the same path and the same log line, so nothing downstream can
+  behave differently depending on which transport carried the bytes.
+
+  Main thread only; the lane manager gets it here by posting an event.
+  */
+  void applyLaneClipboard(ClipboardID id, uint32_t seqNum, const std::string &data);
+
   //@}
 
 protected:
@@ -82,6 +93,7 @@ private:
   void enter();
   void leave();
   void setClipboard();
+  void clipboardLaneAdvert();
   void grabClipboard();
   void keyDown(uint16_t id, uint16_t mask, uint16_t button, const std::string &lang);
   void keyRepeat();
@@ -133,4 +145,9 @@ private:
   // setClipboard() -- ONE buffer shared by both clipboard ids and every ServerProxy in the
   // process. See ClipboardChunk::Assembly for the corruption that caused.
   ClipboardChunk::Assembly m_clipboardAssembly[kClipboardEnd];
+
+  // Rate limit for the "no lane, clipboard dropped" warning. A clipboard is offered on every leave,
+  // so an un-limited warning would produce a line per crossing for as long as the lane stays down --
+  // which buries the first occurrence, the only one that carries news.
+  double m_lastNoLaneWarning = 0.0;
 };

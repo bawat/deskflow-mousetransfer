@@ -13,6 +13,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "deskflow/PacketStreamFilter.h"
+#include "deskflow/ProtocolTypes.h"
 #include "net/IDataSocket.h"
 #include "net/IListenSocket.h"
 #include "net/ISocketFactory.h"
@@ -173,7 +174,7 @@ void ClientListener::handleClientAccepted(IDataSocket *socket)
   }
 
   // create proxy for unknown client
-  auto *client = new ClientProxyUnknown(stream, 30.0, m_server, m_events);
+  auto *client = new ClientProxyUnknown(stream, kUnknownClientTimeout, m_server, m_events);
 
   m_newClients.insert(client);
 

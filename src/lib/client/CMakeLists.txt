@@ -6,6 +6,8 @@
 add_library(client STATIC
   Client.cpp
   Client.h
+  ClipboardLaneDialer.cpp
+  ClipboardLaneDialer.h
   ServerProxy.cpp
   ServerProxy.h
 )

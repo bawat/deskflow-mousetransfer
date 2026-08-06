@@ -8,19 +8,33 @@
 
 #include "client/ServerProxy.h"
 
+#include "arch/Arch.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "client/Client.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardChunk.h"
+#include "deskflow/ClipboardLane.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/OptionTypes.h"
 #include "deskflow/ProtocolTypes.h"
 #include "deskflow/ProtocolUtil.h"
-#include "deskflow/StreamChunker.h"
 #include "io/IStream.h"
 
 #include <cstring>
+#include <utility>
+
+namespace {
+
+//! Seconds between "clipboard dropped, there is no lane" warnings
+/*!
+Not a tuning knob so much as a floor on usefulness. A client offers its clipboard on every leave, so
+the un-limited version of this warning fires on every crossing for as long as the lane is down --
+and the line that matters is the FIRST one. Matches the server-side limit in ClientProxy1_6.
+*/
+constexpr double kNoLaneWarningInterval = 30.0;
+
+} // namespace
 
 //
 // ServerProxy
@@ -42,9 +56,12 @@ ServerProxy::ServerProxy(Client *client, deskflow::IStream *stream, IEventQueue 
   m_events->addHandler(EventTypes::StreamInputReady, m_stream->getEventTarget(), [this](const auto &) {
     handleData();
   });
-  m_events->addHandler(EventTypes::ClipboardSending, this, [this](const auto &e) {
-    ClipboardChunk::send(m_stream, e.getDataObject());
-  });
+
+  // The ClipboardSending handler that used to be registered here is GONE, along with the
+  // StreamChunker path it served: a clipboard leaving this client now goes down the dedicated lane,
+  // never onto the main connection. Removing the registration also retires the documented leak it
+  // carried -- the destructor only ever removed the StreamInputReady handler, so this one outlived
+  // every ServerProxy that was ever destroyed.
 
   // send heartbeat
   setKeepAliveRate(kKeepAliveRate);
@@ -140,6 +157,15 @@ ServerProxy::ConnectionResult ServerProxy::parseHandshakeMessage(const uint8_t *
     m_parser = &ServerProxy::parseMessage;
     checkMissedLanguages();
     m_client->handshakeComplete();
+  }
+
+  else if (memcmp(code, kMsgDLaneAdvert, 4) == 0) {
+    // MouseTransfer: parsed in BOTH parsers on purpose. Server::adoptClient sends the advert right
+    // after sendOptions(), and the kMsgDSetOptions that call produces is the message that flips this
+    // client out of the handshake parser -- so which parser sees the advert depends on how the two
+    // land, and only one of them handling it would make the advert an "invalid message from server"
+    // that drains the whole stream.
+    clipboardLaneAdvert();
   }
 
   else if (memcmp(code, kMsgCResetOptions, 4) == 0) {
@@ -289,6 +315,12 @@ ServerProxy::ConnectionResult ServerProxy::parseMessage(const uint8_t *code)
     setClipboard();
   }
 
+  else if (memcmp(code, kMsgDLaneAdvert, 4) == 0) {
+    // See the identical branch in parseHandshakeMessage(): the advert can arrive either side of the
+    // kMsgDSetOptions that ends the handshake, so both parsers must know it.
+    clipboardLaneAdvert();
+  }
+
   else if (memcmp(code, kMsgCResetOptions, 4) == 0) {
     resetOptions();
   }
@@ -351,10 +383,44 @@ bool ServerProxy::onGrabClipboard(ClipboardID id)
 
 void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard)
 {
+  // Every DECISION about whether to send was made before this was called and stays where it was --
+  // Client::sendClipboard owns the clipboard-time check, the size limit and the sent/unchanged
+  // bookkeeping. Only the TRANSPORT is different here.
+  //
+  // This used to be StreamChunker::sendClipboard(), which queued the entire train onto the main
+  // connection as one event per chunk, in front of the keepalives the server's death timer depends
+  // on. That is the wall-off loop the lane exists to end, so there is deliberately NO in-stream
+  // fallback: a clipboard that cannot go by lane is dropped, loudly but harmlessly, rather than
+  // being allowed back onto the path that kills the KVM link.
   std::string data = IClipboard::marshall(clipboard);
-  LOG_DEBUG("sending clipboard %d seqnum=%d", id, m_seqNum);
+  const size_t size = data.size();
 
-  StreamChunker::sendClipboard(data, data.size(), id, m_seqNum, m_events, this);
+  using SendResult = deskflow::ClipboardLaneManager::SendResult;
+  switch (m_client->sendClipboardOverLane(id, m_seqNum, std::move(data))) {
+  case SendResult::Queued:
+    LOG_DEBUG("sending clipboard %d over the lane, seqnum=%d, size=%d", id, m_seqNum, static_cast<int>(size));
+    break;
+
+  case SendResult::TooLarge:
+    LOG_NOTE(
+        "not sending clipboard %d: %d bytes is over the limit configured by the server", id, static_cast<int>(size)
+    );
+    break;
+
+  case SendResult::NoLane:
+    // An older server (nothing advertised a lane), or a lane that is down or has not come up yet.
+    // sendClipboardOverLane() has already asked the dialer to try again. Rate limited: see
+    // kNoLaneWarningInterval.
+    if (const double now = ARCH->time(); now - m_lastNoLaneWarning >= kNoLaneWarningInterval) {
+      m_lastNoLaneWarning = now;
+      LOG_WARN(
+          "clipboard %d not delivered to the server: no clipboard lane (server is older than "
+          "protocol 1.9, or the lane is down)",
+          id
+      );
+    }
+    break;
+  }
 }
 
 void ServerProxy::flushCompressedMouse()
@@ -537,6 +603,42 @@ void ServerProxy::setClipboard()
 
     LOG_INFO("clipboard was updated");
   }
+}
+
+void ServerProxy::applyLaneClipboard(ClipboardID id, uint32_t seqNum, const std::string &data)
+{
+  if (id >= kClipboardEnd) {
+    return;
+  }
+
+  LOG_DEBUG("received clipboard %d over the lane, seqnum=%d, size=%d", id, seqNum, static_cast<int>(data.size()));
+
+  // Identical to setClipboard()'s Finished branch, on purpose -- same unmarshall, same handoff to
+  // the client, same log line, so nothing downstream can tell which transport carried the bytes.
+  Clipboard clipboard;
+  clipboard.unmarshall(data, 0);
+  m_client->setClipboard(id, &clipboard);
+
+  LOG_INFO("clipboard was updated");
+}
+
+void ServerProxy::clipboardLaneAdvert()
+{
+  int16_t laneVersion = 0;
+  std::string token;
+  if (!ProtocolUtil::readf(m_stream, kMsgDLaneAdvert + 4, &laneVersion, &token)) {
+    // Nothing to do about it and nothing to disconnect over: the clipboard lane is the one feature
+    // whose failure mode is "no lane", never "no session".
+    LOG_DEBUG("clipboard lane advert could not be read");
+    return;
+  }
+
+  // The token is a per-session secret: it is not logged here, not at DEBUG, not truncated and not
+  // hashed. Its length is not printed either -- that is a constant of the protocol, and printing it
+  // would only invite the next line to print a little more. The news is that an advert arrived.
+  LOG_DEBUG("recv clipboard lane advert (lane wire version %d)", laneVersion);
+
+  m_client->onClipboardLaneAdvert(laneVersion, std::move(token));
 }
 
 void ServerProxy::grabClipboard()

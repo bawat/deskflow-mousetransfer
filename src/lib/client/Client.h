@@ -11,11 +11,14 @@
 #include "deskflow/IClient.h"
 
 #include "base/EventTypes.h"
+#include "deskflow/ClipboardLane.h"
 #include "deskflow/IClipboard.h"
 #include "net/NetworkAddress.h"
 
 #include <climits>
+#include <memory>
 
+class ClipboardLaneDialer;
 class Event;
 class EventQueueTimer;
 namespace deskflow {
@@ -95,6 +98,28 @@ public:
   Notifies the client that the connection handshake has completed.
   */
   virtual void handshakeComplete();
+
+  //! The server offered a dedicated clipboard connection (MouseTransfer fork)
+  /*!
+  Opens the local lane session and starts the dial. \p token authorises exactly one lane onto this
+  session and is a SECRET -- it is not logged here or anywhere below this call.
+
+  A second advert (the server re-armed the session, or we reconnected) supersedes the first: the old
+  session and its lane go, and the dial starts again with the new token.
+  */
+  void onClipboardLaneAdvert(int16_t laneVersion, std::string token);
+
+  //! Hand a marshalled clipboard to the lane for the server (MouseTransfer fork)
+  /*!
+  The transport half of ServerProxy::onClipboardChanged. Every DECISION about whether to send stays
+  with the caller; this only routes the bytes, and reports what became of them. There is
+  deliberately no in-stream fallback -- see MT-CLIPBOARD-LANE-DESIGN.md §5.
+
+  \p sequenceNumber is the client's clipboard sequence number, which the server compares against
+  what it last saw. It is carried end to end.
+  */
+  deskflow::ClipboardLaneManager::SendResult
+  sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::string payload);
 
   //@}
   //! @name accessors
@@ -180,6 +205,18 @@ private:
   void sendClipboardThread(void *);
   void bindNetworkInterface(IDataSocket *socket) const;
 
+  // MouseTransfer clipboard lane. -------------------------------------------------------------
+  //! A complete payload arrived from the server over the lane
+  /*!
+  On the MAIN thread -- a lane worker gets here by posting an event, precisely so that the apply may
+  touch screen and proxy state.
+  */
+  void handleLaneClipboard(const deskflow::LaneClipboardInfo &info);
+  //! Drop the lane and anything dialling one. Idempotent; safe in any state.
+  void cleanupLane();
+  //! The configured clipboard limit in BYTES, saturating rather than overflowing
+  size_t maxClipboardBytes() const;
+
 private:
   std::string m_name;
   NetworkAddress m_serverAddress;
@@ -201,4 +238,11 @@ private:
   bool m_enableClipboard = true;
   size_t m_maximumClipboardSize = INT_MAX;
   size_t m_resolvedAddressesCount = 0;
+
+  // MouseTransfer clipboard lane. Built in the constructor and destroyed with this object, so it is
+  // always valid; its destructor stops and joins the lane worker, which is why nothing else in the
+  // client has to think about worker lifetimes. The dialer exists only between an advert and the
+  // end of the main session.
+  std::unique_ptr<deskflow::ClipboardLaneManager> m_clipboardLane;
+  std::unique_ptr<ClipboardLaneDialer> m_laneDialer;
 };
