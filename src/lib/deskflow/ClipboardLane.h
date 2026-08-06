@@ -209,7 +209,13 @@ private:
   //! The actual loop, free to throw
   void runLaneBody(Lane *lane);
   //! Raise the stop flag, unblock the wait, join the worker, then let the connection go
-  static void stopLane(std::unique_ptr<Lane> lane);
+  /*!
+  \p why is what the CALLER is doing (replacing the session, shutting down...). It is only used when
+  the connection itself has no verdict of its own: a lane that failed reports why it failed, which is
+  the more useful half of the story and the reason this logs at INFO rather than DEBUG. A fleet log
+  at the default level has to be able to answer "did the clipboard lane die, and what killed it".
+  */
+  static void stopLane(std::unique_ptr<Lane> lane, const char *why);
 
   IEventQueue *m_events = nullptr;
   std::atomic<size_t> m_maxPayloadBytes;

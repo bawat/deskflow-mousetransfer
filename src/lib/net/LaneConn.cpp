@@ -35,7 +35,7 @@ namespace deskflow {
 
 namespace lane {
 
-void demoteCurrentThreadToBackground()
+bool demoteCurrentThreadToBackground()
 {
 #if SYSAPI_WIN32
   // THREAD_MODE_BACKGROUND_BEGIN (winbase.h) lowers scheduling priority AND memory/IO priority for
@@ -45,10 +45,22 @@ void demoteCurrentThreadToBackground()
   // work. Background mode moves the thread out of that régime instead of within it.
   //
   // Documented to fail with ERROR_THREAD_MODE_ALREADY_BACKGROUND if applied twice; we apply it once
-  // per thread at its start, and a failure is not worth acting on either way.
+  // per thread at its start.
+  //
+  // A failure is reported at WARN, not swallowed at DEBUG1 (which it was until stage 5). Whether
+  // background mode is even available to a thread of a REALTIME_PRIORITY_CLASS process is not
+  // something this code can assume -- and if it is not, this worker runs at realtime priority while
+  // it streams tens of megabytes, competing with the very input relay the lane was built to protect.
+  // That is the single most consequential thing that can silently go wrong in here, so it says so.
   if (!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)) {
-    LOG_DEBUG1("clipboard lane: could not enter background thread mode (%lu)", GetLastError());
+    LOG_WARN(
+        "clipboard lane: the OS REFUSED background thread mode for a lane worker (error %lu); it will "
+        "run at this process's priority class while it transfers",
+        GetLastError()
+    );
+    return false;
   }
+  return true;
 #elif defined(__linux__)
   // On Linux the "process" a nice value applies to is the TASK, i.e. the calling thread, so
   // PRIO_PROCESS with who == 0 is a per-thread nice. (This is a documented Linux deviation from
@@ -59,11 +71,19 @@ void demoteCurrentThreadToBackground()
   // priority inversion against a peer that is waiting on our TCP window.
   errno = 0;
   if (setpriority(PRIO_PROCESS, 0, 10) != 0 && errno != 0) {
-    LOG_DEBUG1("clipboard lane: could not lower thread priority (%d)", errno);
+    LOG_WARN(
+        "clipboard lane: could not lower a lane worker's thread priority (errno %d); it will compete "
+        "with input relay while it transfers",
+        errno
+    );
+    return false;
   }
+  return true;
 #else
   // macOS/BSD: nice() really is process-wide here, so doing it would be worse than doing nothing.
-  // The lane stays at normal priority; it is polite by being small and infrequent instead.
+  // The lane stays at normal priority; it is polite by being small and infrequent instead. Reported
+  // as success because there is no failure to report -- nothing was attempted.
+  return true;
 #endif
 }
 
@@ -289,7 +309,7 @@ int LaneConn::classify(int result, const char *what)
   case SSL_ERROR_ZERO_RETURN:
     // Clean close_notify from the peer.
     LOG_DEBUG("clipboard lane %s: peer closed the connection", describe().c_str());
-    m_dead.store(true, std::memory_order_release);
+    markDead("the peer closed the connection");
     return -1;
 
   default:
@@ -297,9 +317,28 @@ int LaneConn::classify(int result, const char *what)
     // Drain the error queue so a failure here cannot be mistaken for a failure elsewhere later on
     // -- OpenSSL's error queue is per-thread and sticky.
     ERR_clear_error();
-    m_dead.store(true, std::memory_order_release);
+    markDead(error == SSL_ERROR_SYSCALL ? "the connection failed (socket error)" : "a tls error");
     return -1;
   }
+}
+
+void LaneConn::markDead(const char *reason)
+{
+  // First writer wins, so the ORIGINAL cause survives a later teardown that would otherwise
+  // overwrite it with "torn down locally". compare_exchange rather than a plain store for exactly
+  // that: shutdown() and the owning thread's classify() genuinely race.
+  const char *expected = nullptr;
+  m_deadReason.compare_exchange_strong(expected, reason, std::memory_order_acq_rel, std::memory_order_acquire);
+  m_dead.store(true, std::memory_order_release);
+}
+
+size_t LaneConn::pendingPlaintext() const
+{
+  if (m_ssl == nullptr) {
+    return 0;
+  }
+  const int n = SSL_pending(static_cast<SSL *>(m_ssl));
+  return n > 0 ? static_cast<size_t>(n) : 0;
 }
 
 int LaneConn::readSome(void *buffer, uint32_t n)
@@ -357,7 +396,7 @@ void LaneConn::shutdown()
   if (m_socket == nullptr) {
     return;
   }
-  m_dead.store(true, std::memory_order_release);
+  markDead("torn down locally");
 #if SYSAPI_WIN32
   ::shutdown(rawOf(m_socket), SD_BOTH);
 #elif SYSAPI_UNIX

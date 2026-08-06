@@ -404,8 +404,11 @@ void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard
   case SendResult::Held:
     // The server advertised a lane, so there is a session, but the lane itself is not up (yet, or
     // any more). The payload is kept and goes out when the dial lands -- which
-    // sendClipboardOverLane() has just asked for -- so this is news at DEBUG and nothing more.
-    LOG_DEBUG("clipboard %d is waiting for the lane, seqnum=%d, size=%d", id, m_seqNum, static_cast<int>(size));
+    // sendClipboardOverLane() has just asked for.
+    //
+    // INFO, not DEBUG: a deployed core logs at the default level, and this is the line that
+    // distinguishes "the clipboard is waiting for a lane" from "the clipboard was never offered".
+    LOG_INFO("clipboard %d is waiting for the lane, seqnum=%d, size=%d", id, m_seqNum, static_cast<int>(size));
     break;
 
   case SendResult::TooLarge:

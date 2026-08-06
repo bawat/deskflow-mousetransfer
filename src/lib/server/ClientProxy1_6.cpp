@@ -106,10 +106,13 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
 
     case SendResult::Held:
       // The client speaks 1.9 and has a session, but its lane is not up (yet, or any more). The
-      // payload is kept and goes out when the client's next dial lands, so this is news at DEBUG
-      // and nothing more.
-      LOG_DEBUG("clipboard %d for \"%s\" is waiting for the lane (%u bytes)", id, peer.c_str(),
-                static_cast<uint32_t>(size));
+      // payload is kept and goes out when the client's next dial lands.
+      //
+      // INFO, not DEBUG: on a deployed fleet the core logs at the default level, and "the clipboard
+      // is waiting for a lane that never came up" is the shape of every delivery complaint this
+      // feature can produce. Paired with the lane up/down lines it says whether the wait ended.
+      LOG_INFO("clipboard %d for \"%s\" is waiting for the lane (%u bytes)", id, peer.c_str(),
+               static_cast<uint32_t>(size));
       break;
 
     case SendResult::TooLarge:

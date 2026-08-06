@@ -24,9 +24,17 @@ core runs at REALTIME priority class, where RELATIVE thread priorities cannot he
 the process, including the lowest relative priority, still outranks ordinary work. Windows'
 background mode is the escape hatch that does apply.
 
-No-op where the platform offers nothing sensible; the lane is correct either way, just less polite.
+Returns TRUE when the thread really was demoted, FALSE when the OS refused. A refusal is not fatal
+and the lane still works, but it is NOT cosmetic: an undemoted worker streaming a large clipboard
+inside a REALTIME-class process competes directly with the input-relay thread, which is the exact
+outcome this design exists to prevent. The caller must therefore make a refusal visible at WARN --
+it is the first thing to look for behind "the whole machine went unresponsive during a transfer".
+This function itself logs the OS error at WARN for the same reason.
+
+Platforms that offer nothing sensible (macOS/BSD, where nice() is process-wide) report success:
+there is nothing to fail, and a permanent warning would train the reader to ignore the line.
 */
-void demoteCurrentThreadToBackground();
+bool demoteCurrentThreadToBackground();
 
 //! Fill \p out with \p count cryptographically strong random bytes; false if none are available
 /*!
@@ -132,11 +140,35 @@ public:
   //! Short identifier for log lines (never carries anything secret)
   std::string describe() const;
 
+  //! Why this connection is dead, as a short literal; nullptr while it is still open
+  /*!
+  Set once, by whichever of the two ever happens first: the owning thread classifying a failed
+  SSL_read/SSL_write, or another thread calling shutdown(). Readable from any thread (the value is
+  always a string literal, so there is nothing to keep alive), which is the point -- the manager
+  reports why a lane went down, and by then the worker is gone.
+  */
+  const char *deadReason() const
+  {
+    return m_deadReason.load(std::memory_order_acquire);
+  }
+
+  //! Plaintext OpenSSL has already decrypted but not handed over yet
+  /*!
+  Diagnostics only, and specifically the probe MT-CLIPBOARD-LANE-DESIGN.md §9b left for the rig: the
+  read buffer is one TLS record's maximum plaintext and read_ahead is off, so this SHOULD always be
+  zero after a read. If it ever is not, select() will not report the leftover -- the bytes are past
+  the kernel -- and the lane stalls one poll interval per read. Owner thread only.
+  */
+  size_t pendingPlaintext() const;
+
 private:
   LaneConn(ArchSocket socket, void *ssl, void *sslContext, std::string pending);
 
   //! Translate an SSL return code into our >0 / 0 / -1 convention, marking m_dead on a real failure
   int classify(int result, const char *what);
+
+  //! Mark the connection dead, recording \p reason unless one was already recorded
+  void markDead(const char *reason);
 
   ArchSocket m_socket = nullptr;
   void *m_ssl = nullptr;
@@ -154,6 +186,11 @@ private:
   // (this fork cross-builds for ARMv6) a worker really can go on not seeing the flag, leaving
   // teardown to depend entirely on the socket half-close waking select().
   std::atomic<bool> m_dead{false};
+
+  // Always a string LITERAL, so publishing the pointer publishes the whole value and there is no
+  // lifetime to reason about. Written by whichever thread kills the connection first, read by the
+  // manager on the main thread after the worker has been joined.
+  std::atomic<const char *> m_deadReason{nullptr};
 };
 
 } // namespace deskflow

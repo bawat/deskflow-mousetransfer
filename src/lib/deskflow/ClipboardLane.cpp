@@ -12,6 +12,7 @@
 #include "net/LaneConn.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -109,7 +110,7 @@ std::string ClipboardLaneManager::openSession(const std::string &peer, const std
 
   std::string issued(reinterpret_cast<const char *>(token.data()), token.size());
   // Outside the lock: joining a worker must never happen with the session map held.
-  stopLane(installSession(peer, issued, peerFingerprint));
+  stopLane(installSession(peer, issued, peerFingerprint), "the peer opened a new session");
 
   LOG_DEBUG(
       "clipboard lane: session opened for \"%s\" (peer authenticated: %s)", peer.c_str(),
@@ -122,7 +123,7 @@ void ClipboardLaneManager::openLocalSession(const std::string &peer)
 {
   // No token and no fingerprint: see the header. This session exists only so that attach() has
   // somewhere to put the lane this endpoint dialled, and it can never validate an inbound one.
-  stopLane(installSession(peer, std::string(), std::string()));
+  stopLane(installSession(peer, std::string(), std::string()), "the server advertised a new lane");
   LOG_DEBUG("clipboard lane: local session opened for \"%s\"", peer.c_str());
 }
 
@@ -158,7 +159,7 @@ void ClipboardLaneManager::closeSession(const std::string &peer)
   }
   // Outside the lock: stopping a lane joins a thread, and nothing else should be waiting on the
   // session map for however long that takes.
-  stopLane(std::move(doomed));
+  stopLane(std::move(doomed), "the main session closed");
   LOG_DEBUG("clipboard lane: session closed for \"%s\"", peer.c_str());
 }
 
@@ -170,15 +171,21 @@ void ClipboardLaneManager::closeAll()
     doomed.swap(m_sessions);
   }
   for (auto &entry : doomed) {
-    stopLane(std::move(entry.second.m_lane));
+    stopLane(std::move(entry.second.m_lane), "this endpoint is shutting down");
   }
 }
 
-void ClipboardLaneManager::stopLane(std::unique_ptr<Lane> lane)
+void ClipboardLaneManager::stopLane(std::unique_ptr<Lane> lane, const char *why)
 {
   if (!lane) {
     return;
   }
+
+  // Read BEFORE shutdown(), which records a reason of its own ("torn down locally") if the
+  // connection has not already failed for a better one. The distinction is the whole point of the
+  // line: "the peer closed the connection" and "the session was replaced" are different incidents
+  // with different next steps.
+  const char *failure = lane->m_conn ? lane->m_conn->deadReason() : nullptr;
 
   // The order is the contract from MT-CLIPBOARD-LANE-DESIGN.md §6: raise the flag, unblock the
   // wait, join, and only then let the connection be destroyed. Nothing is ever detached, so a
@@ -190,7 +197,11 @@ void ClipboardLaneManager::stopLane(std::unique_ptr<Lane> lane)
   if (lane->m_worker.joinable()) {
     lane->m_worker.join();
   }
-  LOG_DEBUG("clipboard lane: down for \"%s\"", lane->m_peer.c_str());
+  // INFO, not DEBUG: the fleet runs its cores at the default log level and never writes log/level
+  // into the settings a wrapper regenerates on every start, so anything below INFO does not exist
+  // as far as a deployed machine is concerned. One line per lane teardown is not chatty -- a lane
+  // is per-peer and lasts the whole session.
+  LOG_INFO("clipboard lane down for \"%s\": %s", lane->m_peer.c_str(), failure != nullptr ? failure : why);
   // ~Lane frees the LaneConn, which is now touched by nobody.
 }
 
@@ -263,11 +274,14 @@ void ClipboardLaneManager::attach(const std::string &peer, std::unique_ptr<LaneC
     lane = fresh.get();
     found->second.m_lane = std::move(fresh);
   }
-  stopLane(std::move(displaced));
+  stopLane(std::move(displaced), "a newer lane connection superseded it");
 
   // Started last, so the worker never sees a half-built lane.
   lane->m_worker = std::thread([this, lane] { runLane(lane); });
-  LOG_DEBUG("clipboard lane: up for \"%s\" %s", peer.c_str(), lane->m_conn->describe().c_str());
+  // INFO for the same reason as the "down" line: on a deployed fleet the core's log level is the
+  // default, so this pair is the ONLY evidence that the clipboard is on its dedicated connection at
+  // all. Two lines per peer per session.
+  LOG_INFO("clipboard lane up for \"%s\" %s", peer.c_str(), lane->m_conn->describe().c_str());
 }
 
 bool ClipboardLaneManager::hasLane(const std::string &peer)
@@ -284,7 +298,7 @@ bool ClipboardLaneManager::hasLane(const std::string &peer)
       }
     }
   }
-  stopLane(std::move(doomed)); // lazy reap of a worker that has already given up
+  stopLane(std::move(doomed), "its worker stopped"); // lazy reap of a worker that has already given up
   return live;
 }
 
@@ -327,7 +341,7 @@ ClipboardLaneManager::send(const std::string &peer, ClipboardID id, uint32_t seq
       }
     }
   }
-  stopLane(std::move(doomed));
+  stopLane(std::move(doomed), "its worker stopped");
   return result;
 }
 
@@ -345,14 +359,39 @@ void ClipboardLaneManager::runLane(Lane *lane)
     LOG_WARN("clipboard lane \"%s\" failed", lane->m_peer.c_str());
   }
 
+  if (mtDiagEnabled()) {
+    LOG_NOTE(
+        "clipdiag: lane worker for \"%s\" exiting: %s", lane->m_peer.c_str(),
+        lane->m_conn && lane->m_conn->deadReason() != nullptr ? lane->m_conn->deadReason() : "asked to stop"
+    );
+  }
+
   // Last act, and the only thing the main thread reads from here: it may now stop and join us.
   lane->m_finished = true;
 }
 
 void ClipboardLaneManager::runLaneBody(Lane *lane)
 {
-  // Before ANY io, and for this thread's whole life.
-  lane::demoteCurrentThreadToBackground();
+  // Before ANY io, and for this thread's whole life. A REFUSAL is news at WARN, not a detail: this
+  // worker is about to stream tens of megabytes inside a process running at REALTIME priority
+  // class, and the demotion is the only thing keeping it off the input relay's back. See
+  // lane::demoteCurrentThreadToBackground().
+  if (!lane::demoteCurrentThreadToBackground()) {
+    LOG_WARN(
+        "clipboard lane \"%s\": worker thread NOT demoted to background scheduling; large clipboards "
+        "may compete with input relay on this machine",
+        lane->m_peer.c_str()
+    );
+  }
+
+  // Read ONCE per worker: the switch is a file/env check that never changes within a process, and
+  // per-chunk logging must not add a per-chunk syscall of its own. Same sentinel ClipboardChunk uses
+  // (a `clipdiag` file in the core's working directory, or MOUSETRANSFER_CLIPDIAG=1) -- deliberately
+  // a FILE, because the elevated core's environment is frozen at task-registration time.
+  const bool diag = mtDiagEnabled();
+  if (diag) {
+    LOG_NOTE("clipdiag: lane worker started for \"%s\" %s", lane->m_peer.c_str(), lane->m_conn->describe().c_str());
+  }
 
   LaneConn &conn = *lane->m_conn;
 
@@ -371,6 +410,7 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
     uint32_t clipSeq = 0; ///< the sender's APPLICATION clipboard sequence number: reported upwards
     uint32_t total = 0;
     std::string data;
+    std::chrono::steady_clock::time_point started; ///< when this train's Start landed (for the summary)
   };
   Assembly assembly[kClipboardEnd];
 
@@ -383,6 +423,13 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
   uint32_t txClipSeq = 0; // the application sequence number this payload was queued with
   std::string txPayload;
   uint32_t txOffset = 0;
+
+  // One INFO line per completed OUTBOUND train, emitted when its End frame has actually reached the
+  // wire rather than when it was produced -- "sent" must mean sent. These three carry the summary
+  // across the gap between producing the End frame and finishing the write of it.
+  bool txEndOnWire = false;
+  uint32_t txTrainBytes = 0;
+  std::chrono::steady_clock::time_point txTrainStart;
 
   // NOTHING is sent here. A lane is SILENT from the moment it is attached until one end has a
   // clipboard to send, and that is a correctness property, not politeness.
@@ -485,7 +532,13 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
             } else {
               // A new START discards whatever was half-assembled for this id -- that is exactly how
               // the sender's supersede works: it stops mid-train and starts a fresh one.
-              assembly[id] = Assembly{true, seq, clipSeq, total, std::string()};
+              assembly[id] = Assembly{true, seq, clipSeq, total, std::string(), std::chrono::steady_clock::now()};
+              if (diag) {
+                LOG_NOTE(
+                    "clipdiag: lane \"%s\" rx START clipboard %d, %u byte(s), train=%u seqnum=%u",
+                    lane->m_peer.c_str(), static_cast<int>(id), total, seq, clipSeq
+                );
+              }
               // Reserve a first chunk's worth rather than the announced total. `total` is a number
               // the PEER chose, and with no configured clipboard limit the ceiling on it is 4 GB --
               // reserving that up front would throw before a single byte of it had arrived. append()
@@ -502,6 +555,16 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
             if (id < kClipboardEnd && assembly[id].active && assembly[id].seq == seq &&
                 at == assembly[id].data.size() && assembly[id].data.size() + chunkSize <= assembly[id].total) {
               assembly[id].data.append(chunk, chunkSize);
+              if (diag) {
+                // Per-CHUNK, so it is gated: a 64 MiB clipboard is 256 of these. SSL_pending is the
+                // probe MT-CLIPBOARD-LANE-DESIGN.md §9b asked for -- anything but 0 means OpenSSL is
+                // holding plaintext select() will never tell us about.
+                LOG_NOTE(
+                    "clipdiag: lane \"%s\" rx DATA clipboard %d, +%u at %u of %u, ssl_pending=%u",
+                    lane->m_peer.c_str(), static_cast<int>(id), static_cast<uint32_t>(chunkSize), at,
+                    assembly[id].total, static_cast<uint32_t>(conn.pendingPlaintext())
+                );
+              }
             } else if (id < kClipboardEnd) {
               // Out of order or from an abandoned train: drop the assembly rather than guess.
               assembly[id].active = false;
@@ -518,9 +581,14 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
               // see ClipboardLaneManager::send().
               info->m_sequenceNumber = assembly[id].clipSeq;
               info->m_data = std::move(assembly[id].data);
-              LOG_DEBUG(
-                  "clipboard lane \"%s\": received clipboard %d, %u byte(s)", lane->m_peer.c_str(),
-                  static_cast<int>(id), assembly[id].total
+              // ONE line per completed transfer, at INFO. This is the receiving half of the pair a
+              // fleet log needs: with the sender's matching line it bounds the transfer at both
+              // ends, which is what turns "the clipboard did not arrive" into a direction.
+              const auto elapsed =
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - assembly[id].started).count();
+              LOG_INFO(
+                  "clipboard lane \"%s\": received clipboard %d, %u byte(s) in %.1fs", lane->m_peer.c_str(),
+                  static_cast<int>(id), assembly[id].total, elapsed
               );
               // Thread-safe hand-off to the main thread, where the apply is allowed to happen.
               // The cast is load-bearing, not decoration: Event has both an `EventData *` and a
@@ -567,6 +635,8 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
           putU8(body, txId);
           putU32(body, txSeq);
           txFrame = frame(LaneFrame::End, body);
+          // The summary belongs to the moment this frame reaches the wire, not to now.
+          txEndOnWire = true;
           abandonTrain();
         } else {
           const uint32_t take = std::min<uint32_t>(kLaneChunkSize, static_cast<uint32_t>(txPayload.size() - txOffset));
@@ -576,6 +646,12 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
           putU32(body, txSeq);
           putU32(body, txOffset);
           body.append(txPayload, txOffset, take);
+          if (diag) {
+            LOG_NOTE(
+                "clipdiag: lane \"%s\" tx DATA clipboard %d, +%u at %u of %u", lane->m_peer.c_str(),
+                static_cast<int>(txId), take, txOffset, static_cast<uint32_t>(txPayload.size())
+            );
+          }
           txOffset += take;
           txFrame = frame(LaneFrame::Data, body);
         }
@@ -599,6 +675,8 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
           txOffset = 0;
           txSeq = ++lane->m_trainSeq;
           txTrainActive = true;
+          txTrainBytes = static_cast<uint32_t>(txPayload.size());
+          txTrainStart = std::chrono::steady_clock::now();
           std::string body;
           putU8(body, txId);
           putU32(body, txSeq);
@@ -627,6 +705,14 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
       if (txSent >= txFrame.size()) {
         txFrame.clear();
         txSent = 0;
+        if (txEndOnWire) {
+          txEndOnWire = false;
+          const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - txTrainStart).count();
+          LOG_INFO(
+              "clipboard lane \"%s\": sent clipboard %d, %u byte(s) in %.1fs", lane->m_peer.c_str(),
+              static_cast<int>(txId), txTrainBytes, elapsed
+          );
+        }
       }
     }
   }
