@@ -628,14 +628,31 @@ void Client::handleHello()
     return;
   }
 
+  // MouseTransfer fork, 2026-08-06: announce min(ours, the server's) rather than ours flat.
+  //
+  // Stock code announced kProtocolMinorVersion unconditionally and threw the server's numbers away.
+  // That is safe only while every build in a mesh shares one minor, because the SERVER's tolerance
+  // runs one way only: ClientProxyUnknown::initProxy switches on the announced minor, and its
+  // default case leaves the proxy null, which throws IncompatibleClientException -- so a client
+  // announcing a minor the server has never heard of is REFUSED, not degraded. The moment this fork
+  // bumped 1.8 -> 1.9 for the clipboard lane, the first machine of a rolling deploy would otherwise
+  // have been unable to connect to any not-yet-updated server, and since the server role moves
+  // around this fleet that is a random total KVM outage.
+  //
+  // Clamping costs nothing in the matched case (min(9,9) == 9) and cannot lose a capability: the
+  // server decides what it sends from the proxy class it built for the version we announced, so
+  // announcing less only makes it speak an older dialect that this client still fully understands.
+  const int16_t announcedMinor = (serverMinor < kProtocolMinorVersion) ? serverMinor : kProtocolMinorVersion;
+
   LOG_DEBUG(
-      "saying hello back with version %s %d.%d", protocolName.c_str(), kProtocolMajorVersion, kProtocolMinorVersion
+      "saying hello back with version %s %d.%d (server offered %d.%d)", protocolName.c_str(), kProtocolMajorVersion,
+      announcedMinor, serverMajor, serverMinor
   );
 
   // dynamically build write format for hello back since `ProtocolUtil::writef`
   // doesn't support formatting fixed length strings yet.
   std::string helloBackMessage = protocolName + kMsgHelloBackArgs;
-  ProtocolUtil::writef(m_stream, helloBackMessage.c_str(), kProtocolMajorVersion, kProtocolMinorVersion, &m_name);
+  ProtocolUtil::writef(m_stream, helloBackMessage.c_str(), kProtocolMajorVersion, announcedMinor, &m_name);
 
   // now connected but waiting to complete handshake
   setupScreen();

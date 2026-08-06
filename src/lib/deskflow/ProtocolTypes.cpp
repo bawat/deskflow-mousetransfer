@@ -36,6 +36,11 @@ const char *const kMsgDMouseRelMove = "DMRM%2i%2i";
 const char *const kMsgDMouseWheel = "DMWM%2i%2i";
 const char *const kMsgDMouseWheel1_0 = "DMWM%2i";
 const char *const kMsgDClipboard = "DCLP%1i%4i%1i%s";
+// MouseTransfer clipboard lane (fork, protocol 1.9). "DLAN" and "MTLH" were checked against every
+// code in this file before being chosen -- an accidental collision would not fail to build, it
+// would silently route one message into another's parser.
+const char *const kMsgDLaneAdvert = "DLAN%2i%s";
+const char *const kMsgMTLaneHello = "MTLH%2i%s%s";
 const char *const kMsgDInfo = "DINF%2i%2i%2i%2i%2i%2i%2i";
 const char *const kMsgDSetOptions = "DSOP%4I";
 const char *const kMsgDFileTransfer = "DFTR%1i%s";

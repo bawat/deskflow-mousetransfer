@@ -23,6 +23,7 @@
 #include "server/ClientProxy1_6.h"
 #include "server/ClientProxy1_7.h"
 #include "server/ClientProxy1_8.h"
+#include "server/ClientProxy1_9.h"
 #include "server/Server.h"
 
 //
@@ -183,7 +184,33 @@ void ClientProxyUnknown::initProxy(const std::string &name, int major, int minor
       m_proxy = new ClientProxy1_8(name, m_stream, m_server, m_events);
       break;
 
+    case 9:
+      m_proxy = new ClientProxy1_9(name, m_stream, m_server, m_events);
+      break;
+
     default:
+      // MouseTransfer fork, 2026-08-06: an unknown minor that is HIGHER than anything we know is
+      // now clamped to our newest proxy instead of refused.
+      //
+      // Stock code fell through to `break` here, leaving m_proxy null, which throws
+      // IncompatibleClientException -> kMsgEIncompatible -> the client gives up. That is the trap
+      // that made bumping this fork's minor to 9 dangerous: it means an OLDER server refuses a
+      // NEWER client outright rather than negotiating down, so the first machine of a rolling
+      // deploy loses its KVM link entirely, not just its clipboard. Client::handleHello now clamps
+      // what it announces, which fixes it for builds that have that clamp -- but a server also
+      // being permissive is what stops the same trap re-arming at the NEXT bump, when the clamped
+      // client is the old binary in the field. A higher minor is by definition a superset, so a
+      // client that speaks it can also speak ours.
+      //
+      // A minor BELOW everything we know (there is no such case today -- 0 is handled) still
+      // falls through to the throw, because that really is an incompatible peer.
+      if (minor > kProtocolMinorVersion) {
+        LOG_WARN(
+            "client \"%s\" announced protocol %d.%d, newer than ours (%d.%d); negotiating down", name.c_str(), major,
+            minor, kProtocolMajorVersion, kProtocolMinorVersion
+        );
+        m_proxy = new ClientProxy1_9(name, m_stream, m_server, m_events);
+      }
       break;
     }
   }

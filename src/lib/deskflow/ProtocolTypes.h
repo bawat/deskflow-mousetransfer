@@ -44,8 +44,19 @@ static const int16_t kProtocolMajorVersion = 1;
  *
  * @note When incrementing the minor version, the Deskflow application version should also increment
  * @since Protocol version 1.0
+ *
+ * MouseTransfer fork, 2026-08-06: 8 -> 9 for the clipboard lane (kMsgDLaneAdvert). Read this before
+ * touching it again: minor-version tolerance is ONE-DIRECTIONAL. A server accepts any minor it has
+ * a ClientProxy1_N for and speaks that older dialect, but a client announcing a HIGHER minor than
+ * the server knows is REFUSED outright (IncompatibleClientException -> kMsgEIncompatible ->
+ * refuseConnection), and stock Client::handleHello announces this constant unconditionally rather
+ * than capping it to the server's. So a bump on its own makes the first machine of a rolling deploy
+ * unable to connect to any not-yet-updated server AT ALL -- and on this fleet the server role moves,
+ * so that is a random total KVM outage, not a clipboard degradation. Two things keep it safe and
+ * must never be separated from the bump: Client::handleHello clamps to min(ours, server's), and
+ * ClientProxyUnknown::initProxy clamps an unknown-but-higher minor down to its newest proxy.
  */
-static const int16_t kProtocolMinorVersion = 8;
+static const int16_t kProtocolMinorVersion = 9;
 
 /**
  * @brief Default TCP port for Deskflow connections
@@ -910,7 +921,119 @@ extern const char *const kMsgDMouseWheel1_0;
  */
 extern const char *const kMsgDClipboard;
 
+/**
+ * @brief Clipboard lane advertisement (MouseTransfer fork)
+ *
+ * **Message Code**: `"DLAN"`
+ * **Direction**: Primary → Secondary
+ * **Format**: `"DLAN%2i%s"`
+ * **Parameters**:
+ * - `$1`: Lane wire-format version (2 bytes) — @ref kLaneWireVersion
+ * - `$2`: Per-session lane token (string) — @ref kLaneTokenSize raw bytes, CSPRNG
+ *
+ * Tells a client that this server will accept a dedicated clipboard-lane connection, and hands it
+ * the token that authorises exactly one such connection for this session. The token is
+ * length-prefixed, so its embedded NULs are carried intact; it must NEVER be logged.
+ *
+ * **Gating is mandatory and structural.** An unknown 4-char code is not ignorable by the receiver:
+ * `ServerProxy::handleData` cannot know the message's length, so it drains the whole stream and the
+ * connection is finished. This message is therefore emitted only by ClientProxy1_9 — the proxy the
+ * server only ever constructs for a client that announced 1.9 or later.
+ *
+ * @see kMsgMTLaneHello, kLaneWireVersion
+ * @since Protocol version 1.9 (MouseTransfer fork)
+ */
+extern const char *const kMsgDLaneAdvert;
+
+/**
+ * @brief Clipboard lane greeting (MouseTransfer fork)
+ *
+ * **Message Code**: `"MTLH"`
+ * **Direction**: Secondary → Primary, on the LANE connection only
+ * **Format**: `"MTLH%2i%s%s"`
+ * **Parameters**:
+ * - `$1`: Lane wire-format version (2 bytes) — @ref kLaneWireVersion
+ * - `$2`: Client screen name (string) — must name a live session on this server
+ * - `$3`: Lane token (string) — the value from that session's @ref kMsgDLaneAdvert
+ *
+ * Written by the client in the position a `kMsgHelloBack` would normally occupy, on a SECOND TLS
+ * connection to the same listener. The server recognises the code, validates name + token
+ * (constant-time) + "the lane's peer TLS fingerprint equals the main session's", detaches the
+ * socket from the multiplexer and hands it to the clipboard lane. Anything else — bad token,
+ * unknown name, mismatched fingerprint, wrong lane version — closes THIS connection quietly and
+ * leaves the main session completely untouched.
+ *
+ * @see kMsgDLaneAdvert
+ * @since Protocol version 1.9 (MouseTransfer fork)
+ */
+extern const char *const kMsgMTLaneHello;
+
 /** @} */ // end of protocol_clipboard group
+
+/**
+ * @defgroup protocol_lane Clipboard Lane Constants (MouseTransfer fork)
+ * @brief Wire constants for the dedicated clipboard connection
+ *
+ * The lane exists because a large clipboard queued onto the main connection starves the client's
+ * keepalive death timer (kAlives are FIFO behind the blob), so the client declares the server dead
+ * and reconnects with a dirty clipboard, which re-sends from byte zero — a permanent wall-off loop.
+ * See MT-CLIPBOARD-LANE-DESIGN.md in the repository root.
+ * @{
+ */
+
+/**
+ * @brief Lane wire-format version
+ *
+ * Bumped only when the frame layout below changes incompatibly. Both endpoints must agree exactly;
+ * a mismatch rejects the lane (and only the lane).
+ */
+static const int16_t kLaneWireVersion = 1;
+
+/**
+ * @brief Size of a per-session lane token, in bytes
+ *
+ * 128 bits from a CSPRNG. The token is not a long-term secret — it authorises one lane connection
+ * for the lifetime of one main session, on top of the TLS fingerprint match — so this is a
+ * guessing bound, not a key-strength figure.
+ */
+static const uint32_t kLaneTokenSize = 16;
+
+/**
+ * @brief Lane frame types
+ *
+ * Every frame is `{uint8 type, uint32 bodyLength}` little-endian followed by `bodyLength` bytes.
+ * An UNKNOWN type is skipped using its length rather than treated as an error, so a future frame
+ * type can be added without a lane version bump.
+ */
+struct LaneFrame
+{
+  inline static const uint8_t Ack = 1;   ///< body: `uint16 laneVersion` (server → client, first frame)
+  inline static const uint8_t Start = 2; ///< body: `uint8 clipId, uint32 seq, uint32 totalLen`
+  inline static const uint8_t Data = 3;  ///< body: `uint8 clipId, uint32 seq, uint32 offset, bytes`
+  inline static const uint8_t End = 4;   ///< body: `uint8 clipId, uint32 seq`
+  inline static const uint8_t Ping = 5;  ///< body: empty. Reserved; v1 never sends one.
+  inline static const uint8_t Pong = 6;  ///< body: empty. Reserved; v1 never sends one.
+};
+
+/**
+ * @brief Payload bytes per lane Data frame
+ *
+ * 256 KB, per MT-CLIPBOARD-LANE-DESIGN.md §4. Deliberately smaller than the in-stream chunker's
+ * 512 KB: the lane checks its supersede flag between chunks, so the chunk size is also the
+ * granularity at which a stale clipboard train can be abandoned.
+ */
+static constexpr uint32_t kLaneChunkSize = 256 * 1024;
+
+/**
+ * @brief Largest lane frame body accepted from a peer, in bytes
+ *
+ * A receiver allocates from a length the peer supplied, so it needs a ceiling that does not depend
+ * on the peer behaving. Derived, not chosen: the biggest legitimate body is one Data frame — its
+ * fixed header (clipId + seq + offset) plus a full chunk — so that plus a small slack is the bound.
+ */
+static constexpr uint32_t kLaneMaxFrameBody = kLaneChunkSize + 64;
+
+/** @} */ // end of protocol_lane group
 
 /**
  * @defgroup protocol_info Information Messages
