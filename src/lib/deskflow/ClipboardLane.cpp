@@ -113,26 +113,37 @@ std::string ClipboardLaneManager::openSession(const std::string &peer, const std
     return {};
   }
 
-  std::unique_ptr<Lane> displaced;
-  std::string issued;
-  {
-    std::scoped_lock lock{m_mutex};
-    Session &session = m_sessions[peer];
-    // A reconnecting client gets a brand new token, and its previous lane goes with the previous
-    // session -- an old token must never open a lane onto a new session.
-    displaced = std::move(session.m_lane);
-    session.m_token.assign(reinterpret_cast<const char *>(token.data()), token.size());
-    session.m_fingerprint = peerFingerprint;
-    issued = session.m_token;
-  }
+  std::string issued(reinterpret_cast<const char *>(token.data()), token.size());
   // Outside the lock: joining a worker must never happen with the session map held.
-  stopLane(std::move(displaced));
+  stopLane(installSession(peer, issued, peerFingerprint));
 
   LOG_DEBUG(
       "clipboard lane: session opened for \"%s\" (peer authenticated: %s)", peer.c_str(),
       peerFingerprint.empty() ? "no" : "yes"
   );
   return issued;
+}
+
+void ClipboardLaneManager::openLocalSession(const std::string &peer)
+{
+  // No token and no fingerprint: see the header. This session exists only so that attach() has
+  // somewhere to put the lane this endpoint dialled, and it can never validate an inbound one.
+  stopLane(installSession(peer, std::string(), std::string()));
+  LOG_DEBUG("clipboard lane: local session opened for \"%s\"", peer.c_str());
+}
+
+std::unique_ptr<ClipboardLaneManager::Lane>
+ClipboardLaneManager::installSession(const std::string &peer, std::string token, std::string fingerprint)
+{
+  std::scoped_lock lock{m_mutex};
+  Session &session = m_sessions[peer];
+  // A reconnecting peer gets a brand new session, and the previous lane goes with the previous one
+  // -- an old token must never open a lane onto a new session, and a stale lane must never outlive
+  // the session that authorised it.
+  std::unique_ptr<Lane> displaced = std::move(session.m_lane);
+  session.m_token = std::move(token);
+  session.m_fingerprint = std::move(fingerprint);
+  return displaced;
 }
 
 void ClipboardLaneManager::closeSession(const std::string &peer)

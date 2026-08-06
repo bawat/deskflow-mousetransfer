@@ -97,6 +97,23 @@ public:
   */
   std::string openSession(const std::string &peer, const std::string &peerFingerprint);
 
+  //! Create a session for a peer this endpoint DIALS rather than accepts
+  /*!
+  The end that opens a lane has nobody to validate. It authenticated its peer with TLS during the
+  dial, and the token it presents is the peer's secret, not one of its own -- but attach() still
+  needs a session to hang the lane on, so this creates one carrying no token and no fingerprint.
+
+  Deliberately not "openSession() with a token nobody uses". A session made here can never
+  authorise an INBOUND lane, because validate() compares tokens with lane::secretsEqual(), which
+  refuses two empty secrets: the refusal is structural rather than a consequence of nobody happening
+  to call validate() on this manager. It also does not depend on the CSPRNG, so a dialling endpoint
+  cannot lose its lane to a randomness failure that has nothing to do with it.
+
+  Replaces any previous session for \p peer and tears down its lane, so a fresh advert supersedes an
+  old lane exactly as it does on the accepting side.
+  */
+  void openLocalSession(const std::string &peer);
+
   //! Forget a peer's session and tear down its lane
   void closeSession(const std::string &peer);
 
@@ -163,6 +180,14 @@ private:
     std::string m_fingerprint;
     std::unique_ptr<Lane> m_lane;
   };
+
+  //! Install a session, returning the lane it displaced so the CALLER can stop it outside the lock
+  /*!
+  The one place a session is created or replaced. Joining a worker while holding m_sessions would
+  block every other caller for as long as the join takes, so the displaced lane is handed back
+  rather than stopped here.
+  */
+  std::unique_ptr<Lane> installSession(const std::string &peer, std::string token, std::string fingerprint);
 
   //! Worker entry point. Catches EVERYTHING: an escaping exception would call std::terminate.
   void runLane(Lane *lane);
