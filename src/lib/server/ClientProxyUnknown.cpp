@@ -208,12 +208,24 @@ void ClientProxyUnknown::initProxy(const std::string &name, int major, int minor
       //
       // A minor BELOW everything we know (there is no such case today -- 0 is handled) still
       // falls through to the throw, because that really is an incompatible peer.
+      //
+      // 1_8, NOT 1_9, and that is the whole subtlety. Work out who can actually reach this branch:
+      // a client of THIS fork clamps what it announces to min(ours, the server's), so it can never
+      // announce more than 9 to us -- it lands on `case 9`. Everything left is a build that does
+      // NOT clamp, i.e. a stock/upstream one, and 1.9 in this fork is not 1.9 anywhere else: it
+      // means "understands kMsgDLaneAdvert", a message this fork invented. ClientProxy1_9 exists
+      // for exactly one purpose, to SEND that advert, and an unknown 4-char code does not degrade
+      // a client -- ServerProxy::handleData cannot know its length, so it drains the entire stream
+      // and the connection is finished. Handing an unknown-but-higher peer a 1_9 proxy would
+      // therefore kill precisely the connection this branch was written to save. 1_8 is the newest
+      // dialect we can speak to a stranger, and the only thing it costs is the clipboard lane,
+      // which we could not have offered safely in any case.
       if (minor > kProtocolMinorVersion) {
         LOG_WARN(
-            "client \"%s\" announced protocol %d.%d, newer than ours (%d.%d); negotiating down", name.c_str(), major,
-            minor, kProtocolMajorVersion, kProtocolMinorVersion
+            "client \"%s\" announced protocol %d.%d, newer than ours (%d.%d); negotiating down to 1.8",
+            name.c_str(), major, minor, kProtocolMajorVersion, kProtocolMinorVersion
         );
-        m_proxy = new ClientProxy1_9(name, m_stream, m_server, m_events);
+        m_proxy = new ClientProxy1_8(name, m_stream, m_server, m_events);
       }
       break;
     }
