@@ -418,8 +418,14 @@ void ServerProxy::onClipboardChanged(ClipboardID id, std::shared_ptr<const std::
     break;
 
   case SendResult::TooLarge:
+    // The EFFECTIVE limit -- the server's configured one, or this build's absolute ceiling
+    // (kLaneMaxPayloadBytes), whichever is smaller. Named rather than described, because they are
+    // different numbers whenever the configuration is missing or absurd, and pointing the reader at
+    // "the limit configured by the server" would then be pointing at the wrong one. Nothing is
+    // dialled and nothing is queued: the transfer is skipped here.
     LOG_NOTE(
-        "not sending clipboard %d: %d bytes is over the limit configured by the server", id, static_cast<int>(size)
+        "not sending clipboard %d: %d bytes is over the %llu byte limit in force", id, static_cast<int>(size),
+        static_cast<unsigned long long>(m_client->clipboardLaneLimit())
     );
     break;
 

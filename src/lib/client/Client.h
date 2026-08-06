@@ -124,6 +124,16 @@ public:
   deskflow::ClipboardLaneManager::SendResult
   sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::shared_ptr<const std::string> payload);
 
+  //! The clipboard size limit actually in force: the server's, or this build's ceiling, whichever is smaller
+  /*!
+  Exists so a refusal can name the number that bit. They are the same number in a configured fleet
+  and different ones whenever the configuration is missing or absurd — see kLaneMaxPayloadBytes.
+  */
+  size_t clipboardLaneLimit() const
+  {
+    return m_clipboardLane->maxPayloadBytes();
+  }
+
   //@}
   //! @name accessors
   //@{

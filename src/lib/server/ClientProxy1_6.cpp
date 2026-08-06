@@ -130,9 +130,14 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
       break;
 
     case SendResult::TooLarge:
+      // The EFFECTIVE limit, which is the configured one or this build's absolute ceiling
+      // (kLaneMaxPayloadBytes), whichever is smaller. Printed rather than described, because the two
+      // are different numbers whenever the configuration is missing or absurd, and "over the
+      // configured limit" would then send the reader to look at a setting that is not the one that
+      // bit. Nothing is dialled and nothing is queued: the transfer is skipped here.
       LOG_NOTE(
-          "not sending clipboard %d to \"%s\": %u bytes is over the configured limit", id, peer.c_str(),
-          static_cast<uint32_t>(size)
+          "not sending clipboard %d to \"%s\": %u bytes is over the %llu byte limit in force", id, peer.c_str(),
+          static_cast<uint32_t>(size), static_cast<unsigned long long>(getServer()->clipboardLane().maxPayloadBytes())
       );
       break;
 

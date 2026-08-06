@@ -76,7 +76,8 @@ public:
 
   /*!
   \p maxPayloadBytes is the largest clipboard this endpoint will send or accept, and should track
-  the server's configured clipboard size limit.
+  the server's configured clipboard size limit. It is silently reduced to `kLaneMaxPayloadBytes` if
+  it exceeds it -- see setMaxPayloadBytes().
   */
   ClipboardLaneManager(IEventQueue *events, size_t maxPayloadBytes);
   ClipboardLaneManager(const ClipboardLaneManager &) = delete;
@@ -86,7 +87,24 @@ public:
   ~ClipboardLaneManager();
 
   void setReceiveHandler(ReceiveHandler handler);
+
+  //! Track the configured clipboard size limit, under the fork's absolute ceiling
+  /*!
+  The effective limit is `min(bytes, kLaneMaxPayloadBytes)`, and this is the ONE place that min is
+  taken -- every other check on both the send and the receive path reads the result through
+  maxPayloadBytes(), so the configured value governs exactly as it always did right up to the
+  ceiling, and nothing anywhere has to remember to apply the ceiling a second time.
+
+  See kLaneMaxPayloadBytes for why a ceiling exists at all: the configured value defaults to
+  ~2 TB when the option is absent, and the receiver allocates from a peer-supplied length.
+  */
   void setMaxPayloadBytes(size_t bytes);
+
+  //! The EFFECTIVE limit -- the configured one, or the fork's ceiling, whichever is smaller
+  size_t maxPayloadBytes() const
+  {
+    return m_maxPayloadBytes.load();
+  }
 
   //! Arm a peer to open a lane; returns the fresh token to advertise (empty ⇒ no CSPRNG, no lane)
   /*!
@@ -185,6 +203,16 @@ private:
     std::atomic<bool> m_stop{false};             ///< set by the main thread; polled by the worker
     std::atomic<bool> m_finished{false};         ///< set by the worker as its last act
     uint32_t m_trainSeq = 0;                     ///< worker-private train counter (FRAMING only)
+
+    //! Why the WORKER gave up, when the reason needs numbers in it. Read only after join().
+    /*!
+    LaneConn::deadReason() is an atomic<const char *> of string literals, which is what makes it
+    readable from any thread with no lifetime question -- and also what stops it carrying a size.
+    This is the escape hatch for the one reason that has to: "the peer announced N bytes, our
+    ceiling is M". Written by the worker before it shuts the connection down, read by stopLane()
+    AFTER the join, which is the synchronisation point that makes a plain std::string safe here.
+    */
+    std::string m_downDetail;
   };
 
   //! What we know about a peer that is allowed to open a lane

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -69,7 +70,9 @@ std::string frame(uint8_t type, const std::string &body)
 
 ClipboardLaneManager::ClipboardLaneManager(IEventQueue *events, size_t maxPayloadBytes)
     : m_events(events),
-      m_maxPayloadBytes(maxPayloadBytes)
+      // Same min() as setMaxPayloadBytes, because a manager built before any configuration arrives
+      // takes the INT_MAX default straight from Server.h / Client.h.
+      m_maxPayloadBytes(std::min<size_t>(maxPayloadBytes, kLaneMaxPayloadBytes))
 {
   // The workers post inbound payloads here; the handler runs on the main thread, which is the whole
   // point of routing them through the event queue rather than calling back directly.
@@ -94,7 +97,21 @@ void ClipboardLaneManager::setReceiveHandler(ReceiveHandler handler)
 
 void ClipboardLaneManager::setMaxPayloadBytes(size_t bytes)
 {
-  m_maxPayloadBytes = bytes;
+  // THE one place the fork's ceiling is applied. Everything else -- send()'s TooLarge test, the
+  // receiver's START check -- reads m_maxPayloadBytes, so the configured limit governs exactly as
+  // before up to the ceiling, and no other site has to remember the ceiling exists.
+  const size_t effective = std::min<size_t>(bytes, kLaneMaxPayloadBytes);
+  if (effective != bytes) {
+    // NOTE, not DEBUG: this means the configured clipboard limit is not the one in force, which is
+    // the sort of thing that has to be visible when a transfer is later refused for a size the
+    // configuration appears to allow. Once per settings change, not per clipboard.
+    LOG_NOTE(
+        "clipboard lane: the configured clipboard limit of %llu byte(s) is above this build's ceiling; "
+        "using %llu byte(s)",
+        static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(effective)
+    );
+  }
+  m_maxPayloadBytes = effective;
 }
 
 std::string ClipboardLaneManager::openSession(const std::string &peer, const std::string &peerFingerprint)
@@ -197,11 +214,19 @@ void ClipboardLaneManager::stopLane(std::unique_ptr<Lane> lane, const char *why)
   if (lane->m_worker.joinable()) {
     lane->m_worker.join();
   }
+
+  // Read AFTER the join, which is the synchronisation point that makes this plain member safe: the
+  // worker wrote it before it shut the connection down. It takes priority because the only reason
+  // that uses it is the one carrying numbers the reader needs (see Lane::m_downDetail).
+  const char *reason = !lane->m_downDetail.empty()  ? lane->m_downDetail.c_str()
+                       : failure != nullptr         ? failure
+                                                    : why;
+
   // INFO, not DEBUG: the fleet runs its cores at the default log level and never writes log/level
   // into the settings a wrapper regenerates on every start, so anything below INFO does not exist
   // as far as a deployed machine is concerned. One line per lane teardown is not chatty -- a lane
   // is per-peer and lasts the whole session.
-  LOG_INFO("clipboard lane down for \"%s\": %s", lane->m_peer.c_str(), failure != nullptr ? failure : why);
+  LOG_INFO("clipboard lane down for \"%s\": %s", lane->m_peer.c_str(), reason);
   // ~Lane frees the LaneConn, which is now touched by nobody.
 }
 
@@ -530,7 +555,34 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
             const uint32_t seq = getU32(body + 1);
             const uint32_t total = getU32(body + 5);
             const uint32_t clipSeq = getU32(body + 9);
+            if (total > kLaneMaxPayloadBytes) {
+              // BEYOND THE FORK'S ABSOLUTE CEILING, and therefore not a configuration disagreement:
+              // no conforming sender can ever emit this, because every sender applies the same
+              // ceiling through ClipboardLaneManager::send(). Treated as a broken or hostile peer
+              // and the lane is dropped BEFORE the reserve() below allocates anything -- which is
+              // the whole point of the ceiling, since `total` is a uint32 a peer chose and the
+              // configured limit it is otherwise checked against defaults to ~2 TB.
+              //
+              // Formatted through m_downDetail rather than LaneConn::markDead() because the numbers
+              // are the news here, and deadReason() carries literals only. stopLane() prefers this,
+              // so it comes out on the INFO "clipboard lane down" line.
+              char detail[160];
+              snprintf(
+                  detail, sizeof(detail),
+                  "the peer announced a %u byte clipboard, above this build's ceiling of %llu bytes", total,
+                  static_cast<unsigned long long>(kLaneMaxPayloadBytes)
+              );
+              lane->m_downDetail = detail;
+              LOG_WARN(
+                  "clipboard lane \"%s\": %s; dropping the lane", lane->m_peer.c_str(), lane->m_downDetail.c_str()
+              );
+              conn.shutdown();
+              break;
+            }
             if (id >= kClipboardEnd || total > m_maxPayloadBytes) {
+              // Inside the ceiling but over the CONFIGURED limit (or a clipboard id we do not have).
+              // A legitimate disagreement -- two peers can be configured differently -- so the train
+              // is refused and the lane stays up, exactly as before.
               LOG_DEBUG(
                   "clipboard lane \"%s\": refusing clipboard %d of %u byte(s)", lane->m_peer.c_str(),
                   static_cast<int>(id), total

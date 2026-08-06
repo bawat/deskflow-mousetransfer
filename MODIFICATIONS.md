@@ -924,9 +924,38 @@ are not on the payload path at all. §11.3 names the three surviving candidates 
 `SSL_write` returning `WANT_READ` and spinning, and the entirely unlogged Windows clipboard WRITE path
 on the main thread — each with the instrument that now settles it.
 
-**Cap: analysis only, nothing changed.** The binding constraint after these fixes is the RECEIVING
+**Cap: the operational number is analysis only; the fork-side ceiling is IMPLEMENTED.** The binding constraint after these fixes is the RECEIVING
 endpoint (~7N, because the Windows clipboard write path is untouched), not the server (~4N). §12
 recommends 32 MB for the wrapper's emitted `clipboardSharingSize` plus a fork-side absolute clamp at
 128 MiB — the latter because `m_maximumClipboardSize` defaults to `INT_MAX` when the option is absent,
 and the new `reserve(total)` makes that default the literal size of an allocation the receiver will
 attempt from a peer-supplied length.
+#### The fork-side payload ceiling (stage 5, follow-up)
+
+`kLaneMaxPayloadBytes = 128 MiB` in `ProtocolTypes.h`, beside the other lane constants and with the
+§12 arithmetic recorded as its justification: 4x the recommended 32 MB operational knob, bounded by
+the worst-endpoint 7N account, so the worst it permits is ~900 MB rather than the 4 GB a `uint32`
+`totalLen` could otherwise ask for.
+
+Applied in ONE place — `ClipboardLaneManager::setMaxPayloadBytes()` and the constructor take
+`min(configured, kLaneMaxPayloadBytes)` — so the wrapper-emitted `clipboardSharingSize` still governs
+exactly as it does today right up to the ceiling, and no other site has to remember the ceiling
+exists. A configured value above it is reported once at NOTE when it is set, because a transfer later
+refused for a size the configuration appears to allow is otherwise baffling.
+
+Receive is two-tiered, and the tiers mean different things. A START announcing more than the CEILING
+drops the lane, before `reserve()` allocates anything — no conforming sender can emit that, since
+every sender applies the same ceiling, so it is a broken or hostile peer rather than a configuration
+disagreement. Its reason carries the numbers and appears on the INFO "clipboard lane down" line, via
+a new `Lane::m_downDetail` written by the worker and read after the join (`LaneConn::deadReason()` is
+an `atomic<const char *>` of literals, which is what makes it any-thread readable and also what stops
+it carrying a size). A START over the CONFIGURED limit but inside the ceiling behaves exactly as
+before: the train is refused at DEBUG and the lane stays up.
+
+Send needed no new gate — `send()` already tested against `m_maxPayloadBytes`, which is now the
+clamped value, so a misconfigured sender gets `TooLarge` and skips with a NOTE having dialled nothing
+and queued nothing. Both call sites now print the limit IN FORCE instead of calling it "the
+configured limit", since those are different numbers precisely when the ceiling is what bit.
+
+**No emitted `clipboardSharingSize` and no wrapper file was touched.** The operational knob (§12
+recommendation 1, 32 MB) remains the owner's decision.

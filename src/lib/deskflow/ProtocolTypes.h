@@ -1065,6 +1065,32 @@ static constexpr uint32_t kLaneChunkSize = 256 * 1024;
  */
 static constexpr uint32_t kLaneMaxFrameBody = kLaneChunkSize + 64;
 
+/**
+ * @brief Absolute ceiling on ONE clipboard payload, whatever the configuration says
+ *
+ * MouseTransfer, stage 5. The configured clipboard size limit (`clipboardSharingSize`, which the
+ * wrapper emits) still governs, and normally governs alone — this is the floor under it, applied as
+ * a `min()` in ClipboardLaneManager, and it exists because that configured number is not
+ * trustworthy input:
+ *
+ * - It defaults to `INT_MAX` KB (~2 TB) whenever the option is simply absent — a stale
+ *   `Deskflow.conf`, a non-MouseTransfer deployment, a config the wrapper did not regenerate.
+ * - Since stage 5 the receiver `reserve()`s the announced total up front, so that default is the
+ *   literal size of a single allocation this process will attempt from a length a PEER chose. That
+ *   is exactly the case a ceiling has to catch, and the only one it ever catches.
+ *
+ * 128 MiB is derived from MT-CLIPBOARD-LANE-DESIGN.md §12, not picked: the worst endpoint is a
+ * machine APPLYING a received clipboard, which peaks at about 7x the payload (assembly + the
+ * unmarshalled Clipboard + the linefeed copy + the UTF-16 conversion at 2x + the HGLOBAL at 2x), and
+ * §12 recommends 32 MB as the operational knob. 4x that recommendation is 128 MiB — far enough above
+ * the knob that it never binds in a configured fleet, and low enough that the very worst case it
+ * permits is ~900 MB rather than the 4 GB a uint32 `totalLen` could otherwise ask for.
+ *
+ * Deliberately NOT the operational number. Lowering what a configured fleet actually transfers is
+ * the owner's decision; this only bounds the unconfigured and the absurd.
+ */
+static constexpr size_t kLaneMaxPayloadBytes = 128ULL * 1024 * 1024;
+
 /** @} */ // end of protocol_lane group
 
 /**

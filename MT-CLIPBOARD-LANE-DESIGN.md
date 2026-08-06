@@ -667,18 +667,52 @@ clipboard (assembly N, unmarshalled `Clipboard` N, linefeed copy N, UTF-16 conve
    tunable, and it already reaches both endpoints (the server's `m_maximumClipboardSize` and, via
    `kMsgDSetOptions`, the client's). 32 MB sits inside the measured always-clean band with a 1.5×
    margin, costs ~224 MB on the worst endpoint of a 4 GB guest, and is 128 lane chunks.
-2. **A fork-side absolute clamp as well, at 128 MiB** — 4× the operational number, so it never binds
-   in normal use. This is not belt-and-braces, it closes a real hole: `m_maximumClipboardSize`
-   defaults to `INT_MAX` (`Server.h`, `Client.h`), i.e. ~2 TB, whenever the option is absent — a
-   stale `Deskflow.conf`, a non-MouseTransfer deployment, a config the wrapper did not regenerate.
-   **Stage 5's `reserve(total)` change makes that default the literal size of a single allocation the
-   receiver will attempt from a peer-supplied length**, so the setting is now load-bearing in a way
-   it was not before. The lane is authenticated (token + matching peer certificate), so the threat
-   model is a paired machine rather than a stranger, and the failure is graceful (`bad_alloc` →
-   caught → the lane goes down, the main session untouched) — but a configuration accident should not
-   be able to ask for 4 GB.
+2. ~~**A fork-side absolute clamp as well, at 128 MiB**~~ — ✅ **IMPLEMENTED**, see §12.1. 4× the
+   operational number, so it never binds in normal use. This is not belt-and-braces, it closes a real
+   hole: `m_maximumClipboardSize` defaults to `INT_MAX` (`Server.h`, `Client.h`), i.e. ~2 TB, whenever
+   the option is absent — a stale `Deskflow.conf`, a non-MouseTransfer deployment, a config the
+   wrapper did not regenerate. **Stage 5's `reserve(total)` change makes that default the literal size
+   of a single allocation the receiver will attempt from a peer-supplied length**, so the setting is
+   now load-bearing in a way it was not before. The lane is authenticated (token + matching peer
+   certificate), so the threat model is a paired machine rather than a stranger, and the failure is
+   graceful (`bad_alloc` → caught → the lane goes down, the main session untouched) — but a
+   configuration accident should not be able to ask for 4 GB.
 
-Nothing in this stage changes any cap. Both numbers above are proposals.
+Recommendation 1 is still a proposal: **no emitted `clipboardSharingSize` and no wrapper file was
+touched.** The operational knob is the owner's decision.
+
+### 12.1 The ceiling, AS BUILT
+
+`kLaneMaxPayloadBytes = 128 MiB`, in `ProtocolTypes.h` beside the other lane constants, with the §12
+arithmetic recorded there as its justification (4× the recommended 32 MB knob, bounded by the
+worst-endpoint 7N account, so the very worst it permits is ~900 MB rather than the 4 GB a `uint32`
+`totalLen` could otherwise ask for).
+
+**It is applied in exactly one place** — `ClipboardLaneManager::setMaxPayloadBytes()` and the
+constructor take `min(configured, kLaneMaxPayloadBytes)`. Every other check on both paths reads the
+result through `maxPayloadBytes()`, so **the wrapper-emitted `clipboardSharingSize` governs exactly
+as it does today, right up to the ceiling**, and no other site has to remember the ceiling exists. A
+configured value above the ceiling is reported once, at NOTE, when it is set — because a transfer
+later refused for a size the configuration appears to allow is otherwise baffling.
+
+**Receive.** `runLaneBody`'s START handler now has two tiers, and the order matters:
+
+- `total > kLaneMaxPayloadBytes` ⇒ **the lane is dropped, before `reserve()` allocates anything.** No
+  conforming sender can emit this, because every sender applies the same ceiling, so it means a
+  broken or hostile peer rather than a disagreement. The reason carries the numbers and comes out on
+  the INFO down-line: `clipboard lane down for "<peer>": the peer announced a <n> byte clipboard,
+  above this build's ceiling of <m> bytes`, plus a WARN at the moment of refusal. (`LaneConn`'s
+  `deadReason()` is an `atomic<const char *>` of literals — which is what makes it any-thread
+  readable — so a formatted reason goes through the new `Lane::m_downDetail`, written by the worker
+  and read by `stopLane()` **after the join**.)
+- `total > m_maxPayloadBytes` but within the ceiling ⇒ **unchanged**: the train is refused at DEBUG
+  and the lane stays up. Two peers may legitimately be configured differently.
+
+**Send.** `ClipboardLaneManager::send()` already tested `payload->size() > m_maxPayloadBytes`, and
+that value is now the clamped one — so a misconfigured sender gets `SendResult::TooLarge` and skips
+with a NOTE at both call sites, having dialled nothing and queued nothing. Both messages now print
+the limit **in force** rather than describing it as "the configured limit", because those are
+different numbers precisely when the ceiling is what bit.
 
 ## 10. Working agreements for implementing agents
 
