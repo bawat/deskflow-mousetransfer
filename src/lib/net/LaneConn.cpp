@@ -26,7 +26,10 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <utility>
 
 namespace deskflow {
 
@@ -105,10 +108,11 @@ inline RawSocket rawOf(ArchSocket s)
 
 } // namespace
 
-LaneConn::LaneConn(ArchSocket socket, void *ssl, void *sslContext)
+LaneConn::LaneConn(ArchSocket socket, void *ssl, void *sslContext, std::string pending)
     : m_socket(socket),
       m_ssl(ssl),
-      m_sslContext(sslContext)
+      m_sslContext(sslContext),
+      m_pending(std::move(pending))
 {
   // do nothing
 }
@@ -138,7 +142,7 @@ LaneConn::~LaneConn()
   }
 }
 
-std::unique_ptr<LaneConn> LaneConn::adopt(ArchSocket socket, void *ssl, void *sslContext)
+std::unique_ptr<LaneConn> LaneConn::adopt(ArchSocket socket, void *ssl, void *sslContext, std::string pending)
 {
   if (socket == nullptr || ssl == nullptr) {
     // Ownership transferred the moment we were called, so refusing still means cleaning up. The
@@ -167,7 +171,7 @@ std::unique_ptr<LaneConn> LaneConn::adopt(ArchSocket socket, void *ssl, void *ss
   WSAEventSelect(rawOf(socket), nullptr, 0);
 #endif
 
-  return std::unique_ptr<LaneConn>(new LaneConn(socket, ssl, sslContext));
+  return std::unique_ptr<LaneConn>(new LaneConn(socket, ssl, sslContext, std::move(pending)));
 }
 
 unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
@@ -178,6 +182,16 @@ unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
 
   const RawSocket raw = rawOf(m_socket);
   unsigned ready = Ready::None;
+
+  // Bytes carried across the detach are past the kernel already, so the socket will never report
+  // them. Without this the worker would wait out a full poll interval per readSome() and, if it
+  // has nothing to write, never be told to read at all. The wait still happens -- with a zero
+  // timeout -- so that write readiness stays honest rather than being assumed.
+  const bool servePending = m_pendingAt < m_pending.size();
+  if (servePending) {
+    ready |= Ready::Read;
+    seconds = 0.0;
+  }
 
 #if SYSAPI_WIN32
   // Winsock's select() is safe for any socket: an fd_set there is an ARRAY of SOCKET handles with
@@ -204,8 +218,9 @@ unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
   if (n <= 0) {
     // 0 is a timeout. A negative result is either EINTR (retry next loop) or a broken fd, and the
     // subsequent read/write is what will tell the difference and mark the connection dead -- there
-    // is nothing this function could usefully decide on its own.
-    return Ready::None;
+    // is nothing this function could usefully decide on its own. Returns `ready` rather than None
+    // so that carried-over bytes are still reported: the socket has nothing to say about them.
+    return ready;
   }
 
   if (forRead && FD_ISSET(raw, &readSet)) {
@@ -237,7 +252,8 @@ unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
   const auto milliseconds = static_cast<int>(seconds * 1.0e3);
   const int n = ::poll(&entry, 1, milliseconds < 0 ? 0 : milliseconds);
   if (n <= 0) {
-    return Ready::None;
+    // As on the Windows branch: `ready` rather than None, so carried-over bytes survive a timeout.
+    return ready;
   }
 
   // POLLERR/POLLHUP/POLLNVAL are always reported whether asked for or not, and they are LEVEL
@@ -288,6 +304,25 @@ int LaneConn::classify(int result, const char *what)
 
 int LaneConn::readSome(void *buffer, uint32_t n)
 {
+  // Anything carried across the detach comes FIRST, and to the exclusion of the SSL object until
+  // it is gone: these bytes precede everything the SSL object still holds, so interleaving them
+  // would splice the stream out of order. Served even when the connection is already dead --
+  // shutdown() does not un-receive what the peer already said.
+  if (m_pendingAt < m_pending.size()) {
+    const auto take = static_cast<uint32_t>(std::min<size_t>(n, m_pending.size() - m_pendingAt));
+    if (take != 0 && buffer != nullptr) {
+      memcpy(buffer, m_pending.data() + m_pendingAt, take);
+      m_pendingAt += take;
+      if (m_pendingAt >= m_pending.size()) {
+        // Let the memory go; a lane lives for the whole session and this is never needed again.
+        m_pending.clear();
+        m_pending.shrink_to_fit();
+        m_pendingAt = 0;
+      }
+      return static_cast<int>(take);
+    }
+  }
+
   if (dead() || m_ssl == nullptr || n == 0) {
     return dead() ? -1 : 0;
   }

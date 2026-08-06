@@ -291,21 +291,32 @@ SecureSocket::DetachedTls SecureSocket::detachTls()
     //                                        retry to present the SAME buffer. Handing the SSL object
     //                                        to code that knows nothing about that pending write is
     //                                        how the 2026-07-28 outage's corruption looked.
-    //  * unread input                     -- bytes already pulled off the wire that the new owner
-    //                                        would never see.
     //  * unwritten output                 -- bytes the peer is still waiting for.
+    //
+    // Unread INPUT is deliberately NOT in that list. It used to be, and it was wrong: the peer may
+    // legitimately speak as soon as IT has finished its own handoff, which can happen before this
+    // end has run the event-queue hop that gets it here -- so refusing meant a perfectly good
+    // connection was dropped for a race that gets MORE likely the more the peer had to say. Those
+    // bytes are already decrypted and already ours; they are handed over with everything else and
+    // the new owner presents them before its first read.
     bool refused = true;
     if (getSocket() == nullptr || !m_ssl || m_ssl->m_ssl == nullptr || !m_secureReady) {
       LOG_DEBUG("tls detach refused: connection is not live/secure");
     } else if (m_writeRetry) {
       LOG_DEBUG("tls detach refused: a partial tls write is pending");
-    } else if (m_inputBuffer.getSize() != 0 || m_outputBuffer.getSize() != 0) {
-      LOG_DEBUG(
-          "tls detach refused: %u byte(s) buffered in, %u byte(s) buffered out", m_inputBuffer.getSize(),
-          m_outputBuffer.getSize()
-      );
+    } else if (m_outputBuffer.getSize() != 0) {
+      LOG_DEBUG("tls detach refused: %u byte(s) still buffered for the peer", m_outputBuffer.getSize());
     } else {
       refused = false;
+
+      // Carry across anything already read but not consumed. Emptied rather than discarded, so
+      // that releaseSocket()'s "both buffers are empty" precondition still holds by the time it
+      // runs and nothing can silently drop these.
+      if (const uint32_t buffered = m_inputBuffer.getSize(); buffered != 0) {
+        out.pending.assign(static_cast<const char *>(m_inputBuffer.peek(buffered)), buffered);
+        m_inputBuffer.pop(buffered);
+        LOG_DEBUG("tls detach: carrying %u byte(s) the peer had already sent", buffered);
+      }
 
       // Hand over the SSL objects and stop pointing at them. m_ssl (the holder) stays alive but
       // empty, so freeSSL() -- which the destructor and close() both call -- finds nothing to free.

@@ -283,7 +283,7 @@ void ClientProxyUnknown::handleLaneHello()
     return;
   }
 
-  const auto detached = secure->detachTls();
+  auto detached = secure->detachTls();
   if (!detached.valid()) {
     // detachTls() refuses anything that is not quiescent, and says why at DEBUG. Falling back to a
     // normal close costs the peer one retry.
@@ -292,7 +292,7 @@ void ClientProxyUnknown::handleLaneHello()
     return;
   }
 
-  auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext);
+  auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext, std::move(detached.pending));
   if (!conn) {
     // Cannot happen with a valid DetachedTls, and handled rather than asserted. adopt() takes
     // ownership unconditionally, so the connection is already freed by the time we get here --

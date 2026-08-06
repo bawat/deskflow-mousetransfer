@@ -288,16 +288,17 @@ void ClipboardLaneDialer::completeDial()
     return;
   }
 
-  const auto detached = secure->detachTls();
+  auto detached = secure->detachTls();
   if (!detached.valid()) {
-    // detachTls() already said which precondition failed, at DEBUG. Note that it leaves the socket
-    // out of the multiplexer either way, so a refused detach is only ever followed by a close --
-    // which is exactly what abandonDial() does.
+    // detachTls() already said which precondition failed, at DEBUG, and a refusal now leaves the
+    // socket exactly as it found it -- so closing here is a choice rather than an obligation. It
+    // is still the right one: the refusals that remain are all "this connection is not in a state
+    // a lane can use", and a fresh dial is cheaper than reasoning about how it got there.
     abandonDial("the connection could not be detached");
     return;
   }
 
-  auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext);
+  auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext, std::move(detached.pending));
   if (!conn) {
     // Unreachable behind valid(), and handled rather than asserted. adopt() takes ownership
     // unconditionally and has already freed the connection, which matters here: cleanupAttempt()

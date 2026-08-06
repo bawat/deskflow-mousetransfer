@@ -80,13 +80,18 @@ public:
   void* so callers need no OpenSSL headers). On success the returned object owns all three and frees
   them in its destructor.
 
+  \p pending is plaintext the previous owner had already decrypted but not consumed (usually
+  empty). It is served by readSome() before anything is taken from the SSL object, so the stream
+  the worker sees is continuous; waitReady() reports readable while any of it remains, because the
+  socket itself will not -- those bytes are past the kernel already.
+
   **Ownership transfers unconditionally.** If the arguments do not describe a usable connection this
   returns nullptr, having already freed whatever it was given -- so a caller never has to unwind a
   half-handed-over connection, which it could not do anyway without the OpenSSL headers this
   interface exists to spare it. The alternative (nullptr, caller cleans up) left both call sites with
   a dead branch that leaked an SSL object each.
   */
-  static std::unique_ptr<LaneConn> adopt(ArchSocket socket, void *ssl, void *sslContext);
+  static std::unique_ptr<LaneConn> adopt(ArchSocket socket, void *ssl, void *sslContext, std::string pending = {});
 
   //! Readiness bits returned by waitReady()
   struct Ready
@@ -128,7 +133,7 @@ public:
   std::string describe() const;
 
 private:
-  LaneConn(ArchSocket socket, void *ssl, void *sslContext);
+  LaneConn(ArchSocket socket, void *ssl, void *sslContext, std::string pending);
 
   //! Translate an SSL return code into our >0 / 0 / -1 convention, marking m_dead on a real failure
   int classify(int result, const char *what);
@@ -136,6 +141,11 @@ private:
   ArchSocket m_socket = nullptr;
   void *m_ssl = nullptr;
   void *m_sslContext = nullptr;
+
+  // Plaintext handed over with the connection, and how much of it has been served. Owner-thread
+  // only, like everything else here except m_dead.
+  std::string m_pending;
+  size_t m_pendingAt = 0;
 
   // ATOMIC, and that is not decoration. shutdown() is documented as callable from any thread and
   // is how a lane is torn down from the outside, so this flag is WRITTEN by the main thread while

@@ -94,6 +94,19 @@ public:
     void *ssl = nullptr;         ///< SSL*, opaque here so callers need no OpenSSL headers
     void *sslContext = nullptr;  ///< SSL_CTX*, likewise
 
+    //! Plaintext already decrypted off this connection but not yet consumed
+    /*!
+    Almost always empty, and NOT an error when it is not. The new owner must serve these bytes
+    BEFORE its first read from the SSL object, or it starts its stream part way through.
+
+    This exists because the peer is allowed to speak the moment IT has finished its own handoff,
+    which can be before this end has performed the event-queue hop that gets it here. Refusing the
+    detach in that case (which is what this used to do) turns a normal, load-dependent ordering
+    into a dropped connection -- and the more useful the connection is, the more likely the peer
+    had something waiting to send on it.
+    */
+    std::string pending;
+
     bool valid() const
     {
       return socket != nullptr && ssl != nullptr;
@@ -107,12 +120,16 @@ public:
   all become no-ops, and it reports itself disconnected. The connection stays open and usable
   through the returned pieces -- this is a transfer of ownership, not a shutdown.
 
-  Returns an invalid DetachedTls (and changes nothing) unless every precondition holds: the socket
-  is open, TLS is up, no partial SSL_write is latched, and neither the input nor the output buffer
-  holds bytes. Those last three are the important ones -- a detach that stranded a half-written
-  record or dropped buffered bytes would corrupt the stream in a way that looks exactly like the
+  Returns an invalid DetachedTls (and changes nothing, including the multiplexer registration)
+  unless every precondition holds: the socket is open, TLS is up, no partial SSL_write is latched,
+  and the output buffer is empty. A detach that stranded a half-written record or dropped bytes the
+  peer is still waiting for would corrupt the stream in a way that looks exactly like the
   2026-07-28 outage, so it is refused instead. The caller's failure path is simply to close the
   connection normally.
+
+  Unread INPUT is not a refusal: it is drained into DetachedTls::pending and handed over with the
+  rest, because those bytes are already ours and losing them is the only thing that would corrupt
+  anything. The new owner must present them before its first read.
 
   Callable from any thread, but in practice from the event-queue thread while the multiplexer
   thread may still be servicing this socket; the multiplexer removal is what makes that safe, and it
