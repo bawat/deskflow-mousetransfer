@@ -8,6 +8,7 @@
 
 #include "arch/IArchNetwork.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -112,7 +113,7 @@ public:
   //! Has this connection failed or been shut down?
   bool dead() const
   {
-    return m_dead;
+    return m_dead.load(std::memory_order_acquire);
   }
 
   //! Half-close the connection. Safe to call from any thread, and safe to call twice.
@@ -135,7 +136,14 @@ private:
   ArchSocket m_socket = nullptr;
   void *m_ssl = nullptr;
   void *m_sslContext = nullptr;
-  bool m_dead = false;
+
+  // ATOMIC, and that is not decoration. shutdown() is documented as callable from any thread and
+  // is how a lane is torn down from the outside, so this flag is WRITTEN by the main thread while
+  // the owning worker READS it in its loop condition and in every readSome()/writeSome()/
+  // waitReady(). A plain bool there is a data race -- formally UB, and on a weakly-ordered target
+  // (this fork cross-builds for ARMv6) a worker really can go on not seeing the flag, leaving
+  // teardown to depend entirely on the socket half-close waking select().
+  std::atomic<bool> m_dead{false};
 };
 
 } // namespace deskflow

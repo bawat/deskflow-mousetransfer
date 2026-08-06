@@ -20,10 +20,9 @@
 #include <windows.h>
 #elif SYSAPI_UNIX
 #include <cerrno>
+#include <poll.h>
 #include <sys/resource.h>
-#include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -173,12 +172,18 @@ std::unique_ptr<LaneConn> LaneConn::adopt(ArchSocket socket, void *ssl, void *ss
 
 unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
 {
-  if (m_socket == nullptr || m_dead || (!forRead && !forWrite)) {
+  if (m_socket == nullptr || dead() || (!forRead && !forWrite)) {
     return Ready::None;
   }
 
   const RawSocket raw = rawOf(m_socket);
+  unsigned ready = Ready::None;
 
+#if SYSAPI_WIN32
+  // Winsock's select() is safe for any socket: an fd_set there is an ARRAY of SOCKET handles with
+  // a count, so FD_SETSIZE bounds how MANY sockets a set may hold (one, here) and never the value
+  // of a handle. poll()/WSAPoll is deliberately not used -- WSAPoll has documented defects around
+  // reporting a failed connect, and there is no reason to take them for a one-socket wait.
   fd_set readSet;
   fd_set writeSet;
   FD_ZERO(&readSet);
@@ -194,14 +199,8 @@ unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
   timeout.tv_sec = static_cast<long>(seconds);
   timeout.tv_usec = static_cast<long>((seconds - static_cast<double>(timeout.tv_sec)) * 1.0e6);
 
-  // First argument: ignored on Windows, "highest fd + 1" on POSIX.
-#if SYSAPI_WIN32
-  const int nfds = 0;
-#else
-  const int nfds = static_cast<int>(raw) + 1;
-#endif
-
-  const int n = ::select(nfds, forRead ? &readSet : nullptr, forWrite ? &writeSet : nullptr, nullptr, &timeout);
+  // First argument is ignored on Windows.
+  const int n = ::select(0, forRead ? &readSet : nullptr, forWrite ? &writeSet : nullptr, nullptr, &timeout);
   if (n <= 0) {
     // 0 is a timeout. A negative result is either EINTR (retry next loop) or a broken fd, and the
     // subsequent read/write is what will tell the difference and mark the connection dead -- there
@@ -209,13 +208,52 @@ unsigned LaneConn::waitReady(bool forRead, bool forWrite, double seconds)
     return Ready::None;
   }
 
-  unsigned ready = Ready::None;
   if (forRead && FD_ISSET(raw, &readSet)) {
     ready |= Ready::Read;
   }
   if (forWrite && FD_ISSET(raw, &writeSet)) {
     ready |= Ready::Write;
   }
+#elif SYSAPI_UNIX
+  // poll(), NOT select(). On POSIX an fd_set is a BITMAP indexed by descriptor number, so FD_SET
+  // on a descriptor >= FD_SETSIZE (1024 on glibc) writes past the end of the object -- a stack
+  // overflow, not a failed wait. A lane is the SECOND connection a peer opens, on a process that
+  // also holds a socket per client plus the multiplexer's own, so "our descriptor is small" is an
+  // assumption about the whole process, not about this file. poll() has no such ceiling, takes the
+  // descriptor by value, and is what the arch layer's own pollSocket() uses.
+  pollfd entry;
+  entry.fd = raw;
+  entry.events = 0;
+  entry.revents = 0;
+  if (forRead) {
+    entry.events |= POLLIN;
+  }
+  if (forWrite) {
+    entry.events |= POLLOUT;
+  }
+
+  // Milliseconds, and never negative: a negative timeout means "block forever" to poll(), which
+  // would strand a worker that had been asked to stop.
+  const auto milliseconds = static_cast<int>(seconds * 1.0e3);
+  const int n = ::poll(&entry, 1, milliseconds < 0 ? 0 : milliseconds);
+  if (n <= 0) {
+    return Ready::None;
+  }
+
+  // POLLERR/POLLHUP/POLLNVAL are always reported whether asked for or not, and they are LEVEL
+  // triggered -- returning "nothing is ready" for them would spin this worker at full speed on a
+  // broken connection. They are therefore folded into whichever direction the caller asked about,
+  // so the caller goes on to read (or write), gets -1, and marks the connection dead. Keeping that
+  // decision in ONE place is the point: a second failure verdict here could disagree with it.
+  const bool broken = (entry.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+  if (forRead && ((entry.revents & POLLIN) != 0 || broken)) {
+    ready |= Ready::Read;
+  }
+  if (forWrite && ((entry.revents & POLLOUT) != 0 || broken)) {
+    ready |= Ready::Write;
+  }
+#endif
+
   return ready;
 }
 
@@ -235,7 +273,7 @@ int LaneConn::classify(int result, const char *what)
   case SSL_ERROR_ZERO_RETURN:
     // Clean close_notify from the peer.
     LOG_DEBUG("clipboard lane %s: peer closed the connection", describe().c_str());
-    m_dead = true;
+    m_dead.store(true, std::memory_order_release);
     return -1;
 
   default:
@@ -243,15 +281,15 @@ int LaneConn::classify(int result, const char *what)
     // Drain the error queue so a failure here cannot be mistaken for a failure elsewhere later on
     // -- OpenSSL's error queue is per-thread and sticky.
     ERR_clear_error();
-    m_dead = true;
+    m_dead.store(true, std::memory_order_release);
     return -1;
   }
 }
 
 int LaneConn::readSome(void *buffer, uint32_t n)
 {
-  if (m_dead || m_ssl == nullptr || n == 0) {
-    return m_dead ? -1 : 0;
+  if (dead() || m_ssl == nullptr || n == 0) {
+    return dead() ? -1 : 0;
   }
 
   ERR_clear_error();
@@ -264,8 +302,8 @@ int LaneConn::readSome(void *buffer, uint32_t n)
 
 int LaneConn::writeSome(const void *buffer, uint32_t n)
 {
-  if (m_dead || m_ssl == nullptr || n == 0) {
-    return m_dead ? -1 : 0;
+  if (dead() || m_ssl == nullptr || n == 0) {
+    return dead() ? -1 : 0;
   }
 
   ERR_clear_error();
@@ -284,7 +322,7 @@ void LaneConn::shutdown()
   if (m_socket == nullptr) {
     return;
   }
-  m_dead = true;
+  m_dead.store(true, std::memory_order_release);
 #if SYSAPI_WIN32
   ::shutdown(rawOf(m_socket), SD_BOTH);
 #elif SYSAPI_UNIX
