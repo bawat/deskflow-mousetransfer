@@ -154,15 +154,23 @@ public:
   is lower than the one it last saw ("mis-sequenced"), and a per-lane counter starting at 1 loses
   that comparison against the server's running total for the rest of the session. Pass what the
   legacy path would have sent, which for a server->client clipboard is 0.
+
+  \p payload is SHARED, not owned: one immutable buffer per clipboard change, handed to every peer
+  that needs it and to each of their workers. It used to be a std::string per peer, which meant a
+  server with two clients kept THREE live copies of a 64 MiB clipboard for the lane alone -- and the
+  worker's own copy on top. Immutable is what makes sharing safe across threads with no lock: a
+  Payload is only ever replaced wholesale, never edited.
   */
-  SendResult send(const std::string &peer, ClipboardID id, uint32_t sequenceNumber, std::string payload);
+  SendResult
+  send(const std::string &peer, ClipboardID id, uint32_t sequenceNumber, std::shared_ptr<const std::string> payload);
 
 private:
   //! A clipboard waiting to go out, with the application sequence number it belongs to
   struct Payload
   {
     uint32_t m_sequenceNumber = 0;
-    std::string m_data;
+    //! Immutable and shared with every other consumer of the same clipboard change
+    std::shared_ptr<const std::string> m_data;
   };
 
   //! One live lane and its worker

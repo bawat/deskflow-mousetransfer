@@ -8,6 +8,8 @@
 #include "deskflow/Clipboard.h"
 #include "base/Log.h"
 
+#include <utility>
+
 //
 // Clipboard
 //
@@ -55,6 +57,28 @@ void Clipboard::add(Format format, const std::string &data)
 
   const auto formatID = static_cast<int>(format);
   m_data[formatID] = data;
+  m_added[formatID] = true;
+}
+
+// MouseTransfer: identical, except that the caller's buffer is TAKEN rather than copied. This is
+// the overload IClipboard::copy() and IClipboard::unmarshall() reach, because both hand over a
+// temporary they have no further use for -- see IClipboard::add(Format, std::string &&). The
+// guard clauses are duplicated rather than delegated so that a rejected add() destroys the
+// caller's buffer at exactly the same point the copying version would have ignored it.
+void Clipboard::add(Format format, std::string &&data)
+{
+  if (!m_open) {
+    LOG_WARN("cannot add to clipboard, not open");
+    return;
+  }
+
+  if (!m_owner) {
+    LOG_WARN("cannot add to clipboard, no owner");
+    return;
+  }
+
+  const auto formatID = static_cast<int>(format);
+  m_data[formatID] = std::move(data);
   m_added[formatID] = true;
 }
 

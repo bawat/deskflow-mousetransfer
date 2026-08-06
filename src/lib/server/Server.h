@@ -199,6 +199,24 @@ public:
     return *m_clipboardLane;
   }
 
+  //! The server's own marshalling of clipboard \p id, if \p forObject IS the server's clipboard
+  /*!
+  MouseTransfer, stage 5. A client proxy asked to push a clipboard used to copy it into its own
+  Clipboard and marshall THAT -- producing, byte for byte, the string the server had already
+  marshalled a moment earlier in onClipboardChanged, once per client. At 64 MiB that was 134 MB of
+  allocation and copying per client per push, and one more retained copy per client for as long as
+  the lane held it.
+
+  Both call sites that push to a client proxy (onClipboardChanged and switchScreen) pass
+  &m_clipboards[id].m_clipboard, so the identity test is exact rather than a guess: if the object is
+  the server's own, the cached marshalling of it is by construction the same bytes, and the caller
+  gets to share the one buffer instead of building its own. Anything else -- a clipboard from
+  somewhere this function does not know about -- gets nullptr and the caller marshalls for itself.
+
+  \return the shared payload, or nullptr if \p forObject is not the server's clipboard \p id.
+  */
+  std::shared_ptr<const std::string> marshalledClipboard(ClipboardID id, const IClipboard *forObject) const;
+
   //! The CONFIGURATION's spelling of a screen name
   /*!
   Config lookups are CASELESS and resolve aliases, so the name a client announces about itself is
@@ -409,7 +427,18 @@ private:
 
   public:
     Clipboard m_clipboard;
-    std::string m_clipboardData;
+    //! m_clipboard.marshall(), SHARED and kept in step with it -- see Server::marshalledClipboard()
+    /*!
+    MouseTransfer: was a plain std::string, re-derived by every consumer. It is now the ONE buffer
+    every consumer of a given clipboard change uses: the dedup comparison here, the size checks in
+    onScreenSwitch, and the payload each client proxy hands to the lane. A server with two clients
+    used to build FOUR identical marshallings of the same bytes and keep three of them alive.
+
+    Invariant: assigned at every point m_clipboard is assigned, including the over-limit early
+    return in onClipboardChanged, so "current marshalling of m_clipboard" is a property rather than
+    a hope. Never null after the constructor.
+    */
+    std::shared_ptr<const std::string> m_clipboardData;
     std::string m_clipboardOwner;
     uint32_t m_clipboardSeqNum = 0;
   };

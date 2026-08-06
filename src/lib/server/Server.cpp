@@ -76,7 +76,7 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
       clipboard.m_clipboard.empty();
       clipboard.m_clipboard.close();
     }
-    clipboard.m_clipboardData = clipboard.m_clipboard.marshall();
+    clipboard.m_clipboardData = std::make_shared<const std::string>(clipboard.m_clipboard.marshall());
   }
 
   // install event handlers
@@ -556,9 +556,17 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     if (m_enableClipboard) {
       // send the clipboard data to new active screen
       for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        const std::string marshalled = m_clipboards[id].m_clipboard.marshall();
+        // MouseTransfer: the CACHED marshalling, not a fresh one. This ran on every crossing, for
+        // every clipboard id, purely to look at two sizes -- so a 64 MiB clipboard cost 268 MB of
+        // allocate-copy-free per seam crossing, on the thread that relays input. m_clipboardData is
+        // kept in step with m_clipboard at every assignment (see ClipboardInfo), so it is the same
+        // bytes marshall() would have produced.
+        const std::shared_ptr<const std::string> &marshalled = m_clipboards[id].m_clipboardData;
+        if (!marshalled) {
+          continue;
+        }
         // Hackity hackity hack
-        if (marshalled.size() > (m_maximumClipboardSize * 1024)) {
+        if (marshalled->size() > (m_maximumClipboardSize * 1024)) {
           continue;
         }
         // MouseTransfer: don't push a clipboard that marshals to NOTHING onto the new
@@ -567,7 +575,7 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
         // wiping the copied file and greying out Paste. NB a zero-format clipboard marshals
         // to exactly 4 bytes (a uint32 format-count of 0), NOT to an empty string — so test
         // size <= 4, not .empty(). File copies are synced out-of-band over SMB.
-        if (marshalled.size() <= 4) {
+        if (marshalled->size() <= 4) {
           continue;
         }
         m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
@@ -1296,7 +1304,7 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
     clipboard.m_clipboard.empty();
     clipboard.m_clipboard.close();
   }
-  clipboard.m_clipboardData = clipboard.m_clipboard.marshall();
+  clipboard.m_clipboardData = std::make_shared<const std::string>(clipboard.m_clipboard.marshall());
 
   // tell all other screens to take ownership of clipboard.  tell the
   // grabber that it's clipboard isn't dirty.
@@ -1659,6 +1667,17 @@ void Server::handleLaneClipboard(const deskflow::LaneClipboardInfo &info)
   proxy->applyLaneClipboard(info.m_id, info.m_sequenceNumber, info.m_data);
 }
 
+std::shared_ptr<const std::string> Server::marshalledClipboard(ClipboardID id, const IClipboard *forObject) const
+{
+  // Identity, not equality: the two call sites that push a clipboard at a client proxy both hand it
+  // &m_clipboards[id].m_clipboard, so this recognises exactly the case where the server has already
+  // done the work. See the header for what it saves.
+  if (id >= kClipboardEnd || forObject != &m_clipboards[id].m_clipboard) {
+    return nullptr;
+  }
+  return m_clipboards[id].m_clipboardData;
+}
+
 void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum)
 {
   ClipboardInfo &clipboard = m_clipboards[id];
@@ -1675,17 +1694,26 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
   // get data
   sender->getClipboard(id, &clipboard.m_clipboard);
 
-  std::string data = clipboard.m_clipboard.marshall();
+  // MouseTransfer: marshalled ONCE, into a shared immutable buffer, and that one buffer is what
+  // every consumer of this change uses -- the dedup below, every later screen switch, and the
+  // payload each client proxy hands to its lane. See ClipboardInfo::m_clipboardData.
+  auto marshalled = std::make_shared<const std::string>(clipboard.m_clipboard.marshall());
+  const std::string &data = *marshalled;
   if (data.size() > m_maximumClipboardSize * 1024) {
     LOG_NOTE(
         "not updating clipboard because it's over the size limit (%i KB) configured by the server",
         m_maximumClipboardSize
     );
+    // The cache tracks m_clipboard, which getClipboard() just overwrote, so it has to be updated
+    // even on the path that sends nothing -- otherwise the next screen switch would size-check a
+    // marshalling of a clipboard that is no longer there. Nothing is pushed either way: this
+    // returns, and switchScreen applies the same limit to the same bytes.
+    clipboard.m_clipboardData = std::move(marshalled);
     return;
   }
 
   // ignore if data hasn't changed
-  if (data == clipboard.m_clipboardData) {
+  if (clipboard.m_clipboardData && data == *clipboard.m_clipboardData) {
     LOG_DEBUG("ignored screen \"%s\" update of clipboard %d (unchanged)", clipboard.m_clipboardOwner.c_str(), id);
     return;
   }
@@ -1701,7 +1729,7 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
   // data" path above when the wrapper's clipset changes the primary's clipboard.
   if (data.size() <= 4) {
     LOG_DEBUG("screen \"%s\" cleared clipboard %d (no syncable data); not propagating", clipboard.m_clipboardOwner.c_str(), id);
-    clipboard.m_clipboardData = data; // drop any stale stored text so it isn't re-pushed
+    clipboard.m_clipboardData = std::move(marshalled); // drop any stale stored text so it isn't re-pushed
     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
       index->second->setClipboardDirty(id, index->second != sender);
     }
@@ -1710,7 +1738,7 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
 
   // got new data
   LOG_INFO("screen \"%s\" updated clipboard %d", clipboard.m_clipboardOwner.c_str(), id);
-  clipboard.m_clipboardData = data;
+  clipboard.m_clipboardData = std::move(marshalled);
 
   // tell all clients except the sender that the clipboard is dirty
   for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {

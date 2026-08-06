@@ -91,6 +91,13 @@ std::string IClipboard::marshall(const IClipboard *clipboard)
         writeUInt32(&data, format);
         writeUInt32(&data, (uint32_t)formatData[format].size());
         data += formatData[format];
+        // MouseTransfer: hand each format's temporary back the instant its bytes are in `data`,
+        // instead of holding every one of them until this function returns. The peak live memory of
+        // a marshall is otherwise the whole clipboard TWICE over plus the source -- three copies of
+        // a 64 MiB clipboard, on a path that runs per client proxy and per screen switch. shrink is
+        // what actually frees it; clear() alone only sets the size to zero.
+        formatData[format].clear();
+        formatData[format].shrink_to_fit();
       }
     }
     clipboard->close();

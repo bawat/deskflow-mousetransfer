@@ -45,6 +45,8 @@ public:
   // IClipboard overrides
   bool empty() final;
   void add(Format, const std::string &data) override;
+  //! MouseTransfer: takes the buffer instead of copying it -- see IClipboard::add(Format, string&&)
+  void add(Format, std::string &&data) override;
   bool open(Time) const final;
   void close() const override;
   Time getTime() const override;

@@ -117,9 +117,12 @@ public:
 
   \p sequenceNumber is the client's clipboard sequence number, which the server compares against
   what it last saw. It is carried end to end.
+
+  \p payload is SHARED and immutable -- the one buffer sendClipboard() marshalled, which is also the
+  dedup record it keeps. Nothing between here and the wire copies it again.
   */
   deskflow::ClipboardLaneManager::SendResult
-  sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::string payload);
+  sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::shared_ptr<const std::string> payload);
 
   //@}
   //! @name accessors
@@ -234,7 +237,9 @@ private:
   bool m_ownClipboard[kClipboardEnd];
   bool m_sentClipboard[kClipboardEnd];
   IClipboard::Time m_timeClipboard[kClipboardEnd];
-  std::string m_dataClipboard[kClipboardEnd];
+  // The last payload SENT for each clipboard id, kept only to answer "has this changed". Shared
+  // with the lane rather than copied for it -- see sendClipboard().
+  std::shared_ptr<const std::string> m_dataClipboard[kClipboardEnd];
   IEventQueue *m_events = nullptr;
   bool m_useSecureNetwork = false;
   bool m_enableClipboard = true;

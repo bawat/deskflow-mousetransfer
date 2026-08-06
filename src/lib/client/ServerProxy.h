@@ -13,6 +13,9 @@
 #include "deskflow/KeyTypes.h"
 #include "deskflow/languages/LanguageManager.h"
 
+#include <memory>
+#include <string>
+
 class Client;
 class ClientInfo;
 class EventQueueTimer;
@@ -47,7 +50,14 @@ public:
 
   void onInfoChanged();
   bool onGrabClipboard(ClipboardID);
-  void onClipboardChanged(ClipboardID, const IClipboard *);
+  //! Send an ALREADY-MARSHALLED clipboard to the server (MouseTransfer fork)
+  /*!
+  Takes the bytes, not the clipboard. Client::sendClipboard has to marshall anyway -- for the size
+  limit and the unchanged check -- so handing this the IClipboard made it marshall the same object a
+  second time, at full cost, on the leave path. The buffer is shared and immutable; this only routes
+  it and logs what became of it.
+  */
+  void onClipboardChanged(ClipboardID, std::shared_ptr<const std::string> marshalled);
 
   //! Apply a clipboard that arrived over the lane (MouseTransfer fork)
   /*!

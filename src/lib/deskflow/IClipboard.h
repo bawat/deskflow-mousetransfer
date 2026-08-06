@@ -73,6 +73,24 @@ public:
   */
   virtual void add(Format, const std::string &data) = 0;
 
+  //! Add data, giving up ownership of it
+  /*!
+  MouseTransfer: the same operation, for a caller that has a buffer it no longer needs. An
+  implementation that STORES the bytes (Clipboard) can then move them instead of copying; one that
+  converts them into something else (every platform clipboard) has nothing to gain and inherits this
+  default, which simply forwards to the copying overload.
+
+  Not a micro-optimisation at the sizes this fork has to survive. Both hot paths took a full extra
+  copy of the whole clipboard through here: IClipboard::copy() built a temporary with get() and then
+  copied it in, and unmarshall() built a temporary per format and then copied THAT in. At 64 MiB
+  each of those was 67 MB of memcpy plus 67 MB of live allocation, on the paths that run per client
+  proxy and per screen switch. See MT-CLIPBOARD-LANE-DESIGN.md §11.
+  */
+  virtual void add(Format format, std::string &&data)
+  {
+    add(format, static_cast<const std::string &>(data));
+  }
+
   //@}
   //! @name accessors
   //@{

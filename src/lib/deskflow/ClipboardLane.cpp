@@ -302,10 +302,14 @@ bool ClipboardLaneManager::hasLane(const std::string &peer)
   return live;
 }
 
-ClipboardLaneManager::SendResult
-ClipboardLaneManager::send(const std::string &peer, ClipboardID id, uint32_t sequenceNumber, std::string payload)
+ClipboardLaneManager::SendResult ClipboardLaneManager::send(
+    const std::string &peer, ClipboardID id, uint32_t sequenceNumber, std::shared_ptr<const std::string> payload
+)
 {
-  if (payload.size() > m_maxPayloadBytes) {
+  if (!payload) {
+    return SendResult::NoLane;
+  }
+  if (payload->size() > m_maxPayloadBytes) {
     return SendResult::TooLarge;
   }
 
@@ -421,7 +425,9 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
   ClipboardID txId = 0;
   uint32_t txSeq = 0;     // train counter, for framing only
   uint32_t txClipSeq = 0; // the application sequence number this payload was queued with
-  std::string txPayload;
+  // SHARED and immutable: the same buffer the queue holds, and the same one every other peer's
+  // worker is sending. Nothing here ever writes through it.
+  std::shared_ptr<const std::string> txPayload;
   uint32_t txOffset = 0;
 
   // One INFO line per completed OUTBOUND train, emitted when its End frame has actually reached the
@@ -454,7 +460,7 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
 
   const auto abandonTrain = [&]() {
     txTrainActive = false;
-    txPayload.clear();
+    txPayload.reset();
     txOffset = 0;
   };
 
@@ -539,12 +545,19 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
                     lane->m_peer.c_str(), static_cast<int>(id), total, seq, clipSeq
                 );
               }
-              // Reserve a first chunk's worth rather than the announced total. `total` is a number
-              // the PEER chose, and with no configured clipboard limit the ceiling on it is 4 GB --
-              // reserving that up front would throw before a single byte of it had arrived. append()
-              // grows geometrically, so the cost of not front-loading is a few reallocations on a
-              // payload that is genuinely large.
-              assembly[id].data.reserve(std::min<uint32_t>(total, kLaneChunkSize));
+              // Reserve the WHOLE announced total, which the branch above has just bounded by
+              // m_maxPayloadBytes -- the same configured clipboard limit the sender obeys. Growing
+              // instead costs a full geometric-growth sequence: reaching 64 MiB from a 256 KB start
+              // is roughly a dozen reallocations, ~2x the payload in memcpy, and a transient peak of
+              // the old buffer plus a 1.5x-larger new one, all on a background-priority thread.
+              //
+              // This is not a new way to make us allocate: `total` was already trusted enough to
+              // decide whether to accept the train at all, the lane is authenticated (token +
+              // matching peer certificate), and a peer that wanted us to hold that much memory could
+              // simply send it. The earlier caution here was about the case with NO configured
+              // limit, where the ceiling is 4 GB -- but that is a configuration problem, and it is
+              // the one thing this reserve now makes loud instead of silent.
+              assembly[id].data.reserve(total);
             }
           } else if (rxType == LaneFrame::Data && rxBody.size() >= kLaneDataHeaderSize) {
             const ClipboardID id = body[0];
@@ -630,7 +643,7 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
           LOG_DEBUG("clipboard lane \"%s\": clipboard %d superseded mid-send", lane->m_peer.c_str(),
                     static_cast<int>(txId));
           abandonTrain();
-        } else if (txOffset >= txPayload.size()) {
+        } else if (txOffset >= txPayload->size()) {
           std::string body;
           putU8(body, txId);
           putU32(body, txSeq);
@@ -639,21 +652,28 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
           txEndOnWire = true;
           abandonTrain();
         } else {
-          const uint32_t take = std::min<uint32_t>(kLaneChunkSize, static_cast<uint32_t>(txPayload.size() - txOffset));
-          std::string body;
-          body.reserve(kLaneDataHeaderSize + take);
-          putU8(body, txId);
-          putU32(body, txSeq);
-          putU32(body, txOffset);
-          body.append(txPayload, txOffset, take);
+          const uint32_t take = std::min<uint32_t>(kLaneChunkSize, static_cast<uint32_t>(txPayload->size() - txOffset));
+          // Built straight into txFrame, header and all, rather than into a `body` that frame() then
+          // copies again: the payload slice is 256 KB, so the intermediate cost a second 256 KB
+          // allocation and memcpy for every chunk -- 128 MB of pure copying across a 64 MiB
+          // clipboard, for nothing. txFrame keeps its capacity between chunks (clear() does not
+          // release it and reserve() will not shrink it), so after the first chunk this allocates
+          // nothing at all.
+          txFrame.clear();
+          txFrame.reserve(kFrameHeaderSize + kLaneDataHeaderSize + take);
+          putU8(txFrame, LaneFrame::Data);
+          putU32(txFrame, kLaneDataHeaderSize + take);
+          putU8(txFrame, txId);
+          putU32(txFrame, txSeq);
+          putU32(txFrame, txOffset);
+          txFrame.append(*txPayload, txOffset, take);
           if (diag) {
             LOG_NOTE(
                 "clipdiag: lane \"%s\" tx DATA clipboard %d, +%u at %u of %u", lane->m_peer.c_str(),
-                static_cast<int>(txId), take, txOffset, static_cast<uint32_t>(txPayload.size())
+                static_cast<int>(txId), take, txOffset, static_cast<uint32_t>(txPayload->size())
             );
           }
           txOffset += take;
-          txFrame = frame(LaneFrame::Data, body);
         }
       } else {
         Payload payload;
@@ -675,19 +695,19 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
           txOffset = 0;
           txSeq = ++lane->m_trainSeq;
           txTrainActive = true;
-          txTrainBytes = static_cast<uint32_t>(txPayload.size());
+          txTrainBytes = static_cast<uint32_t>(txPayload->size());
           txTrainStart = std::chrono::steady_clock::now();
           std::string body;
           putU8(body, txId);
           putU32(body, txSeq);
-          putU32(body, static_cast<uint32_t>(txPayload.size()));
+          putU32(body, static_cast<uint32_t>(txPayload->size()));
           // The application's own sequence number, carried end to end so the receiver's
           // mis-sequence check sees the number the in-stream path would have given it.
           putU32(body, txClipSeq);
           txFrame = frame(LaneFrame::Start, body);
           LOG_DEBUG(
               "clipboard lane \"%s\": sending clipboard %d, %u byte(s), seqnum=%u", lane->m_peer.c_str(),
-              static_cast<int>(txId), static_cast<uint32_t>(txPayload.size()), txClipSeq
+              static_cast<int>(txId), static_cast<uint32_t>(txPayload->size()), txClipSeq
           );
         }
       }

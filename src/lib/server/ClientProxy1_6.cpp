@@ -14,6 +14,9 @@
 #include "io/IStream.h"
 #include "server/Server.h"
 
+#include <memory>
+#include <utility>
+
 namespace {
 
 //! Seconds between "clipboard dropped, this client has no lane" warnings, per client
@@ -71,8 +74,19 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
     m_clipboard[id].m_dirty = false;
     Clipboard::copy(&m_clipboard[id].m_clipboard, clipboard);
 
-    std::string data = m_clipboard[id].m_clipboard.marshall();
-    const size_t size = data.size();
+    // MouseTransfer, stage 5: SHARE the server's marshalling rather than producing an identical one.
+    // The copy above is proxy STATE (what this client is believed to hold) and stays; what does not
+    // need to be per-proxy is the marshalled payload, which is a pure function of the clipboard the
+    // server just handed us. Both callers pass the server's own clipboard object, so
+    // marshalledClipboard() answers with the buffer built in onClipboardChanged -- one allocation
+    // and one memcpy of the whole clipboard per client, gone, plus one retained copy per client for
+    // as long as the lane holds it. The fallback marshalls locally, so an unrecognised source object
+    // still works exactly as before.
+    std::shared_ptr<const std::string> data = getServer()->marshalledClipboard(id, clipboard);
+    if (!data) {
+      data = std::make_shared<const std::string>(m_clipboard[id].m_clipboard.marshall());
+    }
+    const size_t size = data->size();
 
     // The transport swap. This used to be StreamChunker::sendClipboard(), which queued the ENTIRE
     // train onto the main connection as one event per chunk -- in front of the keepalives the

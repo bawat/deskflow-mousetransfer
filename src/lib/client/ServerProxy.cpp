@@ -381,7 +381,7 @@ bool ServerProxy::onGrabClipboard(ClipboardID id)
   return true;
 }
 
-void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard)
+void ServerProxy::onClipboardChanged(ClipboardID id, std::shared_ptr<const std::string> marshalled)
 {
   // Every DECISION about whether to send was made before this was called and stays where it was --
   // Client::sendClipboard owns the clipboard-time check, the size limit and the sent/unchanged
@@ -392,11 +392,17 @@ void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard
   // on. That is the wall-off loop the lane exists to end, so there is deliberately NO in-stream
   // fallback: a clipboard that cannot go by lane is dropped, loudly but harmlessly, rather than
   // being allowed back onto the path that kills the KVM link.
-  std::string data = IClipboard::marshall(clipboard);
-  const size_t size = data.size();
+  //
+  // MouseTransfer, stage 5: the bytes arrive already marshalled. This function used to call
+  // IClipboard::marshall() on the very clipboard the caller had just marshalled for its own checks
+  // -- a second full pass over the whole payload, on the leave path.
+  if (!marshalled) {
+    return;
+  }
+  const size_t size = marshalled->size();
 
   using SendResult = deskflow::ClipboardLaneManager::SendResult;
-  switch (m_client->sendClipboardOverLane(id, m_seqNum, std::move(data))) {
+  switch (m_client->sendClipboardOverLane(id, m_seqNum, std::move(marshalled))) {
   case SendResult::Queued:
     LOG_DEBUG("sending clipboard %d over the lane, seqnum=%d, size=%d", id, m_seqNum, static_cast<int>(size));
     break;

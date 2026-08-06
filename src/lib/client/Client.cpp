@@ -382,7 +382,15 @@ void Client::sendClipboard(ClipboardID id)
   // check time
   if (m_timeClipboard[id] == 0 || clipboard.getTime() != m_timeClipboard[id]) {
     // marshall the data
-    std::string data = clipboard.marshall();
+    //
+    // MouseTransfer, stage 5: ONCE, into a shared immutable buffer that is then the dedup record,
+    // the size check AND the payload handed to the lane. This function used to marshall for the
+    // size/dedup checks, keep a private copy of the result, and then hand the CLIPBOARD to
+    // ServerProxy::onClipboardChanged, which marshalled the very same object all over again. At
+    // 64 MiB that was a second 134 MB of allocate-and-copy on the leave path -- the moment the user
+    // is waiting for the cursor to appear on the next screen.
+    auto marshalled = std::make_shared<const std::string>(clipboard.marshall());
+    const std::string &data = *marshalled;
     if (data.size() >= m_maximumClipboardSize * 1024) {
       LOG(
           (CLOG_NOTE "skipping clipboard transfer because the clipboard"
@@ -395,10 +403,10 @@ void Client::sendClipboard(ClipboardID id)
     // save new time
     m_timeClipboard[id] = clipboard.getTime();
     // save and send data if different or not yet sent
-    if (!m_sentClipboard[id] || data != m_dataClipboard[id]) {
+    if (!m_sentClipboard[id] || !m_dataClipboard[id] || data != *m_dataClipboard[id]) {
       m_sentClipboard[id] = true;
-      m_dataClipboard[id] = data;
-      m_server->onClipboardChanged(id, &clipboard);
+      m_dataClipboard[id] = marshalled;
+      m_server->onClipboardChanged(id, std::move(marshalled));
     }
   }
 }
@@ -427,7 +435,7 @@ void Client::onClipboardLaneAdvert(int16_t laneVersion, std::string token)
 }
 
 deskflow::ClipboardLaneManager::SendResult
-Client::sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::string payload)
+Client::sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::shared_ptr<const std::string> payload)
 {
   const auto result = m_clipboardLane->send(kLaneServerPeer, id, sequenceNumber, std::move(payload));
 
