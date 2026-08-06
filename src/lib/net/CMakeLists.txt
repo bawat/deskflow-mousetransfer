@@ -20,6 +20,8 @@ add_library(net STATIC
   FingerprintDatabase.h
   IDataSocket.cpp
   IDataSocket.h
+  LaneConn.cpp
+  LaneConn.h
   IListenSocket.h
   ISocket.h
   ISocketFactory.h
