@@ -212,6 +212,8 @@ private:
   touch screen and proxy state.
   */
   void handleLaneClipboard(const deskflow::LaneClipboardInfo &info);
+  //! Re-dial if the lane has quietly died. Cheap, idempotent, and a no-op with a lane up.
+  void ensureClipboardLane();
   //! Drop the lane and anything dialling one. Idempotent; safe in any state.
   void cleanupLane();
   //! The configured clipboard limit in BYTES, saturating rather than overflowing

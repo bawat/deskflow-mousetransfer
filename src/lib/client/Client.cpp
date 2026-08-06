@@ -216,6 +216,14 @@ void Client::enter(int32_t xAbs, int32_t yAbs, uint32_t, KeyModifierMask mask, b
   m_active = true;
   m_screen->mouseMove(xAbs, yAbs);
   m_screen->enter(mask);
+
+  // MouseTransfer: a crossing is the only moment a clipboard moves in either direction, so it is
+  // exactly when a lane needs to exist -- and it is an event that already happens, which is why the
+  // check lives here rather than on a timer of its own. It matters because a lane that dies WITHOUT
+  // the main connection dying (an idle lane sends nothing, so a stateful firewall can reap it) would
+  // otherwise go unnoticed until this machine next copied something: the server cannot re-dial, only
+  // we can. Costs a lookup on a one-entry map.
+  ensureClipboardLane();
 }
 
 bool Client::leave()
@@ -445,6 +453,17 @@ void Client::handleLaneClipboard(const deskflow::LaneClipboardInfo &info)
   // Routed through the proxy rather than applied here, so that a lane clipboard lands in exactly
   // the same state, through exactly the same code, as one that arrived in-stream.
   m_server->applyLaneClipboard(info.m_id, info.m_sequenceNumber, info.m_data);
+}
+
+void Client::ensureClipboardLane()
+{
+  // hasLane() is the authority on "is there a live lane", and it also reaps a worker that has
+  // already given up -- which is how a lane that died quietly gets noticed at all. nudge() is a
+  // no-op unless the dialer is idle with a token, so this can neither interrupt a dial in flight
+  // nor pull a backoff forward.
+  if (m_laneDialer && !m_clipboardLane->hasLane(kLaneServerPeer)) {
+    m_laneDialer->nudge();
+  }
 }
 
 void Client::cleanupLane()
