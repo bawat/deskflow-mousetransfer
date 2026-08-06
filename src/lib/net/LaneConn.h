@@ -76,8 +76,14 @@ public:
   //! Take ownership of a detached TLS connection
   /*!
   \p socket is one owned ArchSocket reference, \p ssl an SSL* and \p sslContext an SSL_CTX* (both
-  void* so callers need no OpenSSL headers). Returns nullptr if any of them is null. On success the
-  returned object owns all three and frees them in its destructor.
+  void* so callers need no OpenSSL headers). On success the returned object owns all three and frees
+  them in its destructor.
+
+  **Ownership transfers unconditionally.** If the arguments do not describe a usable connection this
+  returns nullptr, having already freed whatever it was given -- so a caller never has to unwind a
+  half-handed-over connection, which it could not do anyway without the OpenSSL headers this
+  interface exists to spare it. The alternative (nullptr, caller cleans up) left both call sites with
+  a dead branch that leaked an SSL object each.
   */
   static std::unique_ptr<LaneConn> adopt(ArchSocket socket, void *ssl, void *sslContext);
 

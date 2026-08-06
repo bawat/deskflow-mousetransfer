@@ -286,8 +286,9 @@ void ClientProxyUnknown::handleLaneHello()
 
   auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext);
   if (!conn) {
-    // Cannot happen with a valid DetachedTls, but if it ever did the connection would leak, so it
-    // is handled rather than asserted.
+    // Cannot happen with a valid DetachedTls, and handled rather than asserted. adopt() takes
+    // ownership unconditionally, so the connection is already freed by the time we get here --
+    // nothing below can reach it any more, the socket wrapper having given it away.
     LOG_DEBUG("clipboard lane refused for \"%s\": could not adopt the detached connection", name.c_str());
     sendFailure();
     return;

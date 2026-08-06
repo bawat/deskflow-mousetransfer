@@ -142,6 +142,21 @@ LaneConn::~LaneConn()
 std::unique_ptr<LaneConn> LaneConn::adopt(ArchSocket socket, void *ssl, void *sslContext)
 {
   if (socket == nullptr || ssl == nullptr) {
+    // Ownership transferred the moment we were called, so refusing still means cleaning up. The
+    // caller cannot do it: it has no OpenSSL headers, which is the whole reason these are void*.
+    if (ssl != nullptr) {
+      SSL_free(static_cast<SSL *>(ssl));
+    }
+    if (sslContext != nullptr) {
+      SSL_CTX_free(static_cast<SSL_CTX *>(sslContext));
+    }
+    if (socket != nullptr) {
+      try {
+        ARCH->closeSocket(socket);
+      } catch (...) {
+        // Nothing useful to do, and this is already the "cannot happen" path.
+      }
+    }
     return nullptr;
   }
 

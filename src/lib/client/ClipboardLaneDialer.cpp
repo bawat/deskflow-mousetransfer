@@ -299,11 +299,9 @@ void ClipboardLaneDialer::completeDial()
 
   auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext);
   if (!conn) {
-    // Unreachable behind valid(), but if it ever happened the connection would leak rather than
-    // fail, so it is handled instead of asserted. cleanupAttempt() can no longer close it -- the
-    // wrapper gave it away a moment ago -- so it is closed here.
-    LOG_DEBUG("clipboard lane: the detached connection could not be adopted");
-    ARCH->closeSocket(detached.socket);
+    // Unreachable behind valid(), and handled rather than asserted. adopt() takes ownership
+    // unconditionally and has already freed the connection, which matters here: cleanupAttempt()
+    // could not close it -- the socket wrapper gave it away a moment ago.
     abandonDial("the detached connection could not be adopted");
     return;
   }
