@@ -265,52 +265,74 @@ SecureSocket::DetachedTls SecureSocket::detachTls()
   // Leave the multiplexer FIRST, exactly as close() does. removeSocket() breaks the service thread
   // out of its poll and takes the job list lock, so once it returns no job can be running against
   // this socket -- which is what makes it safe to take the object apart from the event-queue
-  // thread while the service thread is alive.
+  // thread while the service thread is alive. It also means the checks below read buffers that
+  // nothing else can be mutating, which is the whole reason the removal cannot come after them.
   setJob(nullptr);
 
-  Lock lock(&getMutex());
-  std::scoped_lock ssl_lock{ssl_mutex_};
+  // ...and that is exactly why a REFUSAL has to put the job back. Leaving early with the socket
+  // out of the multiplexer would silently strand a live connection: no reads, no writes, no
+  // disconnect event, just silence. Today's two callers both close after a refusal so they never
+  // notice, but "this method half-destroys the socket when it says no" is a trap laid for the
+  // third one, and this fork's rule is to close a trap rather than document it and hope. Recomputed
+  // under the lock (newJob() requires it) and applied after it (setJob() must not be called under
+  // it -- close() takes the same care).
+  ISocketMultiplexerJob *restore = nullptr;
+  bool restoreJob = false;
+  {
+    Lock lock(&getMutex());
+    std::scoped_lock ssl_lock{ssl_mutex_};
 
-  // Refuse anything that is not a quiescent, live, secured connection. Each of these would be a
-  // stream-corrupting detach rather than a clean transfer, and the caller's fallback (close the
-  // connection normally) is cheap, so refusing is always the better answer:
-  //
-  //  * no socket / no SSL / not secure  -- there is nothing to hand over.
-  //  * m_writeRetry                     -- a partial SSL_write is latched, and OpenSSL requires the
-  //                                        retry to present the SAME buffer. Handing the SSL object
-  //                                        to code that knows nothing about that pending write is
-  //                                        how the 2026-07-28 outage's corruption looked.
-  //  * unread input                     -- bytes already pulled off the wire that the new owner
-  //                                        would never see.
-  //  * unwritten output                 -- bytes the peer is still waiting for.
-  if (getSocket() == nullptr || !m_ssl || m_ssl->m_ssl == nullptr || !m_secureReady) {
-    LOG_DEBUG("tls detach refused: connection is not live/secure");
+    // Refuse anything that is not a quiescent, live, secured connection. Each of these would be a
+    // stream-corrupting detach rather than a clean transfer, and the caller's fallback (close the
+    // connection normally) is cheap, so refusing is always the better answer:
+    //
+    //  * no socket / no SSL / not secure  -- there is nothing to hand over.
+    //  * m_writeRetry                     -- a partial SSL_write is latched, and OpenSSL requires the
+    //                                        retry to present the SAME buffer. Handing the SSL object
+    //                                        to code that knows nothing about that pending write is
+    //                                        how the 2026-07-28 outage's corruption looked.
+    //  * unread input                     -- bytes already pulled off the wire that the new owner
+    //                                        would never see.
+    //  * unwritten output                 -- bytes the peer is still waiting for.
+    bool refused = true;
+    if (getSocket() == nullptr || !m_ssl || m_ssl->m_ssl == nullptr || !m_secureReady) {
+      LOG_DEBUG("tls detach refused: connection is not live/secure");
+    } else if (m_writeRetry) {
+      LOG_DEBUG("tls detach refused: a partial tls write is pending");
+    } else if (m_inputBuffer.getSize() != 0 || m_outputBuffer.getSize() != 0) {
+      LOG_DEBUG(
+          "tls detach refused: %u byte(s) buffered in, %u byte(s) buffered out", m_inputBuffer.getSize(),
+          m_outputBuffer.getSize()
+      );
+    } else {
+      refused = false;
+
+      // Hand over the SSL objects and stop pointing at them. m_ssl (the holder) stays alive but
+      // empty, so freeSSL() -- which the destructor and close() both call -- finds nothing to free.
+      out.ssl = m_ssl->m_ssl;
+      out.sslContext = m_ssl->m_context;
+      m_ssl->m_ssl = nullptr;
+      m_ssl->m_context = nullptr;
+      m_secureReady = false;
+
+      // Hand over the socket handle and stop pointing at that too. releaseSocket() also puts the
+      // wrapper into the disconnected state, so close() will not announce a SocketDisconnected for
+      // a connection that is very much alive in someone else's hands.
+      out.socket = releaseSocket();
+    }
+
+    if (refused) {
+      restore = newJob();
+      restoreJob = true;
+    }
+  }
+
+  if (restoreJob) {
+    // newJob() may legitimately be null (nothing to wait for); setJob handles that as a removal,
+    // which is where we already are, so this is safe either way.
+    setJob(restore);
     return out;
   }
-  if (m_writeRetry) {
-    LOG_DEBUG("tls detach refused: a partial tls write is pending");
-    return out;
-  }
-  if (m_inputBuffer.getSize() != 0 || m_outputBuffer.getSize() != 0) {
-    LOG_DEBUG(
-        "tls detach refused: %u byte(s) buffered in, %u byte(s) buffered out", m_inputBuffer.getSize(),
-        m_outputBuffer.getSize()
-    );
-    return out;
-  }
-
-  // Hand over the SSL objects and stop pointing at them. m_ssl (the holder) stays alive but empty,
-  // so freeSSL() -- which the destructor and close() both call -- finds nothing to free.
-  out.ssl = m_ssl->m_ssl;
-  out.sslContext = m_ssl->m_context;
-  m_ssl->m_ssl = nullptr;
-  m_ssl->m_context = nullptr;
-  m_secureReady = false;
-
-  // Hand over the socket handle and stop pointing at that too. releaseSocket() also puts the
-  // wrapper into the disconnected state, so close() will not announce a SocketDisconnected for a
-  // connection that is very much alive in someone else's hands.
-  out.socket = releaseSocket();
 
   LOG_DEBUG("tls connection detached for the clipboard lane");
   return out;
