@@ -81,35 +81,55 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
     // dropped, loudly but harmlessly, rather than being allowed back onto the path that kills the
     // KVM link.
     //
-    // Clearing m_dirty above without waiting for delivery is intentional and safe: the lane keeps
-    // the LATEST payload per clipboard id until it goes out or is superseded, so a lane that comes
-    // up late still delivers current state rather than replaying history.
+    // Clearing m_dirty above without waiting for delivery is intentional and safe ONLY because the
+    // lane manager retains the LATEST payload per clipboard id whether or not a lane exists yet --
+    // see ClipboardLaneManager::send(). Nothing re-offers this clipboard: Server only marks a
+    // client dirty again when the clipboard CHANGES, so a payload dropped here is gone until the
+    // user copies something else.
     // Sequence number 0, exactly as the StreamChunker call this replaced passed it. A client
     // ignores the sequence number on a clipboard the server sends (ServerProxy::setClipboard reads
     // it and never uses it); it is the OTHER direction where the number is load-bearing.
+    //
+    // The CANONICAL screen name, never this proxy's own. Server::getName() runs every client name
+    // through Config::getCanonicalName -- a CASELESS lookup that also resolves aliases -- and keys
+    // m_clients, the lane sessions and the lane teardown by the result. getName() here is what the
+    // client announced about ITSELF, so on any screen whose configured spelling differs by case or
+    // is an alias the two are different strings, the session lookup misses, and clipboard sync dies
+    // silently in both directions.
     using SendResult = deskflow::ClipboardLaneManager::SendResult;
-    switch (getServer()->clipboardLane().send(getName(), id, 0, std::move(data))) {
+    const std::string peer = getServer()->canonicalName(getName());
+    switch (getServer()->clipboardLane().send(peer, id, 0, std::move(data))) {
     case SendResult::Queued:
-      LOG_DEBUG("sending clipboard %d to \"%s\" over the lane (%u bytes)", id, getName().c_str(),
+      LOG_DEBUG("sending clipboard %d to \"%s\" over the lane (%u bytes)", id, peer.c_str(),
+                static_cast<uint32_t>(size));
+      break;
+
+    case SendResult::Held:
+      // The client speaks 1.9 and has a session, but its lane is not up (yet, or any more). The
+      // payload is kept and goes out when the client's next dial lands, so this is news at DEBUG
+      // and nothing more.
+      LOG_DEBUG("clipboard %d for \"%s\" is waiting for the lane (%u bytes)", id, peer.c_str(),
                 static_cast<uint32_t>(size));
       break;
 
     case SendResult::TooLarge:
       LOG_NOTE(
-          "not sending clipboard %d to \"%s\": %u bytes is over the configured limit", id, getName().c_str(),
+          "not sending clipboard %d to \"%s\": %u bytes is over the configured limit", id, peer.c_str(),
           static_cast<uint32_t>(size)
       );
       break;
 
     case SendResult::NoLane:
-      // An older client, or a lane that is down or has not come up yet. Rate limited: see
-      // kNoLaneWarningInterval.
-      if (const double now = ARCH->time(); now - m_lastNoLaneWarning >= kNoLaneWarningInterval) {
+      // No SESSION at all, which on the server means exactly one thing: this client is older than
+      // protocol 1.9, so it was never offered a lane. Rate limited: see kNoLaneWarningInterval.
+      if (const double now = ARCH->time();
+          !m_noLaneWarned || now - m_lastNoLaneWarning >= kNoLaneWarningInterval) {
         m_lastNoLaneWarning = now;
+        m_noLaneWarned = true;
         LOG_WARN(
-            "clipboard %d not delivered to \"%s\": no clipboard lane (client is older than protocol "
-            "1.9, or its lane is down)",
-            id, getName().c_str()
+            "clipboard %d not delivered to \"%s\": the client is older than protocol 1.9 and has no "
+            "clipboard lane",
+            id, peer.c_str()
         );
       }
       break;

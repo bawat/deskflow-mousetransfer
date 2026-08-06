@@ -41,7 +41,14 @@ private:
   // Rate limit for the "no lane, clipboard dropped" warning. A clipboard is re-published on every
   // screen switch, so an un-limited warning would produce a line per crossing for as long as an old
   // client stays connected -- which buries the first occurrence, the only one that carries news.
+  //
+  // The separate "have we ever warned" flag is not redundant: ARCH->time() is a steady_clock
+  // reading, i.e. seconds since BOOT, so on a machine that has just started (which is how this
+  // fleet starts -- a scheduled task at boot) `now` can be smaller than the interval and a plain
+  // `now - 0.0 >= interval` test SUPPRESSES the very first warning. That is precisely the one that
+  // carries news, and precisely the moment a rolling deploy produces mixed versions.
   double m_lastNoLaneWarning = 0.0;
+  bool m_noLaneWarned = false;
 
   // Per-connection, per-clipboard reassembly state. Was a `static std::string dataCached` inside
   // recvClipboard() -- ONE buffer shared by both clipboard ids AND EVERY CONNECTED CLIENT, so two
