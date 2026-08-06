@@ -685,3 +685,81 @@ Applied clean onto our fork: SEC-08b touched `secureAccept` (not `serviceAccept`
 patches touch `ClientListener`. Verify: the server's open-handle count stays FLAT under a flood of
 fingerprint-rejected connections (valid TLS, untrusted cert — the unthrottled reject path, not garbage
 bytes).
+
+## MT clipboard lane — a dedicated connection for clipboard data (2026-08-06, **server half; client half follows**)
+
+**New files:** `src/lib/net/LaneConn.{h,cpp}`, `src/lib/deskflow/ClipboardLane.{h,cpp}`,
+`src/lib/server/ClientProxy1_9.{h,cpp}`.
+**Modified:** `src/lib/deskflow/ProtocolTypes.{h,cpp}`, `src/lib/base/EventTypes.h`,
+`src/lib/net/{SecureSocket,TCPSocket}.{h,cpp}`, `src/lib/deskflow/PacketStreamFilter.{h,cpp}`,
+`src/lib/server/{Server,ClientProxy1_6,ClientProxyUnknown}.{h,cpp}`, `src/lib/client/Client.cpp`.
+**Design record:** `MT-CLIPBOARD-LANE-DESIGN.md` in the repository root.
+
+**The problem.** A large clipboard (a 1080p screenshot marshals to ~8.3 MB, and there are two
+clipboard ids) queued onto the main connection sits in front of the keepalives, which are FIFO
+behind it. The client's death timer resets only on `kMsgCKeepAlive`, so after 9 s it declares the
+server dead, disconnects (the cursor teleports off that screen), reconnects with `m_dirty` true by
+default, and the next screen switch re-sends the same blob from byte zero — a permanent wall-off
+loop, observed for 56 cycles on 2026-08-06. Synergy fixed this class in 1.8 with per-chunk
+interleaved keepalives; Deskflow deleted that in `5365e34f0` and our base v1.26.0 contains the
+deletion.
+
+**The change.** Clipboard data moves on its OWN TLS connection to the same port 24800, serviced by
+its own low-priority worker thread, entirely outside the `SocketMultiplexer`. This **completely
+replaces** the in-stream transfer server→client: `kMsgDClipboard` trains are never SENT by a new
+core, though they are still PARSED so older peers keep working. A lane failure can only ever mean
+"clipboard not delivered" — it must never write to, block, or disconnect the main session.
+
+- **Negotiation.** Protocol minor 1.8 → 1.9. The server sends `kMsgDLaneAdvert` ("DLAN", lane wire
+  version + a 16-byte CSPRNG token) only from `ClientProxy1_9`, the proxy it builds only for a
+  client that announced 1.9 — a type rather than a version check, because an unknown 4-char code
+  makes a Deskflow client drain its whole stream and die, so this must be impossible by
+  construction rather than by condition. The client greets on the lane connection with
+  `kMsgMTLaneHello` ("MTLH") where a `kMsgHelloBack` would go.
+- **Two clamps ship with the bump and must never be separated from it.** Minor-version tolerance in
+  Deskflow is one-directional: a server accepts any minor it has a proxy for, but a client
+  announcing a HIGHER minor is REFUSED (`ClientProxyUnknown::initProxy`'s null default →
+  `IncompatibleClientException`), and stock `Client::handleHello` announces its own constant
+  unconditionally. Unclamped, the first machine of a rolling deploy could not connect to a
+  not-yet-updated server AT ALL. So `Client::handleHello` now announces `min(ours, the server's)`,
+  and `initProxy`'s default negotiates an unknown-but-higher minor DOWN to its newest proxy instead
+  of refusing it, which stops the same trap re-arming at the next bump.
+- **Socket handoff.** `SecureSocket::detachTls()` leaves the multiplexer, then hands over the socket
+  handle, `SSL` and `SSL_CTX` and empties itself, so its `close()`/destructor become no-ops. It
+  REFUSES a connection that is not quiescent — a latched partial `SSL_write`, or bytes buffered
+  either way — because a detach that stranded a half-written record would corrupt the stream exactly
+  as the 2026-07-28 outage did. `TCPSocket::releaseSocket()` and
+  `PacketStreamFilter::hasBufferedInput()` exist for this (`getSize()` reports 0 both for "empty"
+  and for "half a packet", and only one of those is safe to hand off).
+- **Threading.** ONE worker thread per lane owns its `SSL` for the connection's whole life, driving
+  both directions from a `select()` loop on a non-blocking socket. A reader/writer pair sharing a
+  per-lane SSL lock was rejected: it deadlocks whenever both endpoints send a large clipboard at
+  once, because progress then requires the reader to run WHILE the writer is blocked inside
+  `SSL_write`. Dropping the lock is not available — OpenSSL forbids two threads in one `SSL`.
+  Workers demote themselves to background scheduling before any IO (Windows
+  `THREAD_MODE_BACKGROUND_BEGIN`, which is the only knob that works inside this core's REALTIME
+  priority class; per-thread `nice` on Linux; an honest no-op elsewhere). Teardown is always: raise
+  the stop flag, `shutdown()` the socket, join, then destroy. Nothing is detached, and the worker
+  catches every exception, because one escaping a thread entry function would call `std::terminate`.
+- **No statics anywhere in the new code.** That is aimed directly at the 2026-07-29 class of bug
+  (`4e2987ff7`, `b8d844715`).
+- **Latest-wins.** At most ONE payload is pending per (peer, clipboard id); a newer copy replaces an
+  undelivered older one, and a payload arriving mid-train makes the sender abandon that train
+  between chunks (the receiver discards its partial assembly when the new START lands). Memory is
+  bounded by construction, and this is what kills the reconnect-and-resend-from-zero pathology: a
+  lane that comes up late delivers current state, not a backlog.
+- **Authorisation.** A lane is accepted only for a live session name, with a constant-time token
+  match, and only if the lane connection's peer TLS fingerprint EQUALS the main session's. (Without
+  peer authentication both fingerprints are empty and the token alone gates — vacuous by
+  construction rather than by omission.) Every refusal is a quiet DEBUG line naming which check
+  failed. A token is never logged.
+- **Removed:** `ClientProxy1_6`'s `ClipboardSending` handler registration and its
+  `StreamChunker::sendClipboard` call, which retires the documented handler-leak concern along with
+  the path it served. `StreamChunker` itself stays — the client half still uses it until stage 2.
+  **Kept, deliberately:** `ClientProxy1_6::recvClipboard` and every send DECISION gate (the
+  ownership marker, the `size <= 4` empty skip, the size cap, the dirty bookkeeping). Only the
+  transport changed.
+
+> ⚠️ **This half is not deployable on its own.** With only the server half, server→client clipboard
+> is dropped with a rate-limited warning because no client can dial a lane yet. Client→server is
+> unaffected (legacy in-stream send, legacy receive, both untouched).
