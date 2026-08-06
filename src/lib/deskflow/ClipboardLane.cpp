@@ -475,7 +475,11 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
                   static_cast<int>(id), assembly[id].total
               );
               // Thread-safe hand-off to the main thread, where the apply is allowed to happen.
-              m_events->addEvent(Event(EventTypes::ClipboardLaneReceived, this, info));
+              // The cast is load-bearing, not decoration: Event has both an `EventData *` and a
+              // `void *data` constructor, and picking the wrong one would compile silently and then
+              // fail twice -- getDataObject() would be null so every payload would be dropped, and
+              // deleteData() would free() a new'd non-POD.
+              m_events->addEvent(Event(EventTypes::ClipboardLaneReceived, this, static_cast<EventData *>(info)));
             }
             if (id < kClipboardEnd) {
               assembly[id] = Assembly{};
