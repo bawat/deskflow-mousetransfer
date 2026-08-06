@@ -92,27 +92,65 @@ missed idea".
 
 ### 3.4 Mixed-version behaviour (accepted transition cost, owner-approved)
 
-New cores never send clipboard data in-stream, so old↔new pairs get no clipboard sync in the
-new→old direction; old→new still works because new cores keep the legacy RECEIVE parsers
-(`ServerProxy::setClipboard`, `ClientProxy1_6::recvClipboard`) intact and tolerant.
+New cores never send clipboard data in-stream, so old↔new pairs get no clipboard sync **in either
+direction**: a new server drops a clipboard bound for an old client (no lane), and a new client
+drops one bound for an old server (nothing advertised a lane). Both log a rate-limited warning
+naming the reason. Receiving still works both ways in a mixed pair, because new cores keep the
+legacy RECEIVE parsers (`ServerProxy::setClipboard`, `ClientProxy1_6::recvClipboard`) intact and
+tolerant — an OLD peer's in-stream clipboard is still understood by a NEW one.
 
-> ⚠️ **Stage 1 alone is NOT deployable.** The server half replaces the server→client transport with
-> the lane, and the client half (lane dial + advert receipt) is a later stage. A core built from
-> stage 1 only will log `clipboard … dropped (no lane)` and deliver nothing server→client.
-> Client→server is unaffected (legacy in-stream send, legacy receive, both untouched).
+> ✅ **Resolved 2026-08-06 (stage 2).** The client half exists: a 1.9 client dials the lane, so a
+> new↔new pair moves clipboards on it in both directions. The stage-1-only caveat that stood here
+> no longer applies.
+
+**Plaintext deployments lose clipboard sync entirely (new limitation).** A lane must be a TLS
+connection — the handoff has an `SSL` object to give the worker, and `ClientProxyUnknown` refuses to
+detach anything else ("not a tls connection"). A client whose security level is `PlainText`
+therefore does not dial at all (it would only ever be refused, and declining early costs no
+sockets), and a plaintext pair gets no clipboard sync in either direction. This is acceptable here
+because MouseTransfer always runs `PeerAuth`, but it IS a behaviour change for a stock unencrypted
+Deskflow setup, and a plaintext lane would need both a `TCPSocket`-level detach and a non-TLS
+`LaneConn` mode to fix.
 
 ## 4. Lane wire format (after lane-ack)
 
-Frames, all little-endian, length-prefixed:
+Frames, all little-endian, length-prefixed (`{u8 type, u32 bodyLength}` then the body):
 
-- `START {clipId u8, seq u32, totalLen u32}` — receiver discards any partial train for that
-  clipId and begins a new assembly. Enforce `totalLen` ≤ the configured maximum clipboard size
-  (`m_maximumClipboardSize`, KB — same limit as today, wrapper emits 512 MB) BEFORE allocating.
+- `START {clipId u8, seq u32, totalLen u32, clipboardSeq u32}` — receiver discards any partial train
+  for that clipId and begins a new assembly. Enforce `totalLen` ≤ the configured maximum clipboard
+  size (`m_maximumClipboardSize`, KB — same limit as today, wrapper emits 512 MB) BEFORE allocating.
+  **`seq` and `clipboardSeq` are different numbers and must not be conflated** (stage 2 fix): `seq`
+  is the sender's private TRAIN counter, which exists only to match DATA/END frames to their START;
+  `clipboardSeq` is the APPLICATION's clipboard sequence number, the same value the in-stream path
+  carries, and it is what the receiver reports upwards. `Server::onClipboardChanged` drops an update
+  whose sequence number is lower than the last it saw, and a per-lane counter starting at 1 loses
+  that comparison for the rest of the session — every clipboard a client copied would have been
+  silently discarded as "mis-sequenced".
 - `DATA {clipId u8, seq u32, offset u32, chunk bytes}` — chunk size ~256 KB.
 - `END {clipId u8, seq u32}` — receiver validates completeness, then posts an event so the
   APPLY happens on the screen/main thread (clipboard APIs are thread-bound), which routes into
   the SAME apply path used today (ownership marker, `size<=4` empty-skip, dedup all preserved).
-- Optional `PING`/`PONG` (low-frequency lane liveness; v1 may omit — TCP keepalive suffices).
+- `ACK`, `PING`, `PONG` — **reserved; v1 sends none of them.** An unknown frame type is skipped by
+  its own length, so adding one later is additive and needs no lane version bump.
+
+**A lane is SILENT from attach until one end has a clipboard, and that is a correctness property.**
+The first draft had the accepting end greet with an `ACK` so the dialling end could tell "attached"
+from "still connecting". It cannot, and the attempt breaks what it was meant to confirm — the socket
+handoff is only legal while the connection is quiescent, so whichever end speaks first can wreck the
+OTHER end's handoff. Both directions race:
+
+- An `ACK` from the **dialling** end can reach the accepting end before its event loop has read the
+  lane greeting. `PacketStreamFilter::readMore()` drains everything available, so those bytes land
+  in the filter's buffer and `hasBufferedInput()` refuses the handoff for "the peer pipelined data
+  behind its greeting" — which it did not do.
+- An `ACK` from the **accepting** end can reach the dialling end before IT has detached. The dial
+  detaches on `StreamOutputFlushed`, an event-queue hop AFTER the bytes went out, so on a loaded
+  client the round trip finishes first; the ACK then sits in the socket's input buffer and
+  `detachTls()` refuses — correctly, because those bytes would be lost.
+
+Both would have been intermittent, load-dependent and self-healing-after-a-dropped-clipboard, which
+is the worst way for a bug to present. A greeting can come back when there is a safe moment for it:
+after BOTH ends have detached, not during.
 
 **Latest-wins:** the sender keeps AT MOST ONE pending payload per (peer, clipId) — a newer copy
 replaces an undelivered older one, and an in-flight send checks a superseded flag between chunks
@@ -232,22 +270,84 @@ Done:
 - MOD `src/lib/client/Client.cpp` — announced-minor clamp (§3.2 item 2; safety, not the client half).
 - MOD `src/lib/{net,deskflow,server}/CMakeLists.txt`.
 
+> Two stage-1 defects were found and fixed while building the client half, both invisible until a
+> client dialled: the lane dropped the application clipboard sequence number (§4), and the worker's
+> opening `ACK` raced the peer's handoff (§4). Both are listed under §9a.
+
 `src/lib/server/ClientListener.cpp` was NOT modified: the lane-hello arrives on a stream that
 `ClientProxyUnknown` already owns, and the existing failure route already deletes the unknown
 proxy, its stream and its socket in the right order.
 
-Remaining for the CLIENT half (stage 2):
+## 9a. File plan — STAGE 2 (client half) AS BUILT
 
-- MOD `src/lib/client/ServerProxy.cpp` — parse `kMsgDLaneAdvert` in **both** `parseHandshakeMessage`
-  and `parseMessage` (the server sends it from `adoptClient`, which can land either side of the
-  `kMsgDSetOptions` that ends the client's handshake state), read it with
-  `ProtocolUtil::readf(m_stream, kMsgDLaneAdvert + 4, &laneVersion, &token)`, and hand the token to
-  `Client`. Never log the token.
-- MOD `src/lib/client/Client.{h,cpp}` — on receiving the advert, dial a SECOND TLS connection to the
-  same server address, then hand it to a client-side `deskflow::ClipboardLaneManager`.
-- MOD `src/lib/client/ServerProxy.cpp` — replace `onClipboardChanged`'s
-  `StreamChunker::sendClipboard` with a lane send, and remove the `ClipboardSending` handler
-  registered in the constructor. Keep `ServerProxy::setClipboard` (legacy receive) intact.
+Done:
+
+- NEW `src/lib/client/ClipboardLaneDialer.{h,cpp}` — the dial, as an event-driven state machine. It
+  holds the token, opens the second connection, discards the server's `kMsgHello`, writes
+  `kMsgMTLaneHello`, waits for `StreamOutputFlushed`, detaches, and hands a `LaneConn` to a
+  callback. Owns the retry backoff. Knows nothing about `Client` (it takes a
+  "prepare this socket" and a "here is a lane" callback), so a lane failure has no route to the
+  main connection at all.
+- MOD `src/lib/client/Client.{h,cpp}` — owns the client-side `ClipboardLaneManager` (built in the
+  constructor, so it is always valid) and the dialer (built on the first advert, destroyed with the
+  main session). Applies inbound lane clipboards on the main thread, keeps the manager's size cap in
+  step with `setOptions`, and re-checks the lane on every `enter()`.
+- MOD `src/lib/client/ServerProxy.{h,cpp}` — parses `kMsgDLaneAdvert` in BOTH parsers, sends the
+  clipboard over the lane instead of `StreamChunker`, applies a lane-received clipboard through the
+  same code the legacy receive uses, and no longer registers the `ClipboardSending` handler.
+- MOD `src/lib/deskflow/ClipboardLane.{h,cpp}` — `send()` carries the application sequence number
+  (see §4); `openLocalSession()` for the dialling end; the ACK is gone (see §4).
+- MOD `src/lib/deskflow/ProtocolTypes.h` — `kUnknownClientTimeout` (was a bare `30.0` in
+  `ClientListener`; the dial needs the same number), the lane frame body sizes as named constants,
+  and the `START` layout + `Ack` doc changes.
+- MOD `src/lib/server/{ClientListener,ClientProxy1_6}.cpp` — the timeout constant, and the
+  server→client `send()` call passing sequence number 0 exactly as the `StreamChunker` call it
+  replaced did.
+- MOD `src/lib/client/CMakeLists.txt`.
+
+**Where the dial runs, and why it cannot delay input.** Entirely on the existing event queue +
+`SocketMultiplexer`, exactly like the main connection. Every slow part — TCP connect, TLS handshake,
+waiting for the greeting, waiting for our own greeting to reach the wire — happens on the
+multiplexer's service thread. What runs on the event-queue thread (which is also the thread that
+puts the server's relayed input onto this screen) is only the short callbacks between those waits:
+read 11 bytes, write ~40, detach. A dial that stalls or fails costs the input path nothing, because
+it simply never posts its next event. Two consequences are load-bearing and must not be "simplified"
+away:
+
+- **`IStream::flush()` is deliberately NOT used** to wait for the greeting to drain, even though §9
+  step 3 offered it: it parks its caller on a condition variable until the multiplexer has drained
+  the socket, and that caller is the input thread. `EventTypes::StreamOutputFlushed` is used instead.
+- **The address is copied already-resolved** from `Client::m_serverAddress`, so a dial never calls
+  `NetworkAddress::resolve()` — DNS blocks.
+
+**Session plumbing — the choice §9 left open.** `ClipboardLaneManager::openLocalSession()` was added
+rather than calling `openSession()` and ignoring the token it mints. Reasons, in order of weight:
+(1) a session created this way can NEVER authorise an inbound lane, because `validate()` compares
+tokens with `lane::secretsEqual()`, which refuses two empty secrets — the refusal is a property of
+the code, not of nobody happening to call `validate()` on a client's manager; (2) it does not mint a
+real secret that nothing validates against; (3) it does not make a dialling endpoint's lane depend
+on the CSPRNG, for a value it would never use. Both entry points go through one `installSession()`,
+so "replace the session, hand the displaced lane back to be stopped outside the lock" exists once.
+
+The client's manager is keyed by the fixed name `"server"`: the protocol never tells a client what
+its server is called (`kMsgHello` carries a product name and a version), and a client has exactly
+one peer, so there is nothing else to use and nothing it could be confused with.
+
+**Retry policy.** A failed dial closes its own connection and schedules a retry with a doubling
+backoff, from `kKeepAliveRate` (3 s) to `kUnknownClientTimeout` (30 s). Two event-driven nudges sit
+on top, both no-ops unless the dialer is idle with a token: a clipboard send that finds no lane, and
+every `Client::enter()`. The second exists because a lane can die WITHOUT the main connection dying
+— an idle lane sends nothing, so a stateful firewall can reap it — and only the client can re-dial;
+without it, server→client clipboard would stay dead until this machine next copied something.
+
+**Deviation from §9 step 6 (the ACK), deliberate.** "Treat the server's `LaneFrame::Ack` as lane up"
+is not implemented, because the ACK itself had to go — see §4 for the two races it caused. A refusal
+after the handoff is instead detected by the connection closing: the worker exits, `hasLane()` reaps
+it, and the next crossing or clipboard re-dials. The cost is that a refused lane is noticed one
+event later rather than immediately; it cannot be noticed sooner without either blocking the input
+thread on a lane read or teaching the manager a "confirmed" state, and the failure it guards against
+(a valid token, for a live session, with a matching fingerprint, being refused) is not a case that
+arises in a healthy mesh.
 
 **The client's lane handshake, in the order the server half requires:**
 
@@ -259,25 +359,25 @@ Remaining for the CLIENT half (stage 2):
    lose whatever the filter still held.
 3. **Wait for the output to drain before detaching.** `SecureSocket::detachTls()` refuses a socket
    with a non-empty output buffer, and the greeting is still in it the instant after `writef`.
-   Either call `IStream::flush()` (blocks on the multiplexer's condition variable, which is a
-   separate thread, so it returns in microseconds for a ~40-byte write) or wait for
-   `EventTypes::StreamOutputFlushed`. A refused detach is not fatal — close and re-dial on a
-   backoff.
+   **Wait for `EventTypes::StreamOutputFlushed`.** (This step originally offered `IStream::flush()`
+   as an alternative; stage 2 rejected it — `flush()` parks its caller on a condition variable until
+   the multiplexer has drained the socket, and on the client that caller is the thread delivering
+   relayed input to the screen.) A refused detach is not fatal — close and re-dial on a backoff.
 4. `SecureSocket::fromStream(stream)` → `detachTls()` → `deskflow::LaneConn::adopt(...)` →
-   `ClipboardLaneManager::attach(serverName, std::move(conn))`. On the client the manager needs a
-   session too: call `openSession()` for the server's name to create one (its token is unused in
-   this direction, since the client is not validating anyone), or add a small "attach without
-   validation" entry point — reviewer's call.
+   `ClipboardLaneManager::attach(peer, std::move(conn))`. The dialling end needs a session too:
+   **`openLocalSession()`**, added in stage 2 — see the reasoning under §9a.
 5. Tear the stream/socket wrapper down WITHOUT closing the connection. They are inert after a
-   successful detach; the server half reuses `ClientProxyUnknown`'s existing failure route for
-   exactly this reason and the client should reuse whatever its equivalent is rather than invent a
-   second teardown.
-6. The server sends a `LaneFrame::Ack` as its first lane frame; treat its arrival as "lane up" and
-   its absence as a failed dial.
+   successful detach, so the ordinary teardown (remove handlers, delete the stream, delete the
+   socket) frees empty shells and leaves the connection alone. Note that a REFUSED `detachTls()`
+   still leaves the socket out of the multiplexer — it calls `setJob(nullptr)` before its
+   preconditions — so a refusal must always be followed by a close, never by carrying on.
+6. ~~The server sends a `LaneFrame::Ack` as its first lane frame; treat its arrival as "lane up".~~
+   **Withdrawn in stage 2.** A lane is silent until someone has a clipboard: any greeting in either
+   direction races the other end's handoff and breaks it. See §4 and the deviation note in §9a.
 
 The manager, `LaneConn`, the frame codec, the latest-wins queue, teardown and the priority seam are
-all shared — the client half should need no new lane machinery, only the dial and the two
-`ServerProxy` edits.
+all shared — the client half needed no new lane machinery beyond `openLocalSession()`, only the dial
+and the `ServerProxy` edits.
 
 ## 10. Working agreements for implementing agents
 

@@ -686,13 +686,14 @@ patches touch `ClientListener`. Verify: the server's open-handle count stays FLA
 fingerprint-rejected connections (valid TLS, untrusted cert — the unthrottled reject path, not garbage
 bytes).
 
-## MT clipboard lane — a dedicated connection for clipboard data (2026-08-06, **server half; client half follows**)
+## MT clipboard lane — a dedicated connection for clipboard data (2026-08-06)
 
 **New files:** `src/lib/net/LaneConn.{h,cpp}`, `src/lib/deskflow/ClipboardLane.{h,cpp}`,
-`src/lib/server/ClientProxy1_9.{h,cpp}`.
+`src/lib/server/ClientProxy1_9.{h,cpp}`, `src/lib/client/ClipboardLaneDialer.{h,cpp}`.
 **Modified:** `src/lib/deskflow/ProtocolTypes.{h,cpp}`, `src/lib/base/EventTypes.h`,
 `src/lib/net/{SecureSocket,TCPSocket}.{h,cpp}`, `src/lib/deskflow/PacketStreamFilter.{h,cpp}`,
-`src/lib/server/{Server,ClientProxy1_6,ClientProxyUnknown}.{h,cpp}`, `src/lib/client/Client.cpp`.
+`src/lib/server/{Server,ClientProxy1_6,ClientProxyUnknown,ClientListener}.{h,cpp}`,
+`src/lib/client/{Client,ServerProxy}.{h,cpp}`.
 **Design record:** `MT-CLIPBOARD-LANE-DESIGN.md` in the repository root.
 
 **The problem.** A large clipboard (a 1080p screenshot marshals to ~8.3 MB, and there are two
@@ -753,13 +754,42 @@ core, though they are still PARSED so older peers keep working. A lane failure c
   peer authentication both fingerprints are empty and the token alone gates — vacuous by
   construction rather than by omission.) Every refusal is a quiet DEBUG line naming which check
   failed. A token is never logged.
-- **Removed:** `ClientProxy1_6`'s `ClipboardSending` handler registration and its
-  `StreamChunker::sendClipboard` call, which retires the documented handler-leak concern along with
-  the path it served. `StreamChunker` itself stays — the client half still uses it until stage 2.
-  **Kept, deliberately:** `ClientProxy1_6::recvClipboard` and every send DECISION gate (the
-  ownership marker, the `size <= 4` empty skip, the size cap, the dirty bookkeeping). Only the
-  transport changed.
+- **The dial (client side).** On `kMsgDLaneAdvert` the client opens a second TLS connection to the
+  same listener, reads and DISCARDS the `kMsgHello` the listener greets every connection with (a
+  HelloBack would make it a second KVM client), writes `kMsgMTLaneHello` and nothing else, waits for
+  `StreamOutputFlushed`, then detaches and attaches. It is an event-driven state machine on the
+  existing event queue + multiplexer, not a routine: everything slow (connect, TLS, both waits)
+  happens on the multiplexer's service thread exactly as it does for the main connection, and what
+  runs on the event-queue thread — which is also the thread that puts relayed input on this screen —
+  is only the short callbacks in between. For the same reason it waits for the flush EVENT rather
+  than calling `IStream::flush()`, which would park the input thread on a condition variable, and it
+  copies an already-resolved address so a dial never performs DNS. A failed dial retries on a
+  doubling backoff (3 s → 30 s, both existing protocol constants) and touches nothing else; the
+  dialer holds no reference to the main connection.
+- **A lane is SILENT from attach until someone has a clipboard.** The first draft had each worker
+  greet its peer with a `LaneFrame::Ack`. That breaks the handoff it was meant to confirm, in both
+  directions: the handoff is only legal while the connection is quiescent, so an ACK from the
+  dialling end can land in the accepting end's packet filter ("pipelined data behind its greeting")
+  and an ACK from the accepting end can land in the dialling end's input buffer before it detaches
+  (`detachTls()` then refuses, correctly). Intermittent, load-dependent, self-healing after a
+  dropped clipboard — the worst possible presentation. The frame type stays reserved and unknown
+  types are skipped by length, so a greeting can return once there is a safe moment for it.
+- **The application clipboard sequence number is carried end to end**, separately from the lane's
+  own train counter. `Server::onClipboardChanged` drops an update whose sequence number is below the
+  last it saw, and a per-lane counter starting at 1 would have lost that comparison for the rest of
+  the session — every clipboard a client copied would have been silently discarded as
+  "mis-sequenced".
+- **Removed:** the `ClipboardSending` handler registration in BOTH `ClientProxy1_6` and
+  `ServerProxy`, and both `StreamChunker::sendClipboard` calls — which retires the documented
+  handler-leak concern along with the path it served (neither destructor ever removed that handler).
+  `StreamChunker` and `ClipboardChunk::send` are now unreferenced but are LEFT IN PLACE: deleting
+  them reaches across three libraries for no behavioural gain, and `ClipboardChunk::assemble` next
+  door is still what both legacy receive paths use.
+  **Kept, deliberately:** `ClientProxy1_6::recvClipboard`, `ServerProxy::setClipboard`, and every
+  send DECISION gate (the ownership marker, the `size <= 4` empty skip, the size cap, the dirty and
+  sent/unchanged bookkeeping). Only the transport changed.
 
-> ⚠️ **This half is not deployable on its own.** With only the server half, server→client clipboard
-> is dropped with a rate-limited warning because no client can dial a lane yet. Client→server is
-> unaffected (legacy in-stream send, legacy receive, both untouched).
+> ⚠️ **A lane requires TLS, so a PLAINTEXT deployment now has no clipboard sync in either
+> direction.** The handoff needs an `SSL` object to give the worker and the server refuses to detach
+> anything else, so a `PlainText` client does not dial at all. Acceptable here — MouseTransfer always
+> runs `PeerAuth` — but it is a behaviour change for a stock unencrypted Deskflow setup.
