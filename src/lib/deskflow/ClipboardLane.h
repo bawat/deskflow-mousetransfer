@@ -65,8 +65,9 @@ public:
   //! What became of a payload handed to send()
   enum class SendResult : uint8_t
   {
-    Queued,   ///< accepted; it will go out, or be superseded by something newer, which is equivalent
-    NoLane,   ///< no lane for this peer (an older client, or the lane is down)
+    Queued,   ///< accepted onto a live lane; it will go out, or be superseded by something newer
+    Held,     ///< accepted, but this peer has no lane RIGHT NOW; it goes out when one attaches
+    NoLane,   ///< no session for this peer at all -- it does not speak the lane protocol. Dropped.
     TooLarge, ///< over the configured clipboard size limit; deliberately dropped
   };
 
@@ -138,9 +139,14 @@ public:
   the worker abandon that train between chunks and start the new one. Memory is bounded by
   construction -- one pending payload per clipboard id per peer, plus one in flight.
 
-  This is also why delivery may be decoupled from the caller's dirty-flag bookkeeping: the newest
-  state is what the lane retains, so a lane that comes up late still delivers something current
-  instead of replaying history.
+  **A payload is retained when there is a SESSION but no lane yet** (SendResult::Held), not
+  dropped. That is what lets delivery be decoupled from the caller's dirty-flag bookkeeping, and
+  the callers depend on it absolutely: both of them clear their dirty flag at the moment they call
+  this, and nothing ever re-offers the same clipboard -- a client is only marked dirty again when
+  the clipboard CHANGES. Dropping here therefore does not delay a clipboard, it loses it until the
+  user copies something else, and the window in which it would be lost is exactly the one this
+  whole feature exists for: between a (re)connection and its lane coming up. Only peers that
+  actually speak the lane protocol have a session, so an older peer holds nothing at all.
 
   \p sequenceNumber is the APPLICATION's clipboard sequence number -- the same value the in-stream
   path puts in kMsgDClipboard -- and is carried through to the receiver untouched. It is emphatically
@@ -179,6 +185,15 @@ private:
     std::string m_token;
     std::string m_fingerprint;
     std::unique_ptr<Lane> m_lane;
+
+    //! Payloads waiting for a lane to exist, same latest-wins bound as Lane::m_pending
+    /*!
+    Lives on the SESSION rather than the lane because a lane is the transient half: it comes up
+    after the session, can die without it, and is replaced wholesale on a re-dial. A payload
+    handed over in any of those gaps has nowhere else to wait, and its sender has already
+    forgotten it. attach() moves this into the fresh lane's queue before starting its worker.
+    */
+    std::map<ClipboardID, Payload> m_held;
   };
 
   //! Install a session, returning the lane it displaced so the CALLER can stop it outside the lock

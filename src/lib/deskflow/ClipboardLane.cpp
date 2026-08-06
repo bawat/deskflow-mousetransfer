@@ -137,6 +137,10 @@ ClipboardLaneManager::installSession(const std::string &peer, std::string token,
   std::unique_ptr<Lane> displaced = std::move(session.m_lane);
   session.m_token = std::move(token);
   session.m_fingerprint = std::move(fingerprint);
+  // A new session is a new peer state, so nothing the OLD one was holding carries over. Keeping it
+  // would mean a client that reconnected minutes later received a clipboard from before it left,
+  // which is the "replay history" behaviour the retention is careful not to be.
+  session.m_held.clear();
   return displaced;
 }
 
@@ -251,6 +255,11 @@ void ClipboardLaneManager::attach(const std::string &peer, std::unique_ptr<LaneC
     auto fresh = std::make_unique<Lane>();
     fresh->m_peer = peer;
     fresh->m_conn = std::move(conn);
+    // Everything the session was holding while it had no lane goes out on this one. Done WITHOUT
+    // taking fresh->m_mutex because the worker that would contend for it does not exist yet -- it
+    // is started below, deliberately last, so that it never sees a half-built lane.
+    fresh->m_pending = std::move(found->second.m_held);
+    found->second.m_held.clear();
     lane = fresh.get();
     found->second.m_lane = std::move(fresh);
   }
@@ -290,18 +299,31 @@ ClipboardLaneManager::send(const std::string &peer, ClipboardID id, uint32_t seq
   SendResult result = SendResult::NoLane;
   {
     std::scoped_lock lock{m_mutex};
-    if (const auto found = m_sessions.find(peer); found != m_sessions.end() && found->second.m_lane) {
-      if (found->second.m_lane->m_finished) {
-        doomed = std::move(found->second.m_lane);
-      } else {
-        Lane &lane = *found->second.m_lane;
+    if (const auto found = m_sessions.find(peer); found != m_sessions.end()) {
+      Session &session = found->second;
+
+      // A worker that has already given up is not a lane. Reaped here (joined outside the lock,
+      // below) so that this payload goes to the holding queue instead of into a dead lane's
+      // pending map, where nothing would ever pick it up again.
+      if (session.m_lane && session.m_lane->m_finished) {
+        doomed = std::move(session.m_lane);
+      }
+
+      // Latest-wins: assignment, not append, in BOTH queues. This IS the bound on memory, and it
+      // is also what kills the reconnect-and-resend-from-zero pathology -- what a late lane
+      // finally sends is the newest state, not a backlog of history. The sequence number travels
+      // WITH the payload it belongs to, so a superseded copy takes its stale one away with it.
+      if (session.m_lane) {
+        Lane &lane = *session.m_lane;
         std::scoped_lock queueLock{lane.m_mutex};
-        // Latest-wins: assignment, not append. This IS the bound on memory, and it is also what
-        // kills the reconnect-and-resend-from-zero pathology -- what a late lane finally sends is
-        // the newest state, not a backlog of history. The sequence number travels WITH the payload
-        // it belongs to, so a superseded copy takes its stale sequence number away with it.
         lane.m_pending[id] = Payload{sequenceNumber, std::move(payload)};
         result = SendResult::Queued;
+      } else {
+        // The session exists but its lane does not (not yet, or not any more). RETAINED, not
+        // dropped: the caller cleared its dirty flag when it called us and nothing re-offers a
+        // clipboard that has not changed, so dropping here loses it outright. See send()'s header.
+        session.m_held[id] = Payload{sequenceNumber, std::move(payload)};
+        result = SendResult::Held;
       }
     }
   }
