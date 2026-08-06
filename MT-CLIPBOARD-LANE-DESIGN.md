@@ -238,13 +238,46 @@ proxy, its stream and its socket in the right order.
 
 Remaining for the CLIENT half (stage 2):
 
-- MOD `src/lib/client/ServerProxy.cpp` — parse `kMsgDLaneAdvert` in `parseHandshakeMessage` AND
-  `parseMessage` (the advert can arrive after the handshake), hand the token to `Client`.
-- MOD `src/lib/client/Client.{h,cpp}` — dial a second TLS connection to the same server address,
-  write `kMsgMTLaneHello`, detach it with `SecureSocket::detachTls()`, hand the `LaneConn` to a
-  client-side `ClipboardLaneManager` session; replace `ServerProxy::onClipboardChanged`'s
-  `StreamChunker::sendClipboard` with a lane send; remove `ServerProxy`'s `ClipboardSending`
-  handler. Keep `ServerProxy::setClipboard` (legacy receive) intact.
+- MOD `src/lib/client/ServerProxy.cpp` — parse `kMsgDLaneAdvert` in **both** `parseHandshakeMessage`
+  and `parseMessage` (the server sends it from `adoptClient`, which can land either side of the
+  `kMsgDSetOptions` that ends the client's handshake state), read it with
+  `ProtocolUtil::readf(m_stream, kMsgDLaneAdvert + 4, &laneVersion, &token)`, and hand the token to
+  `Client`. Never log the token.
+- MOD `src/lib/client/Client.{h,cpp}` — on receiving the advert, dial a SECOND TLS connection to the
+  same server address, then hand it to a client-side `deskflow::ClipboardLaneManager`.
+- MOD `src/lib/client/ServerProxy.cpp` — replace `onClipboardChanged`'s
+  `StreamChunker::sendClipboard` with a lane send, and remove the `ClipboardSending` handler
+  registered in the constructor. Keep `ServerProxy::setClipboard` (legacy receive) intact.
+
+**The client's lane handshake, in the order the server half requires:**
+
+1. Connect + TLS as normal. `ClientListener` will greet the new connection with `kMsgHello` before
+   it knows what it is — **read and discard that packet**. Do NOT reply with `kMsgHelloBack`.
+2. `ProtocolUtil::writef(stream, kMsgMTLaneHello, kLaneWireVersion, &screenName, &token)`, and write
+   NOTHING else. The server refuses the handoff if anything is pipelined behind the greeting
+   (`PacketStreamFilter::hasBufferedInput()`), because the lane takes the raw connection and would
+   lose whatever the filter still held.
+3. **Wait for the output to drain before detaching.** `SecureSocket::detachTls()` refuses a socket
+   with a non-empty output buffer, and the greeting is still in it the instant after `writef`.
+   Either call `IStream::flush()` (blocks on the multiplexer's condition variable, which is a
+   separate thread, so it returns in microseconds for a ~40-byte write) or wait for
+   `EventTypes::StreamOutputFlushed`. A refused detach is not fatal — close and re-dial on a
+   backoff.
+4. `SecureSocket::fromStream(stream)` → `detachTls()` → `deskflow::LaneConn::adopt(...)` →
+   `ClipboardLaneManager::attach(serverName, std::move(conn))`. On the client the manager needs a
+   session too: call `openSession()` for the server's name to create one (its token is unused in
+   this direction, since the client is not validating anyone), or add a small "attach without
+   validation" entry point — reviewer's call.
+5. Tear the stream/socket wrapper down WITHOUT closing the connection. They are inert after a
+   successful detach; the server half reuses `ClientProxyUnknown`'s existing failure route for
+   exactly this reason and the client should reuse whatever its equivalent is rather than invent a
+   second teardown.
+6. The server sends a `LaneFrame::Ack` as its first lane frame; treat its arrival as "lane up" and
+   its absence as a failed dial.
+
+The manager, `LaneConn`, the frame codec, the latest-wins queue, teardown and the priority seam are
+all shared — the client half should need no new lane machinery, only the dial and the two
+`ServerProxy` edits.
 
 ## 10. Working agreements for implementing agents
 

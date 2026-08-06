@@ -225,7 +225,7 @@ void ClientProxyUnknown::initProxy(const std::string &name, int major, int minor
   }
 }
 
-bool ClientProxyUnknown::handleLaneHello()
+void ClientProxyUnknown::handleLaneHello()
 {
   // Everything here is best-effort and self-contained. The connection this runs on is a SECOND
   // connection from a peer whose main session is already up; nothing we do or fail to do may reach
@@ -236,7 +236,7 @@ bool ClientProxyUnknown::handleLaneHello()
   if (!ProtocolUtil::readf(m_stream, kMsgMTLaneHello + 4, &laneVersion, &name, &token)) {
     LOG_DEBUG("clipboard lane refused: malformed lane greeting");
     sendFailure();
-    return true;
+    return;
   }
 
   auto &lane = m_server->clipboardLane();
@@ -255,7 +255,7 @@ bool ClientProxyUnknown::handleLaneHello()
     // lane that SHOULD work does not.
     LOG_DEBUG("clipboard lane refused for \"%s\": %s", name.c_str(), reason.c_str());
     sendFailure();
-    return true;
+    return;
   }
 
   // Only a TLS connection can become a lane: the fingerprint binding is half the authorisation, and
@@ -263,7 +263,7 @@ bool ClientProxyUnknown::handleLaneHello()
   if (secure == nullptr) {
     LOG_DEBUG("clipboard lane refused for \"%s\": not a tls connection", name.c_str());
     sendFailure();
-    return true;
+    return;
   }
 
   // Anything still sitting in the packet filter would be lost by the handoff -- the lane takes the
@@ -272,7 +272,7 @@ bool ClientProxyUnknown::handleLaneHello()
   if (auto *filter = dynamic_cast<PacketStreamFilter *>(m_stream); filter != nullptr && filter->hasBufferedInput()) {
     LOG_DEBUG("clipboard lane refused for \"%s\": the peer pipelined data behind its greeting", name.c_str());
     sendFailure();
-    return true;
+    return;
   }
 
   const auto detached = secure->detachTls();
@@ -281,7 +281,7 @@ bool ClientProxyUnknown::handleLaneHello()
     // normal close costs the peer one retry.
     LOG_DEBUG("clipboard lane refused for \"%s\": the connection could not be detached", name.c_str());
     sendFailure();
-    return true;
+    return;
   }
 
   auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext);
@@ -290,17 +290,24 @@ bool ClientProxyUnknown::handleLaneHello()
     // is handled rather than asserted.
     LOG_DEBUG("clipboard lane refused for \"%s\": could not adopt the detached connection", name.c_str());
     sendFailure();
-    return true;
+    return;
   }
 
-  lane.attach(name, std::move(conn));
+  try {
+    lane.attach(name, std::move(conn));
+  } catch (const std::exception &e) {
+    // attach() starts a thread, and thread creation is the one thing here that can throw something
+    // that is not a BaseException -- which would escape the event dispatch entirely rather than be
+    // caught by handleData. The connection is already gone with the unique_ptr by this point; all
+    // that is left to do is not take the process with it.
+    LOG_WARN("clipboard lane for \"%s\" could not be started: %s", name.c_str(), e.what());
+  }
 
   // The socket wrapper, the stream and this object are all inert now: the wrapper owns nothing, and
   // the ordinary failure route deletes the three of them in the right order without touching the
   // connection the lane just took. Reusing that route rather than inventing a second teardown is
   // the point -- there is exactly one way these objects get cleaned up.
   sendFailure();
-  return true;
 }
 
 void ClientProxyUnknown::handleData()
