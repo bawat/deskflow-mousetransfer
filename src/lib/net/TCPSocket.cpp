@@ -447,6 +447,27 @@ void TCPSocket::discardWrittenData(int bytesWrote)
   }
 }
 
+ArchSocket TCPSocket::releaseSocket()
+{
+  // note -- must have m_mutex locked on entry, and must already be out of the multiplexer
+
+  ArchSocket socket = m_socket;
+  m_socket = nullptr;
+
+  // Same end state as onDisconnected() minus the buffer pops (the caller has already established
+  // that both buffers are empty; popping is what would DISCARD data if that ever stopped being
+  // true, so it is deliberately not done here).
+  m_connected = false;
+  m_readable = false;
+  m_writable = false;
+
+  // Release anyone parked in flush(). There is nothing left to flush and there never will be.
+  m_flushed = true;
+  m_flushed.broadcast();
+
+  return socket;
+}
+
 void TCPSocket::onConnected()
 {
   m_connected = true;

@@ -101,6 +101,15 @@ uint32_t PacketStreamFilter::getSize() const
   return isReadyNoLock() ? m_size : 0;
 }
 
+bool PacketStreamFilter::hasBufferedInput() const
+{
+  std::scoped_lock lock{m_mutex};
+  // m_size != 0 means a packet length has been parsed and its body is still owed; m_buffer holding
+  // anything means bytes have been pulled off the underlying stream but not yet consumed. Either
+  // one makes a socket handoff lossy.
+  return m_size != 0 || m_buffer.getSize() != 0;
+}
+
 bool PacketStreamFilter::isReadyNoLock() const
 {
   return (m_size != 0 && m_buffer.getSize() >= m_size);

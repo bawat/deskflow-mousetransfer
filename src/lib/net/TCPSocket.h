@@ -124,6 +124,18 @@ protected:
   void sendEvent(EventTypes);
   void discardWrittenData(int bytesWrote);
 
+  //! Give up the socket handle WITHOUT closing it
+  /*!
+  Returns the handle (one owned reference -- the new owner must eventually ARCH->closeSocket it) and
+  puts this wrapper into the disconnected state, so nothing it does afterwards touches the
+  connection: close() will not close the handle and will not announce a disconnection, and newJob()
+  will not hand the multiplexer another job.
+
+  The caller MUST hold m_mutex, and MUST have already left the multiplexer (setJob(nullptr)).
+  Exists for SecureSocket::detachTls(); see MT-CLIPBOARD-LANE-DESIGN.md.
+  */
+  ArchSocket releaseSocket();
+
   StreamBuffer m_inputBuffer;
   StreamBuffer m_outputBuffer;
 

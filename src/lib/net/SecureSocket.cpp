@@ -242,6 +242,64 @@ TCPSocket::JobResult SecureSocket::doWrite()
   return Retry;
 }
 
+SecureSocket::DetachedTls SecureSocket::detachTls()
+{
+  DetachedTls out;
+
+  // Leave the multiplexer FIRST, exactly as close() does. removeSocket() breaks the service thread
+  // out of its poll and takes the job list lock, so once it returns no job can be running against
+  // this socket -- which is what makes it safe to take the object apart from the event-queue
+  // thread while the service thread is alive.
+  setJob(nullptr);
+
+  Lock lock(&getMutex());
+  std::scoped_lock ssl_lock{ssl_mutex_};
+
+  // Refuse anything that is not a quiescent, live, secured connection. Each of these would be a
+  // stream-corrupting detach rather than a clean transfer, and the caller's fallback (close the
+  // connection normally) is cheap, so refusing is always the better answer:
+  //
+  //  * no socket / no SSL / not secure  -- there is nothing to hand over.
+  //  * m_writeRetry                     -- a partial SSL_write is latched, and OpenSSL requires the
+  //                                        retry to present the SAME buffer. Handing the SSL object
+  //                                        to code that knows nothing about that pending write is
+  //                                        how the 2026-07-28 outage's corruption looked.
+  //  * unread input                     -- bytes already pulled off the wire that the new owner
+  //                                        would never see.
+  //  * unwritten output                 -- bytes the peer is still waiting for.
+  if (getSocket() == nullptr || !m_ssl || m_ssl->m_ssl == nullptr || !m_secureReady) {
+    LOG_DEBUG("tls detach refused: connection is not live/secure");
+    return out;
+  }
+  if (m_writeRetry) {
+    LOG_DEBUG("tls detach refused: a partial tls write is pending");
+    return out;
+  }
+  if (m_inputBuffer.getSize() != 0 || m_outputBuffer.getSize() != 0) {
+    LOG_DEBUG(
+        "tls detach refused: %u byte(s) buffered in, %u byte(s) buffered out", m_inputBuffer.getSize(),
+        m_outputBuffer.getSize()
+    );
+    return out;
+  }
+
+  // Hand over the SSL objects and stop pointing at them. m_ssl (the holder) stays alive but empty,
+  // so freeSSL() -- which the destructor and close() both call -- finds nothing to free.
+  out.ssl = m_ssl->m_ssl;
+  out.sslContext = m_ssl->m_context;
+  m_ssl->m_ssl = nullptr;
+  m_ssl->m_context = nullptr;
+  m_secureReady = false;
+
+  // Hand over the socket handle and stop pointing at that too. releaseSocket() also puts the
+  // wrapper into the disconnected state, so close() will not announce a SocketDisconnected for a
+  // connection that is very much alive in someone else's hands.
+  out.socket = releaseSocket();
+
+  LOG_DEBUG("tls connection detached for the clipboard lane");
+  return out;
+}
+
 int SecureSocket::secureRead(void *buffer, int size, int &read)
 {
   std::scoped_lock ssl_lock{ssl_mutex_};
@@ -654,7 +712,7 @@ void SecureSocket::disconnect()
   sendEvent(StreamInputShutdown);
 }
 
-bool SecureSocket::verifyCertFingerprint(const QString &FingerprintDatabasePath) const
+bool SecureSocket::verifyCertFingerprint(const QString &FingerprintDatabasePath)
 {
   const auto cert = SSL_get_peer_certificate(m_ssl->m_ssl);
   const auto sha256 = deskflow::sslCertFingerprint(cert, QCryptographicHash::Sha256);
@@ -664,6 +722,12 @@ bool SecureSocket::verifyCertFingerprint(const QString &FingerprintDatabasePath)
 
   if (!sha256.isValid())
     return false;
+
+  // Remember it. This is the only moment the peer's certificate is in hand, and the clipboard lane
+  // needs to answer "is this SECOND connection from the same peer as the main session?" long after
+  // the certificate is gone. Stored raw-hex (not the colon-separated display form) because it is
+  // compared, not shown.
+  m_peerFingerprint = sha256.data.toHex().toStdString();
 
   // Gui Must Parse this line, DO NOT CHANGE
   LOG_IPC("peer fingerprint: %s", qPrintable(deskflow::formatSSLFingerprint(sha256.data, false)));

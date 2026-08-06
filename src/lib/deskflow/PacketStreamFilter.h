@@ -32,6 +32,17 @@ public:
   bool isReady() const override;
   uint32_t getSize() const override;
 
+  //! Is ANY unconsumed input held here?
+  /*!
+  Unlike getSize(), which reports 0 both for "nothing buffered" and for "a partial packet
+  buffered", this reports true for either kind of leftover.
+
+  It exists for the clipboard lane's socket handoff: the lane takes the raw TLS connection away from
+  this filter, so bytes sitting in this buffer would be silently lost. The handoff refuses unless
+  this is false. See MT-CLIPBOARD-LANE-DESIGN.md.
+  */
+  bool hasBufferedInput() const;
+
 protected:
   // StreamFilter overrides
   void filterEvent(const Event &) override;
