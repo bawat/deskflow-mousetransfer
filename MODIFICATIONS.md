@@ -723,13 +723,19 @@ core, though they are still PARSED so older peers keep working. A lane failure c
   `IncompatibleClientException`), and stock `Client::handleHello` announces its own constant
   unconditionally. Unclamped, the first machine of a rolling deploy could not connect to a
   not-yet-updated server AT ALL. So `Client::handleHello` now announces `min(ours, the server's)`,
-  and `initProxy`'s default negotiates an unknown-but-higher minor DOWN to its newest proxy instead
-  of refusing it, which stops the same trap re-arming at the next bump.
+  and `initProxy`'s default negotiates an unknown-but-higher minor DOWN to **`ClientProxy1_8`** — the
+  newest dialect that is safe to speak to a peer we have not identified. Not 1_9: a client of this
+  fork clamps, so it can never announce more than 9 and always lands on `case 9`; anything reaching
+  the default is therefore a build that does NOT clamp (i.e. not ours), and 1_9's entire reason to
+  exist is to send `kMsgDLaneAdvert`, which such a peer would treat as an unknown code and die on.
 - **Socket handoff.** `SecureSocket::detachTls()` leaves the multiplexer, then hands over the socket
   handle, `SSL` and `SSL_CTX` and empties itself, so its `close()`/destructor become no-ops. It
-  REFUSES a connection that is not quiescent — a latched partial `SSL_write`, or bytes buffered
-  either way — because a detach that stranded a half-written record would corrupt the stream exactly
-  as the 2026-07-28 outage did. `TCPSocket::releaseSocket()` and
+  REFUSES a connection that is not quiescent — a latched partial `SSL_write`, or unwritten OUTPUT —
+  because a detach that stranded a half-written record would corrupt the stream exactly as the
+  2026-07-28 outage did, and a **refusal restores the multiplexer job**, so declining never leaves a
+  live socket stranded out of the poll set. Unread INPUT is not a refusal: it is drained into
+  `DetachedTls::pending` and served by `LaneConn::readSome()` before anything is taken from the
+  `SSL` object (see the review note below). `TCPSocket::releaseSocket()` and
   `PacketStreamFilter::hasBufferedInput()` exist for this (`getSize()` reports 0 both for "empty"
   and for "half a packet", and only one of those is safe to hand off).
 - **Threading.** ONE worker thread per lane owns its `SSL` for the connection's whole life, driving
@@ -744,10 +750,15 @@ core, though they are still PARSED so older peers keep working. A lane failure c
   catches every exception, because one escaping a thread entry function would call `std::terminate`.
 - **No statics anywhere in the new code.** That is aimed directly at the 2026-07-29 class of bug
   (`4e2987ff7`, `b8d844715`).
-- **Latest-wins.** At most ONE payload is pending per (peer, clipboard id); a newer copy replaces an
-  undelivered older one, and a payload arriving mid-train makes the sender abandon that train
-  between chunks (the receiver discards its partial assembly when the new START lands). Memory is
-  bounded by construction, and this is what kills the reconnect-and-resend-from-zero pathology: a
+- **Latest-wins, and retained across a missing lane.** At most ONE payload is pending per (peer,
+  clipboard id); a newer copy replaces an undelivered older one, and a payload arriving mid-train
+  makes the sender abandon that train between chunks (the receiver discards its partial assembly
+  when the new START lands). A payload handed over while the peer has a SESSION but no live lane is
+  held on the session (`Session::m_held`) and seeded into the next lane by `attach()`, because both
+  callers clear their dirty flag at the moment they call `send()` and nothing ever re-offers an
+  unchanged clipboard — so dropping there loses it rather than delaying it. Memory is bounded by
+  construction (one payload per clipboard id per peer, and only peers that speak the lane protocol
+  have a session at all), and this is what kills the reconnect-and-resend-from-zero pathology: a
   lane that comes up late delivers current state, not a backlog.
 - **Authorisation.** A lane is accepted only for a live session name, with a constant-time token
   match, and only if the lane connection's peer TLS fingerprint EQUALS the main session's. (Without
@@ -793,3 +804,65 @@ core, though they are still PARSED so older peers keep working. A lane failure c
 > direction.** The handoff needs an `SSL` object to give the worker and the server refuses to detach
 > anything else, so a `PlainText` client does not dial at all. Acceptable here — MouseTransfer always
 > runs `PeerAuth` — but it is a behaviour change for a stock unencrypted Deskflow setup.
+
+### Adversarial review pass (2026-08-06) — seven defects found by reading, all fixed
+
+Recorded because each one was invisible to a compiler and to a happy-path run, and three of them
+would have presented as "clipboard sync intermittently doesn't work", which is the failure mode this
+project has historically spent whole sessions on.
+
+1. **A clipboard handed over before the lane came up was DROPPED, not retained.** `send()` queued
+   only onto a live lane; with a session but no lane the payload was destroyed and `NoLane`
+   returned. Both callers clear their dirty flag at that moment and nothing re-offers an unchanged
+   clipboard (`Server` marks a client dirty again only when the clipboard CHANGES), so the payload
+   was lost until the user copied something else. The window is the one the feature exists for:
+   connect → advert → dial (TCP + a 4096-bit TLS handshake) is comfortably long enough for
+   `switchScreen()`'s leave-time push to land in it, and a lane outage opens it again for a whole
+   retry backoff. Fixed with `Session::m_held` + a new `SendResult::Held`, which also splits the
+   diagnostics: `NoLane` now means only "this peer is older than 1.9".
+2. **The lane session key and the lane greeting used different name spaces.** Sessions are opened,
+   torn down and looked up under `Server::getName()` — `Config::getCanonicalName`, a CASELESS lookup
+   that also resolves aliases — while `ClientProxyUnknown::handleLaneHello` matched the name the
+   client announced about itself and `ClientProxy1_6::setClipboard` sent under the proxy's own. Any
+   screen the configuration spells differently, or knows by an alias, would have had every lane
+   refused ("no live session with that screen name", at DEBUG) and clipboard sync dead in both
+   directions with nothing else wrong. `Server::canonicalName()` is now used at both.
+3. **`initProxy`'s permissive default handed a stranger a `ClientProxy1_9`** and would then advertise
+   the lane at it — an unknown 4-char code, which makes a Deskflow client drain its whole stream and
+   die. The branch written to save an unidentified peer's KVM link would have killed it. Negotiates
+   down to 1_8 now; see the bullet above.
+4. **A refused `detachTls()` left a live socket out of the multiplexer.** It calls `setJob(nullptr)`
+   before its preconditions — correctly, that is what makes the buffer checks race-free — but then
+   returned "no" having silently stopped servicing a healthy connection. Both callers happen to
+   close afterwards, so it was correct only by what every current caller does next. A refusal now
+   re-arms the job.
+5. **Unread input was a refusal, and silence does not remove the race it covers.** The peer may
+   legitimately speak as soon as IT has detached, which can be before this end has run the
+   event-queue hop that gets it to `detachTls()` — a LAN round trip beats a queued event on a busy
+   client. Fix 1 makes it *more* likely by giving a fresh lane something to send immediately. Those
+   bytes are now carried across the handoff instead of dropping the connection.
+6. **`LaneConn::m_dead` was a plain `bool` written cross-thread.** `shutdown()` is the documented
+   any-thread teardown call and the owning worker reads that flag in its loop condition and every
+   IO call: a data race, and on a weakly-ordered target (this fork cross-builds for ARMv6) a worker
+   really can fail to observe it. Now `std::atomic<bool>`.
+7. **`waitReady()` used `select()` on POSIX**, where an `fd_set` is a bitmap indexed by descriptor
+   number — `FD_SET` on a descriptor ≥ `FD_SETSIZE` (1024) writes past the end of the object. A lane
+   is by definition the second connection a peer opens. POSIX uses `poll()` now; Windows keeps
+   `select()`, which is correct there.
+
+Also fixed: the "no lane" warning was rate-limited against `ARCH->time()` (a steady_clock reading,
+i.e. seconds since BOOT) compared with a `0.0` initialiser, so on a machine that had just started —
+which is how this fleet starts — the FIRST warning was suppressed. An explicit flag replaces the
+sentinel arithmetic on both ends.
+
+**Verified-and-refuted, so nobody re-derives them:** deleting the dialer's stream and socket from
+inside the packet filter's own `filterEvent` dispatch chain is the same shape as stock
+`Client::handleDisconnected → cleanupStream()` and is safe — `StreamFilter::filterEvent` and
+`PacketStreamFilter::filterEvent` touch no member after the nested `dispatchEvent`, the filter's
+mutex is released before it, and every dialer handler is a single tail call, which is what makes
+erasing the currently-executing `std::function` survivable. `nudge()` cannot open a duplicate lane
+(both call sites gate on "no lane", and `attach()` supersedes rather than accumulates). The START
+frame layout matches `kLaneStartBodySize` exactly and `kLaneMaxFrameBody` has 55 bytes of slack over
+the largest legal body. `Client::enter()`'s lane check is a one-entry map lookup plus, at worst, a
+join of a thread that has already returned — no worker holds a lock during IO, and no worker ever
+touches the session map, so there is no path by which one can block the input thread.
