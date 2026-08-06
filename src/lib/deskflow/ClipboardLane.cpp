@@ -40,12 +40,6 @@ void putU8(std::string &out, uint8_t value)
   out.push_back(static_cast<char>(value));
 }
 
-void putU16(std::string &out, uint16_t value)
-{
-  out.push_back(static_cast<char>(value & 0xff));
-  out.push_back(static_cast<char>((value >> 8) & 0xff));
-}
-
 void putU32(std::string &out, uint32_t value)
 {
   for (int shift = 0; shift < 32; shift += 8) {
@@ -368,12 +362,26 @@ void ClipboardLaneManager::runLaneBody(Lane *lane)
   std::string txPayload;
   uint32_t txOffset = 0;
 
-  // The server speaks first on a lane, so the client can tell "attached" from "still connecting".
-  {
-    std::string body;
-    putU16(body, static_cast<uint16_t>(kLaneWireVersion));
-    txFrame = frame(LaneFrame::Ack, body);
-  }
+  // NOTHING is sent here. A lane is SILENT from the moment it is attached until one end has a
+  // clipboard to send, and that is a correctness property, not politeness.
+  //
+  // The first draft had this end greet its peer with a LaneFrame::Ack, so that the dialling end
+  // could tell "attached" from "still connecting". It cannot: whichever end speaks first breaks the
+  // OTHER end's handoff, because the handoff is only legal while the connection is quiescent.
+  //
+  //   * An Ack from the DIALLING end can reach the accepting end before its event loop has read the
+  //     lane greeting. PacketStreamFilter::readMore() drains everything available, so those bytes
+  //     land in the filter's buffer and hasBufferedInput() refuses the handoff -- "the peer
+  //     pipelined data behind its greeting", which it did not.
+  //   * An Ack from the ACCEPTING end can reach the dialling end before IT has detached. The
+  //     dialling end detaches on StreamOutputFlushed, which is an event-queue hop AFTER the bytes
+  //     went out, so on a busy client the round trip finishes first; the Ack then sits in the
+  //     socket's input buffer and detachTls() refuses -- correctly, since it would be lost.
+  //
+  // Both would have been intermittent, load-dependent and self-healing-with-a-dropped-clipboard,
+  // which is the worst way for a bug to present. Silence removes the class. LaneFrame::Ack stays
+  // defined and an unknown frame type is skipped by its length, so a later version can reintroduce
+  // a greeting once it has somewhere safe to put it (after both ends are detached, not during).
 
   const auto abandonTrain = [&]() {
     txTrainActive = false;

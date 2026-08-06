@@ -79,6 +79,19 @@ static const uint16_t kDefaultPort = 24800;
 static const uint32_t kMaxHelloLength = 1024;
 
 /**
+ * @brief How long a connection has to say who it is, in seconds
+ *
+ * The server greets every accepted connection and then waits this long for it to identify itself
+ * (`ClientProxyUnknown`'s one-shot timer); after that the proxy, its stream and its socket are all
+ * destroyed. Was an unnamed literal at the one place that constructed the proxy until the
+ * MouseTransfer clipboard lane needed the same number on the CLIENT side — a lane dial that has not
+ * been accepted by now is talking to a proxy that no longer exists.
+ *
+ * @since Protocol version 1.0
+ */
+static const double kUnknownClientTimeout = 30.0;
+
+/**
  * @brief Keep-alive message interval in seconds
  *
  * Time between kMsgCKeepAlive messages sent by the server.
@@ -1007,7 +1020,12 @@ static const uint32_t kLaneTokenSize = 16;
  */
 struct LaneFrame
 {
-  inline static const uint8_t Ack = 1;   ///< body: `uint16 laneVersion` (server → client, first frame)
+  /*!
+   * body: `uint16 laneVersion`. RESERVED, and never sent in lane wire version 1 — a lane is silent
+   * from attach until someone has a clipboard, because whichever end speaks first can break the
+   * other end's handoff (see ClipboardLaneManager::runLaneBody for both races).
+   */
+  inline static const uint8_t Ack = 1;
   inline static const uint8_t Start = 2; ///< body: `uint8 clipId, uint32 seq, uint32 totalLen, uint32 clipboardSeq`
   inline static const uint8_t Data = 3;  ///< body: `uint8 clipId, uint32 seq, uint32 offset, bytes`
   inline static const uint8_t End = 4;   ///< body: `uint8 clipId, uint32 seq`
