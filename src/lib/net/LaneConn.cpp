@@ -9,7 +9,9 @@
 #include "arch/Arch.h"
 #include "base/Log.h"
 
+#include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 
 #if SYSAPI_WIN32
@@ -61,6 +63,26 @@ void demoteCurrentThreadToBackground()
   // macOS/BSD: nice() really is process-wide here, so doing it would be worse than doing nothing.
   // The lane stays at normal priority; it is polite by being small and infrequent instead.
 #endif
+}
+
+bool secureRandomBytes(void *out, size_t count)
+{
+  // OpenSSL's CSPRNG -- the only source of randomness this code base already links, and the same
+  // one the TLS handshakes use. RAND_bytes returns 1 only when the bytes really are strong; every
+  // other value must be treated as a refusal, never as "close enough".
+  return RAND_bytes(static_cast<unsigned char *>(out), static_cast<int>(count)) == 1;
+}
+
+bool secretsEqual(const std::string &a, const std::string &b)
+{
+  if (a.size() != b.size()) {
+    return false;
+  }
+  if (a.empty()) {
+    // Two empty secrets are not a match -- an unarmed session must never validate.
+    return false;
+  }
+  return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
 } // namespace lane

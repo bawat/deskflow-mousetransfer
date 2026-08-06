@@ -27,6 +27,21 @@ No-op where the platform offers nothing sensible; the lane is correct either way
 */
 void demoteCurrentThreadToBackground();
 
+//! Fill \p out with \p count cryptographically strong random bytes; false if none are available
+/*!
+Lives here because this is the layer that already links OpenSSL, and because a caller must be able
+to treat "no secure randomness" as a hard refusal rather than quietly falling back to something
+predictable. A lane token that can be guessed is worth less than no lane at all.
+*/
+bool secureRandomBytes(void *out, size_t count);
+
+//! Compare two secrets without leaking where they first differ
+/*!
+Unequal lengths are reported unequal immediately -- that much is public, since the length of a token
+this code issues is a constant. The bytes themselves are compared in constant time.
+*/
+bool secretsEqual(const std::string &a, const std::string &b);
+
 } // namespace lane
 
 //! A TLS connection owned outright, driven without the SocketMultiplexer

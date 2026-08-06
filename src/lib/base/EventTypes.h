@@ -229,6 +229,15 @@ enum class EventTypes : uint32_t
   /// This event is sent whenever a clipboard chunk is transferred.
   ClipboardSending,
 
+  /** MouseTransfer fork: a complete clipboard payload arrived over a dedicated clipboard lane.
+      The data is a LaneClipboardInfo (an EventData, so it is deleted with the event).
+
+      Posted BY a lane worker thread and handled on the main thread -- that hop is the whole
+      reason the event exists. Clipboard state belongs to proxies and screens, which a worker
+      thread must never touch. See MT-CLIPBOARD-LANE-DESIGN.md.
+  */
+  ClipboardLaneReceived,
+
   /// Start libei
   EIConnected,
 
