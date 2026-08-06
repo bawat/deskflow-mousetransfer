@@ -1008,12 +1008,24 @@ static const uint32_t kLaneTokenSize = 16;
 struct LaneFrame
 {
   inline static const uint8_t Ack = 1;   ///< body: `uint16 laneVersion` (server → client, first frame)
-  inline static const uint8_t Start = 2; ///< body: `uint8 clipId, uint32 seq, uint32 totalLen`
+  inline static const uint8_t Start = 2; ///< body: `uint8 clipId, uint32 seq, uint32 totalLen, uint32 clipboardSeq`
   inline static const uint8_t Data = 3;  ///< body: `uint8 clipId, uint32 seq, uint32 offset, bytes`
   inline static const uint8_t End = 4;   ///< body: `uint8 clipId, uint32 seq`
   inline static const uint8_t Ping = 5;  ///< body: empty. Reserved; v1 never sends one.
   inline static const uint8_t Pong = 6;  ///< body: empty. Reserved; v1 never sends one.
 };
+
+/**
+ * @brief Fixed part of each lane frame body, in bytes
+ *
+ * Written out as the sum of its fields so the layout above and the code that parses it cannot drift
+ * apart. `seq` is the sender's TRAIN counter (framing: it matches Data/End frames to their Start);
+ * `clipboardSeq` is the APPLICATION's clipboard sequence number, which the receiver reports upwards
+ * — the two are different numbers and conflating them makes every update look mis-sequenced.
+ */
+static constexpr uint32_t kLaneStartBodySize = 1 + 4 + 4 + 4;
+static constexpr uint32_t kLaneDataHeaderSize = 1 + 4 + 4; ///< bytes before a Data frame's payload
+static constexpr uint32_t kLaneEndBodySize = 1 + 4;
 
 /**
  * @brief Payload bytes per lane Data frame
@@ -1030,6 +1042,8 @@ static constexpr uint32_t kLaneChunkSize = 256 * 1024;
  * A receiver allocates from a length the peer supplied, so it needs a ceiling that does not depend
  * on the peer behaving. Derived, not chosen: the biggest legitimate body is one Data frame — its
  * fixed header (clipId + seq + offset) plus a full chunk — so that plus a small slack is the bound.
+ * The slack also covers a future frame type with a larger fixed part; @ref kLaneStartBodySize is the
+ * largest one today and is far inside it.
  */
 static constexpr uint32_t kLaneMaxFrameBody = kLaneChunkSize + 64;
 

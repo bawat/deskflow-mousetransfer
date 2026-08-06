@@ -124,10 +124,24 @@ public:
   This is also why delivery may be decoupled from the caller's dirty-flag bookkeeping: the newest
   state is what the lane retains, so a lane that comes up late still delivers something current
   instead of replaying history.
+
+  \p sequenceNumber is the APPLICATION's clipboard sequence number -- the same value the in-stream
+  path puts in kMsgDClipboard -- and is carried through to the receiver untouched. It is emphatically
+  NOT the lane's own train counter: Server::onClipboardChanged drops an update whose sequence number
+  is lower than the one it last saw ("mis-sequenced"), and a per-lane counter starting at 1 loses
+  that comparison against the server's running total for the rest of the session. Pass what the
+  legacy path would have sent, which for a server->client clipboard is 0.
   */
-  SendResult send(const std::string &peer, ClipboardID id, std::string payload);
+  SendResult send(const std::string &peer, ClipboardID id, uint32_t sequenceNumber, std::string payload);
 
 private:
+  //! A clipboard waiting to go out, with the application sequence number it belongs to
+  struct Payload
+  {
+    uint32_t m_sequenceNumber = 0;
+    std::string m_data;
+  };
+
   //! One live lane and its worker
   struct Lane
   {
@@ -135,11 +149,11 @@ private:
     std::unique_ptr<LaneConn> m_conn;
     std::thread m_worker;
 
-    std::mutex m_mutex;                              ///< guards m_pending
-    std::map<ClipboardID, std::string> m_pending;    ///< at most one payload per clipboard id
-    std::atomic<bool> m_stop{false};                 ///< set by the main thread; polled by the worker
-    std::atomic<bool> m_finished{false};             ///< set by the worker as its last act
-    uint32_t m_trainSeq = 0;                         ///< worker-private train counter
+    std::mutex m_mutex;                          ///< guards m_pending
+    std::map<ClipboardID, Payload> m_pending;    ///< at most one payload per clipboard id
+    std::atomic<bool> m_stop{false};             ///< set by the main thread; polled by the worker
+    std::atomic<bool> m_finished{false};         ///< set by the worker as its last act
+    uint32_t m_trainSeq = 0;                     ///< worker-private train counter (FRAMING only)
   };
 
   //! What we know about a peer that is allowed to open a lane

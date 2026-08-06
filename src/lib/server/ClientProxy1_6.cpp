@@ -84,8 +84,11 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
     // Clearing m_dirty above without waiting for delivery is intentional and safe: the lane keeps
     // the LATEST payload per clipboard id until it goes out or is superseded, so a lane that comes
     // up late still delivers current state rather than replaying history.
+    // Sequence number 0, exactly as the StreamChunker call this replaced passed it. A client
+    // ignores the sequence number on a clipboard the server sends (ServerProxy::setClipboard reads
+    // it and never uses it); it is the OTHER direction where the number is load-bearing.
     using SendResult = deskflow::ClipboardLaneManager::SendResult;
-    switch (getServer()->clipboardLane().send(getName(), id, std::move(data))) {
+    switch (getServer()->clipboardLane().send(getName(), id, 0, std::move(data))) {
     case SendResult::Queued:
       LOG_DEBUG("sending clipboard %d to \"%s\" over the lane (%u bytes)", id, getName().c_str(),
                 static_cast<uint32_t>(size));
