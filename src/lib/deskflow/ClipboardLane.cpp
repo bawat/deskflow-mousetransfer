@@ -74,6 +74,11 @@ ClipboardLaneManager::ClipboardLaneManager(IEventQueue *events, size_t maxPayloa
       // takes the INT_MAX default straight from Server.h / Client.h.
       m_maxPayloadBytes(std::min<size_t>(maxPayloadBytes, kLaneMaxPayloadBytes))
 {
+  // Re-apply through setMaxPayloadBytes for its NOTE: the server passes its configured limit HERE
+  // (it never calls setMaxPayloadBytes afterwards), so without this a server whose configured limit
+  // exceeds the ceiling is silently clamped -- the stage-6 rig re-check caught exactly that, and a
+  // fleet server always configures 512 MB against a 128 MiB ceiling. The double min() is harmless.
+  setMaxPayloadBytes(maxPayloadBytes);
   // The workers post inbound payloads here; the handler runs on the main thread, which is the whole
   // point of routing them through the event queue rather than calling back directly.
   m_events->addHandler(EventTypes::ClipboardLaneReceived, this, [this](const Event &event) {

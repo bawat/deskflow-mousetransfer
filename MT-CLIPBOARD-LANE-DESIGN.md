@@ -678,8 +678,15 @@ clipboard (assembly N, unmarshalled `Clipboard` N, linefeed copy N, UTF-16 conve
    graceful (`bad_alloc` → caught → the lane goes down, the main session untouched) — but a
    configuration accident should not be able to ask for 4 GB.
 
-Recommendation 1 is still a proposal: **no emitted `clipboardSharingSize` and no wrapper file was
-touched.** The operational knob is the owner's decision.
+Recommendation 1 was **DECLINED by the owner (2026-08-06)**: the wrapper's emitted 512 MB
+`clipboardSharingSize` stands unchanged, so the fleet's effective per-payload bound is the 128 MiB
+ceiling below. The owner accepts the measured residuals of that choice, recorded by the stage-6 rig
+re-check on 2-vCPU/4 GB guests: a server core RETAINS ~453 MB while a 64 MiB clipboard stays live
+(released on the next copy — retention, not a leak; the §11.2 upstream proxy/server state), relay
+latency during such a transfer degraded to 3.8 s worst-case, and a payload the ceiling REFUSES still
+costs the SENDER full marshalling before the refusal (929 MB transient at 132 MiB). File copies are
+unaffected at any size (CF_HDROP never rides the clipboard path). Revisit only with fleet log
+evidence — the INFO lifecycle lines exist precisely so that evidence would be there.
 
 ### 12.1 The ceiling, AS BUILT
 
