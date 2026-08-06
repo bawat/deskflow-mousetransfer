@@ -866,3 +866,67 @@ frame layout matches `kLaneStartBodySize` exactly and `kLaneMaxFrameBody` has 55
 the largest legal body. `Client::enter()`'s lane check is a one-entry map lookup plus, at worst, a
 join of a thread that has already returned — no worker holds a lock during IO, and no worker ever
 touches the session map, so there is no path by which one can block the input thread.
+
+### Stage 5 — operability and the copy account (2026-08-06)
+
+Rig stage 4 passed functionally and produced three deployment blockers: a 64 MiB publish took the
+server core from 3 MB to 517 MB private bytes (~8×, settling ~388 MB), the server froze once for
+~3 minutes CPU-bound and silent, and a client froze once for ~90 s with its whole 2-vCPU guest
+pinned. Everything ≤48 MiB was clean in every run. Full write-up, with the numbers, in
+`MT-CLIPBOARD-LANE-DESIGN.md` §7 (as built), §11 and §12.
+
+**Diagnostics, because the design's §7 was operationally wrong.** It put the lane's whole lifecycle
+at `LOG_DEBUG`. Fleet cores run at the default INFO level and the wrapper regenerates
+`settings\Deskflow.conf` on every engine start and core respawn without ever writing `log/level` — so
+DEBUG cannot be turned on for the machine that is misbehaving, and nothing below INFO survives to be
+read afterwards. Both rig stalls had their entire evidence trail in lines a fleet log would not carry.
+Promoted to INFO, and no further: lane up (peer + socket), lane down **with the reason**, one
+completion line per transfer on each of the sending and receiving workers (bytes + elapsed), and
+"clipboard is waiting for the lane". A transfer that never finishes is then diagnosed by the absence
+of a completion line between an `up` and a `down`. The down reason is recorded state, not a guess:
+`LaneConn::markDead()` publishes a string literal through an atomic, first writer wins, so the real
+cause survives the teardown that follows it.
+
+The `clipdiag` gating the design promised was never wired — `ClipboardChunk::diagEnabled()` appeared
+nowhere in lane code. Per-chunk lines now sit behind `mtDiagEnabled()` (the same `clipdiag` sentinel
+FILE, chosen because an elevated core's environment block is frozen at task-registration time), read
+once per worker so the gate costs nothing per chunk. They include `SSL_pending()` after every
+reassembled chunk — the probe §9b left for the rig.
+
+A REFUSED thread demotion is now WARN rather than `LOG_DEBUG1`. `deskflow-core` runs in
+`REALTIME_PRIORITY_CLASS` (`AppUtilWindows.cpp:112` → `Thread::setPriority(-14)` → entry 22 of
+`ArchMultithreadWindows`'s table), and an undemoted worker streaming tens of megabytes there competes
+directly with the input relay the lane exists to protect. A standalone probe confirmed background
+mode works and pins a thread to absolute priority 4 under NORMAL and HIGH classes; REALTIME could not
+be tested without `SeIncreaseBasePriorityPrivilege`, so the WARN is what will settle it on the fleet.
+
+**The 8× is per-consumer copying, not a leak and not a quadratic.** Counted statically for a server
+with two clients: the payload was marshalled once by the server and then again, byte for byte, inside
+every `ClientProxy1_6::setClipboard`; each proxy kept a `Clipboard` mirror AND handed the lane its own
+private string; `IClipboard::copy` and `unmarshall` each took a whole extra copy because `add()` could
+only copy; `marshall()` held every format's temporary until it returned; and `switchScreen`
+re-marshalled both clipboard ids on every seam crossing purely to size-check them. Model: peak 8N,
+settle 6N — 537 MB and 402 MB at 64 MiB, against 517 MB and 388 MB measured.
+
+Fixed by one immutable `shared_ptr<const std::string>` per clipboard change, shared through every
+proxy, both queues and every worker; a cached marshalling on `Server::ClipboardInfo` that is assigned
+everywhere `m_clipboard` is (including the over-limit early return, so "current" is an invariant);
+`IClipboard::add(Format, std::string&&)` so the two copy paths move; a single marshall on the client's
+send path instead of two; `reserve()` of the announced total in the lane's reassembly; and `DATA`
+frames built straight into the send buffer. Model after: peak ~4N, settle ~4N, and the steady state
+now grows by 1N per client instead of 2N. Per-crossing cost 268 MB → 0.
+
+**The stalls remain UNEXPLAINED, and this says so rather than claiming them.** 170 and 90 CPU-seconds
+are orders of magnitude beyond any linear pass over 64 MiB, and there is no O(n²) anywhere on the
+path: marshall and unmarshall reserve exactly and walk once, the reassembly grew geometrically
+(amortised linear), the Unicode converters all reserve up front, and `ProtocolUtil`/`StreamChunker`
+are not on the payload path at all. §11.3 names the three surviving candidates — an undemoted worker,
+`SSL_write` returning `WANT_READ` and spinning, and the entirely unlogged Windows clipboard WRITE path
+on the main thread — each with the instrument that now settles it.
+
+**Cap: analysis only, nothing changed.** The binding constraint after these fixes is the RECEIVING
+endpoint (~7N, because the Windows clipboard write path is untouched), not the server (~4N). §12
+recommends 32 MB for the wrapper's emitted `clipboardSharingSize` plus a fork-side absolute clamp at
+128 MiB — the latter because `m_maximumClipboardSize` defaults to `INT_MAX` when the option is absent,
+and the new `reserve(total)` makes that default the literal size of an allocation the receiver will
+attempt from a peer-supplied length.

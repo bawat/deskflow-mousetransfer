@@ -259,12 +259,62 @@ Teardown stays exactly as specified: set the stop flag, `shutdown()` the socket,
 worker. The worker is never detached and never outlives its manager; the `select()` timeout bounds
 how long teardown can take even if `shutdown()` were a no-op.
 
-## 7. Diagnostics
+## 7. Diagnostics — AS BUILT (stage 5, 2026-08-06)
 
-- Lifecycle at LOG_DEBUG (`lane up/down/reject reason`, per-train summaries).
-- Per-chunk verbosity gated on the existing `clipdiag` sentinel-file mechanism.
-- A rejected/failed lane must log WHY (token mismatch vs no session vs fingerprint mismatch) —
-  at DEBUG, never spammy at INFO.
+> ⚠️ **The original of this section was wrong in a way that cost the rig two unexplained stalls.**
+> It put the whole lifecycle at `LOG_DEBUG`, which reads as a sensible default and is, on a deployed
+> machine, indistinguishable from not logging at all: **fleet cores run at the default INFO level,
+> and the wrapper regenerates `settings\Deskflow.conf` on every engine start and every core respawn
+> without ever writing `log/level`.** There is therefore no way to turn DEBUG on for the machine that
+> is misbehaving, and nothing below INFO can be recovered after the fact. The `clipdiag` gating it
+> promised was also never wired — `ClipboardChunk::diagEnabled()` appeared nowhere in lane code.
+
+**At INFO, always — the minimal set a fleet log must carry.** One or two lines per peer per session
+plus one per transfer; a lane is per-peer and long-lived, so this is not chatty.
+
+| line | where | says |
+|---|---|---|
+| `clipboard lane up for "<peer>" [sock N]` | `ClipboardLaneManager::attach` | the lane exists |
+| `clipboard lane down for "<peer>": <reason>` | `ClipboardLaneManager::stopLane` | it stopped, and why |
+| `clipboard lane "<peer>": sent clipboard <id>, <n> byte(s) in <t>s` | sending worker | a transfer completed, from this end |
+| `clipboard lane "<peer>": received clipboard <id>, <n> byte(s) in <t>s` | receiving worker | a transfer completed, at this end |
+| `clipboard <id> for "<peer>" is waiting for the lane (<n> bytes)` | `ClientProxy1_6::setClipboard` / `ServerProxy::onClipboardChanged` | `SendResult::Held` — kept, not lost |
+| `clipboard <id> not delivered ... older than protocol 1.9 ...` | same two, rate-limited | `SendResult::NoLane`, already WARN |
+| `clipboard lane ... worker thread NOT demoted ...` | `runLaneBody` + `demoteCurrentThreadToBackground` | see below |
+
+The **down reason** is recorded state, not a guess at the call site: `LaneConn::markDead()` publishes
+a string literal through an atomic, first writer wins, so the real cause ("the peer closed the
+connection", "a tls error", "the connection failed (socket error)") survives the teardown that
+follows it and is never overwritten by "torn down locally". When the connection has no verdict of its
+own, the caller's reason is used instead ("the main session closed", "a newer lane connection
+superseded it", "this endpoint is shutting down", "its worker stopped").
+
+**A transfer that never completes is diagnosed by the ABSENCE of a completion line between an `up`
+and a `down`.** That is deliberate: a per-train START line at INFO would double the volume for a
+case the up/down pair already brackets. The sender's completion line with no matching receiver line
+names the direction that failed.
+
+**Thread demotion failure is WARN** (`lane::demoteCurrentThreadToBackground`, `LaneConn.cpp`), not
+the `LOG_DEBUG1` it was. It is the single most consequential thing that can quietly go wrong in
+here: `deskflow-core` puts itself in **`REALTIME_PRIORITY_CLASS`** (sourced, not assumed —
+`AppUtilWindows.cpp:112` calls `Thread::setPriority(-14)`, which indexes `ArchMultithreadWindows`'s
+table at entry 22, `{REALTIME_PRIORITY_CLASS, THREAD_PRIORITY_TIME_CRITICAL}`), and an undemoted
+worker streaming tens of megabytes in that process competes directly with the input relay this whole
+design exists to keep clear. Two lines are emitted on failure — the OS error from inside the seam,
+and the peer name from the worker.
+
+**Per-chunk detail is gated on `mtDiagEnabled()`** — the same `clipdiag` sentinel `ClipboardChunk`
+uses: a file named `clipdiag` in the core's working directory, or `MOUSETRANSFER_CLIPDIAG=1`. The
+FILE is the primary switch on purpose, because the elevated core's environment block is frozen when
+its task is registered. It is read ONCE per worker into a local, so the gate costs nothing per chunk.
+Gated lines: worker start/exit, `tx DATA` and `rx DATA` per chunk with offsets, `rx START` — and
+**`ssl_pending=` after every reassembled chunk, which is exactly the probe §9b left for the rig.**
+Anything other than 0 there means OpenSSL is holding decrypted plaintext that `select()` will never
+report, and the lane is losing a poll interval per read.
+
+- A rejected lane still logs WHY at DEBUG (token mismatch vs no session vs fingerprint mismatch), in
+  `ClientProxyUnknown` — unchanged, and deliberately not promoted: a refusal is per-connection and an
+  attacker could make it spam.
 
 ## 8. Verification plan
 
@@ -468,6 +518,167 @@ the input thread (no worker ever takes the session mutex, and no worker holds an
   minor, so such a pairing connects where it used to be refused — and a pre-1.3 server sends no
   `kMsgCKeepAlive`, which `ServerProxy`'s alarm requires. No such server exists in this fleet or
   upstream (v1.26.0 is 1.8), so this is a note rather than a finding.
+
+## 11. Where a 64 MiB clipboard's memory and CPU actually go (stage 5, 2026-08-06)
+
+Rig stage 4 passed functionally but produced three things that block deployment: one 64 MiB publish
+took the server core from 3 MB to **517 MB** private bytes (~8×), settling ~388 MB; the server froze
+once for ~3 minutes, silent, with its CPU advancing ~170 s; and a client froze once for ~90 s while
+its whole 2-vCPU guest was CPU-pinned. Everything ≤48 MiB was uniformly clean in every run.
+
+### 11.1 The memory is fully accounted for — and it is not a leak or a quadratic
+
+Counted statically, per client that has been pushed the clipboard, with `N` = the marshalled payload
+(64 MiB = 67.1 MB). Before this stage, on a server with two clients that have both been pushed:
+
+| what | where | live copies of N |
+|---|---|---|
+| the Windows read: UTF-16 handle copy + UTF-8 result | `MSWindowsClipboardAnyTextConverter::toIClipboard` | 3 (transient) |
+| the server's stored clipboard | `Server::ClipboardInfo::m_clipboard` | 1 (retained) |
+| `marshall()`: the per-format temporaries + the result | `IClipboard::marshall` | 2 (transient) |
+| the server's marshalled cache | `ClipboardInfo::m_clipboardData` | 1 (retained) |
+| `onClipboardChanged`'s local `data` | `Server.cpp` | 1 (transient) |
+| each proxy's mirror of the clipboard | `ClientProxy1_0::m_clipboard[id]` | 1 per client (retained) |
+| each proxy's OWN marshalling of the same bytes | `ClientProxy1_6::setClipboard` | 2 per client (transient) |
+| each peer's queued lane payload | `Lane::m_pending` / `Session::m_held` | 1 per client (retained) |
+
+**Model: peak 8N = 537 MB, settle 6N = 402 MB. Measured: 517 MB and 388 MB.** Within 4 % of both.
+There is no leak and no quadratic here — it is per-consumer copying, one copy per consumer, and the
+consumers multiply with the client count.
+
+Two more costs on the same account, both linear and both invisible in the peak because they are
+transient: `switchScreen` re-marshalled BOTH clipboard ids from scratch on **every seam crossing**
+purely to look at two sizes (268 MB of allocate-copy-free per crossing at 64 MiB, on the thread that
+relays input), and the client marshalled the same clipboard **twice** per send — once in
+`Client::sendClipboard` for the size and unchanged checks, then again in
+`ServerProxy::onClipboardChanged`.
+
+### 11.2 What stage 5 changed, and what it leaves
+
+Fixed (commit `perf: marshall a clipboard once and share the one buffer`):
+
+- One immutable `shared_ptr<const std::string>` per clipboard change, from `Server::onClipboardChanged`
+  through every proxy, both queues and every worker. The per-proxy marshall and the per-peer queued
+  copy are gone — the lane's payload cost no longer scales with the client count at all.
+- `switchScreen` size-checks the cached marshalling. Per-crossing cost: 268 MB → **0**.
+- `IClipboard::add(Format, std::string&&)` (default forwards to the copying overload, `Clipboard`
+  overrides it to move) removes the extra full copy from `IClipboard::copy` AND `IClipboard::unmarshall`
+  — i.e. from every `getClipboard`, every `setClipboard` and every apply, on both endpoints.
+- `marshall()` releases each format's temporary as its bytes land in the result.
+- The client marshalls once instead of twice.
+- The lane receiver `reserve()`s the announced total (already bounded by the configured cap) instead
+  of growing geometrically from 256 KB: ~2N of memcpy and a transient 2.5N peak → exactly N.
+- The lane sender builds each `DATA` frame straight into its send buffer instead of into a temporary
+  that `frame()` then copied: 128 MB of pure memcpy per 64 MiB transfer, and zero per-chunk
+  allocation after the first.
+
+**Model after: peak ~4N (268 MB), settle ~4N (268 MB)** for the same two-client 64 MiB publish — a
+~50 % cut in peak and ~33 % in steady state, and the steady state now grows by 1N per client rather
+than 2N.
+
+**Left, deliberately, and NOT half-fixed:**
+
+- **Each client proxy still keeps its own `Clipboard` mirror (1N per client, retained).** That is
+  proxy STATE — what this client is believed to hold — not a transport buffer, and it is read by
+  `ClientProxy1_0::getClipboard`. Removing it would change upstream semantics that predate the fork
+  for one copy of saving.
+- **The Windows clipboard WRITE path is the worst endpoint and is untouched.** Applying a received
+  clipboard costs, in sequence: `convertLinefeedToWin32` (a full copy), `Unicode::UTF8ToUTF16` (2N
+  for a mostly-ASCII payload), and a `GlobalAlloc` of the same 2N that is then memcpy'd into. With
+  the assembly buffer and the unmarshalled `Clipboard` still live, a **receiving** endpoint peaks
+  around **7N** — worse than the server. This is inherent to `CF_UNICODETEXT` and to
+  `IMSWindowsClipboardConverter`'s `HANDLE fromIClipboard(const std::string &)` signature; removing
+  it means changing that interface for every platform converter, which is out of proportion to this
+  stage. **It is the binding constraint on §12's cap.**
+- `IClipboard::marshall` still copies each format once via `get()`, because `get()` returns by value
+  through a polymorphic interface and calling it twice is not an option (on Windows it is a clipboard
+  read plus a full character-by-character conversion).
+
+### 11.3 The two stalls are NOT explained. Stated plainly.
+
+The memory account above closes; **the CPU does not.** 170 CPU-seconds on the server and ~90 on the
+client are two to three orders of magnitude more than any linear pass over 64 MiB can cost, and a
+static hunt for the classic cause found nothing:
+
+- `IClipboard::marshall` reserves the **exact** total and appends once per format — linear.
+- `IClipboard::unmarshall` walks the buffer once with no reallocation of the source — linear.
+- The lane's reassembly appended 256 KB at a time into a `std::string`, which grows **geometrically**
+  — amortised O(n) with a constant near 2, not O(n²). (Now exactly 1, via `reserve`.)
+- `Unicode::UTF8ToUTF16` / `UTF16ToUTF8` / `convertLinefeedTo*` all reserve up front and append —
+  linear, with a per-character constant.
+- `ProtocolUtil` and `StreamChunker` are not on the lane's payload path at all.
+
+So: **no O(n²) exists in the path, and the fixes above do not explain stalls A or B.** They will
+lower the pressure that may have contributed, and they remove ~250 MB of the server's peak, but
+claiming they close the stalls would be a guess. What stage 5 does instead is make the next
+occurrence diagnosable, and name the three candidates with the instrument that now settles each:
+
+1. **The lane worker is not actually demoted.** `LaneConn.cpp` assumes Windows background mode is the
+   escape hatch from `REALTIME_PRIORITY_CLASS`; that assumption has never been tested in a realtime
+   process. STALL B's shape — *the whole 2-vCPU guest CPU-pinned, the event thread missing keepalives,
+   an SSH banner exchange timing out* — is precisely what a realtime-priority worker looks like.
+   **Measured here (standalone probe, not the core):** background mode succeeds and pins the thread
+   to absolute priority 4 under `NORMAL_PRIORITY_CLASS` (offset −4 from base 8) and under
+   `HIGH_PRIORITY_CLASS` (offset −9 from base 13). `REALTIME_PRIORITY_CLASS` **could not be tested**
+   — `SetPriorityClass(REALTIME)` silently degrades to `HIGH` without `SeIncreaseBasePriorityPrivilege`,
+   which the probe did not have. Note the corollary: a core NOT running as LocalSystem is at HIGH,
+   where the demotion demonstrably works, so this would present only on elevated cores.
+   *Instrument:* the new WARN. If it appears on a rig guest, this is the cause and the seam needs a
+   different mechanism for realtime processes.
+2. **`SSL_write` returning `WANT_READ`** (TLS 1.3 key update / post-handshake ticket) spins the
+   worker at full speed, because `select()` keeps reporting the socket writable. Already listed as an
+   open item in §9b, bounded and transient in theory, unbounded in practice if the peer never speaks.
+   *Instrument:* `clipdiag` — a burst of `tx DATA` lines with no advancing offset, or none at all
+   while the worker is hot.
+3. **The Windows clipboard write, on the main thread, logging nothing.** On the server the only code
+   between the last line it printed (`screen "..." updated clipboard 1`, `Server.cpp`) and its
+   silence is `m_active->setClipboard()`. If the active screen is the PRIMARY, that is
+   `MSWindowsScreen::setClipboard` → two full character-by-character conversion passes → a 128 MiB
+   `GlobalAlloc` → `SetClipboardData`, which then notifies **every clipboard listener in the session**
+   — including the MouseTransfer wrapper's own watcher, which reads the clipboard back. None of that
+   logs at any level, and it is the only silent, CPU-bound, main-thread work of the right shape.
+   *Instrument:* none added here — it is outside the lane. The rig can settle it by watching whether
+   the freeze reproduces with the wrapper's clipboard watcher disabled.
+
+## 12. Payload cap — recommendation and the arithmetic (stage 5; NO cap changed)
+
+The wrapper emits `clipboardSharingSize = 512 MB` as a memory guardrail. The rig's knee: 64 MiB
+intermittently bad on 2-vCPU/4 GB guests, ≤48 MiB always clean.
+
+**The binding constraint after §11.2 is the RECEIVING endpoint, not the server.** The server's
+multiplier fell from ~8N to ~4N, which would move its knee to roughly 128 MiB; the receiver's fell
+only from ~8N to ~7N, because the Windows clipboard write path (§11.2) is untouched. So the knee
+should be expected to move very little, and a cap chosen from the server's improvement would be
+wrong.
+
+Worst-endpoint arithmetic, after the fixes: `peak ≈ 7 × N` on a machine applying a received
+clipboard (assembly N, unmarshalled `Clipboard` N, linefeed copy N, UTF-16 conversion 2N, `HGLOBAL`
+2N). Solving for a memory budget `B`: `N ≤ B / 7`.
+
+| budget for one transfer | machine it suits | implied cap |
+|---|---|---|
+| 256 MB (~6 % of RAM) | a 4 GB guest / the Win8 laptop | **~36 MB** |
+| 512 MB | an 8 GB fleet machine | ~73 MB |
+| 3.5 GB (today's 512 MB setting) | nothing in this fleet | — |
+
+**Recommendation — the owner decides the number; this is the basis:**
+
+1. **Wrapper `clipboardSharingSize`: 32768 KB (32 MB).** It is the operational knob, per-fleet
+   tunable, and it already reaches both endpoints (the server's `m_maximumClipboardSize` and, via
+   `kMsgDSetOptions`, the client's). 32 MB sits inside the measured always-clean band with a 1.5×
+   margin, costs ~224 MB on the worst endpoint of a 4 GB guest, and is 128 lane chunks.
+2. **A fork-side absolute clamp as well, at 128 MiB** — 4× the operational number, so it never binds
+   in normal use. This is not belt-and-braces, it closes a real hole: `m_maximumClipboardSize`
+   defaults to `INT_MAX` (`Server.h`, `Client.h`), i.e. ~2 TB, whenever the option is absent — a
+   stale `Deskflow.conf`, a non-MouseTransfer deployment, a config the wrapper did not regenerate.
+   **Stage 5's `reserve(total)` change makes that default the literal size of a single allocation the
+   receiver will attempt from a peer-supplied length**, so the setting is now load-bearing in a way
+   it was not before. The lane is authenticated (token + matching peer certificate), so the threat
+   model is a paired machine rather than a stranger, and the failure is graceful (`bad_alloc` →
+   caught → the lane goes down, the main session untouched) — but a configuration accident should not
+   be able to ask for 4 GB.
+
+Nothing in this stage changes any cap. Both numbers above are proposals.
 
 ## 10. Working agreements for implementing agents
 
