@@ -435,7 +435,12 @@ Client::sendClipboardOverLane(ClipboardID id, uint32_t sequenceNumber, std::stri
   // deliver is the moment it becomes worth trying again. Cheap and idempotent -- it does nothing at
   // all unless the dialer is idle with a token, so it cannot interrupt an attempt in flight or pull
   // a backoff forward.
-  if (result == deskflow::ClipboardLaneManager::SendResult::NoLane && m_laneDialer) {
+  //
+  // Held is the case that matters (a session exists, so a token exists, but the lane is down and
+  // the payload is being kept for it). NoLane is kept alongside it because it costs nothing and is
+  // a no-op by construction: no session means no advert, which means the dialer has no token.
+  using SendResult = deskflow::ClipboardLaneManager::SendResult;
+  if ((result == SendResult::Held || result == SendResult::NoLane) && m_laneDialer) {
     m_laneDialer->nudge();
   }
   return result;

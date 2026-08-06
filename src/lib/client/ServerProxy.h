@@ -149,5 +149,11 @@ private:
   // Rate limit for the "no lane, clipboard dropped" warning. A clipboard is offered on every leave,
   // so an un-limited warning would produce a line per crossing for as long as the lane stays down --
   // which buries the first occurrence, the only one that carries news.
+  //
+  // The separate "have we ever warned" flag is not redundant: ARCH->time() is a steady_clock
+  // reading, i.e. seconds since BOOT, so on a freshly booted machine `now` can be smaller than the
+  // interval and a plain `now - 0.0 >= interval` test SUPPRESSES the very first warning. Same
+  // reasoning, same shape, as ClientProxy1_6.
   double m_lastNoLaneWarning = 0.0;
+  bool m_noLaneWarned = false;
 };

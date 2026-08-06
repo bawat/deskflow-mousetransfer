@@ -401,6 +401,13 @@ void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard
     LOG_DEBUG("sending clipboard %d over the lane, seqnum=%d, size=%d", id, m_seqNum, static_cast<int>(size));
     break;
 
+  case SendResult::Held:
+    // The server advertised a lane, so there is a session, but the lane itself is not up (yet, or
+    // any more). The payload is kept and goes out when the dial lands -- which
+    // sendClipboardOverLane() has just asked for -- so this is news at DEBUG and nothing more.
+    LOG_DEBUG("clipboard %d is waiting for the lane, seqnum=%d, size=%d", id, m_seqNum, static_cast<int>(size));
+    break;
+
   case SendResult::TooLarge:
     LOG_NOTE(
         "not sending clipboard %d: %d bytes is over the limit configured by the server", id, static_cast<int>(size)
@@ -408,14 +415,14 @@ void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard
     break;
 
   case SendResult::NoLane:
-    // An older server (nothing advertised a lane), or a lane that is down or has not come up yet.
-    // sendClipboardOverLane() has already asked the dialer to try again. Rate limited: see
-    // kNoLaneWarningInterval.
-    if (const double now = ARCH->time(); now - m_lastNoLaneWarning >= kNoLaneWarningInterval) {
+    // No SESSION at all, which on the client means the server never advertised a lane -- i.e. it is
+    // older than protocol 1.9. Rate limited: see kNoLaneWarningInterval.
+    if (const double now = ARCH->time(); !m_noLaneWarned || now - m_lastNoLaneWarning >= kNoLaneWarningInterval) {
       m_lastNoLaneWarning = now;
+      m_noLaneWarned = true;
       LOG_WARN(
-          "clipboard %d not delivered to the server: no clipboard lane (server is older than "
-          "protocol 1.9, or the lane is down)",
+          "clipboard %d not delivered to the server: it is older than protocol 1.9 and offered no "
+          "clipboard lane",
           id
       );
     }
