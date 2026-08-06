@@ -10,10 +10,14 @@
 
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "deskflow/ClipboardLane.h"
 #include "deskflow/DeskflowException.h"
+#include "deskflow/PacketStreamFilter.h"
 #include "deskflow/ProtocolTypes.h"
 #include "deskflow/ProtocolUtil.h"
 #include "io/IStream.h"
+#include "net/LaneConn.h"
+#include "net/SecureSocket.h"
 #include "server/ClientProxy1_0.h"
 #include "server/ClientProxy1_1.h"
 #include "server/ClientProxy1_2.h"
@@ -221,6 +225,84 @@ void ClientProxyUnknown::initProxy(const std::string &name, int major, int minor
   }
 }
 
+bool ClientProxyUnknown::handleLaneHello()
+{
+  // Everything here is best-effort and self-contained. The connection this runs on is a SECOND
+  // connection from a peer whose main session is already up; nothing we do or fail to do may reach
+  // that session.
+  int16_t laneVersion = 0;
+  std::string name;
+  std::string token;
+  if (!ProtocolUtil::readf(m_stream, kMsgMTLaneHello + 4, &laneVersion, &name, &token)) {
+    LOG_DEBUG("clipboard lane refused: malformed lane greeting");
+    sendFailure();
+    return true;
+  }
+
+  auto &lane = m_server->clipboardLane();
+
+  // Validate BEFORE detaching anything: a refusal must leave the connection in the ordinary state
+  // so the ordinary teardown can close it.
+  std::string fingerprint;
+  auto *secure = SecureSocket::fromStream(m_stream);
+  if (secure != nullptr) {
+    fingerprint = secure->peerFingerprint();
+  }
+
+  if (std::string reason; !lane.validate(name, token, fingerprint, laneVersion, reason)) {
+    // At DEBUG and naming the reason: a rejected lane is not an alarm (it is what an attacker or a
+    // stale client looks like), but "which check failed" is the only useful thing to know when a
+    // lane that SHOULD work does not.
+    LOG_DEBUG("clipboard lane refused for \"%s\": %s", name.c_str(), reason.c_str());
+    sendFailure();
+    return true;
+  }
+
+  // Only a TLS connection can become a lane: the fingerprint binding is half the authorisation, and
+  // the plaintext path has no SSL object to hand over in the first place.
+  if (secure == nullptr) {
+    LOG_DEBUG("clipboard lane refused for \"%s\": not a tls connection", name.c_str());
+    sendFailure();
+    return true;
+  }
+
+  // Anything still sitting in the packet filter would be lost by the handoff -- the lane takes the
+  // raw connection, not the filter. The client contract is "write the lane greeting and nothing
+  // else until the ack", so this should never fire; if it does, refusing is the honest answer.
+  if (auto *filter = dynamic_cast<PacketStreamFilter *>(m_stream); filter != nullptr && filter->hasBufferedInput()) {
+    LOG_DEBUG("clipboard lane refused for \"%s\": the peer pipelined data behind its greeting", name.c_str());
+    sendFailure();
+    return true;
+  }
+
+  const auto detached = secure->detachTls();
+  if (!detached.valid()) {
+    // detachTls() refuses anything that is not quiescent, and says why at DEBUG. Falling back to a
+    // normal close costs the peer one retry.
+    LOG_DEBUG("clipboard lane refused for \"%s\": the connection could not be detached", name.c_str());
+    sendFailure();
+    return true;
+  }
+
+  auto conn = deskflow::LaneConn::adopt(detached.socket, detached.ssl, detached.sslContext);
+  if (!conn) {
+    // Cannot happen with a valid DetachedTls, but if it ever did the connection would leak, so it
+    // is handled rather than asserted.
+    LOG_DEBUG("clipboard lane refused for \"%s\": could not adopt the detached connection", name.c_str());
+    sendFailure();
+    return true;
+  }
+
+  lane.attach(name, std::move(conn));
+
+  // The socket wrapper, the stream and this object are all inert now: the wrapper owns nothing, and
+  // the ordinary failure route deletes the three of them in the right order without touching the
+  // connection the lane just took. Reusing that route rather than inventing a second teardown is
+  // the point -- there is exactly one way these objects get cleaned up.
+  sendFailure();
+  return true;
+}
+
 void ClientProxyUnknown::handleData()
 {
   LOG_DEBUG1("parsing hello reply");
@@ -234,10 +316,30 @@ void ClientProxyUnknown::handleData()
       throw BadClientException();
     }
 
+    // MouseTransfer: a clipboard lane greets us here instead of replying to the hello, so the first
+    // four bytes decide which conversation this is. They are read separately rather than by readf
+    // because readf CONSUMES what it parses and there is no way to put it back -- and because the
+    // hello reply's protocol name is a fixed 7-byte field (kMsgHelloBack is "%7s..."), those four
+    // bytes plus the next three reconstruct it exactly, which is what the non-lane path does below.
+    uint8_t head[4];
+    if (m_stream->read(head, sizeof(head)) != sizeof(head)) {
+      throw BadClientException();
+    }
+    if (memcmp(head, kMsgMTLaneHello, sizeof(head)) == 0) {
+      handleLaneHello();
+      return;
+    }
+
     // parse the reply to hello
     int16_t major;
     int16_t minor;
-    if (std::string protocolName; !ProtocolUtil::readf(m_stream, kMsgHelloBack, &protocolName, &major, &minor, &name)) {
+    uint8_t restOfProtocolName[3];
+    if (m_stream->read(restOfProtocolName, sizeof(restOfProtocolName)) != sizeof(restOfProtocolName)) {
+      throw BadClientException();
+    }
+    // The protocol name itself is read but not checked, exactly as before -- version compatibility
+    // is decided by the numbers, and both accepted names ("Synergy", "Barrier") are 7 chars.
+    if (!ProtocolUtil::readf(m_stream, kMsgHelloBackArgs, &major, &minor, &name)) {
       throw BadClientException();
     }
 

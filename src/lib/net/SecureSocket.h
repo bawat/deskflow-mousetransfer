@@ -22,6 +22,10 @@ class SocketMultiplexer;
 class ISocketMultiplexerJob;
 class QString;
 
+namespace deskflow {
+class IStream;
+}
+
 struct Ssl;
 
 //! Secure socket
@@ -115,6 +119,16 @@ public:
   happens first, exactly as close() does it.
   */
   DetachedTls detachTls();
+
+  //! Find the SecureSocket underneath a stream, or nullptr
+  /*!
+  Streams reach code that has no idea how they were built, so this walks the one shape the product
+  actually constructs -- a StreamFilter (a PacketStreamFilter, in practice) wrapping the socket --
+  and returns the SecureSocket if that is what is at the bottom. Returns nullptr for a plaintext
+  socket, an unrecognised chain, or a filter that has adopted (and will therefore delete) its
+  stream, which is exactly the "we are not allowed to take this apart" case.
+  */
+  static SecureSocket *fromStream(deskflow::IStream *stream);
 
 private:
   // SSL

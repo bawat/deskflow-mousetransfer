@@ -304,6 +304,24 @@ ClipboardLaneManager::SendResult ClipboardLaneManager::send(const std::string &p
 
 void ClipboardLaneManager::runLane(Lane *lane)
 {
+  // An exception escaping a std::thread's entry function calls std::terminate -- i.e. a clipboard
+  // problem would take the whole core down, which is the exact opposite of this feature's one
+  // non-negotiable property. A lane may only ever fail by going quiet. The realistic candidate is
+  // bad_alloc on a genuinely large clipboard.
+  try {
+    runLaneBody(lane);
+  } catch (const std::exception &e) {
+    LOG_WARN("clipboard lane \"%s\" failed: %s", lane->m_peer.c_str(), e.what());
+  } catch (...) {
+    LOG_WARN("clipboard lane \"%s\" failed", lane->m_peer.c_str());
+  }
+
+  // Last act, and the only thing the main thread reads from here: it may now stop and join us.
+  lane->m_finished = true;
+}
+
+void ClipboardLaneManager::runLaneBody(Lane *lane)
+{
   // Before ANY io, and for this thread's whole life.
   lane::demoteCurrentThreadToBackground();
 
@@ -422,7 +440,12 @@ void ClipboardLaneManager::runLane(Lane *lane)
               // A new START discards whatever was half-assembled for this id -- that is exactly how
               // the sender's supersede works: it stops mid-train and starts a fresh one.
               assembly[id] = Assembly{true, seq, total, std::string()};
-              assembly[id].data.reserve(total);
+              // Reserve a first chunk's worth rather than the announced total. `total` is a number
+              // the PEER chose, and with no configured clipboard limit the ceiling on it is 4 GB --
+              // reserving that up front would throw before a single byte of it had arrived. append()
+              // grows geometrically, so the cost of not front-loading is a few reallocations on a
+              // payload that is genuinely large.
+              assembly[id].data.reserve(std::min<uint32_t>(total, kLaneChunkSize));
             }
           } else if (rxType == LaneFrame::Data && rxBody.size() >= 9) {
             const ClipboardID id = body[0];
@@ -551,9 +574,6 @@ void ClipboardLaneManager::runLane(Lane *lane)
       }
     }
   }
-
-  // Last act, and the only thing the main thread reads from here: it may now stop and join us.
-  lane->m_finished = true;
 }
 
 } // namespace deskflow

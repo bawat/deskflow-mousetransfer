@@ -57,6 +57,17 @@ private:
   void initProxy(const std::string &name, int major, int minor);
   void removeTimer();
   void handleData();
+
+  //! Handle a connection that greeted us with kMsgMTLaneHello instead of kMsgHelloBack
+  /*!
+  Validates it against a live session, detaches the TLS connection and hands it to the clipboard
+  lane. Returns true if it consumed the connection one way or the other (accepted OR rejected) --
+  either way this object is finished with it and has already arranged its own teardown.
+
+  Nothing in here may touch, delay or fail the peer's MAIN session. The worst outcome of a bad lane
+  greeting is that one extra TCP connection is closed and a line appears in the debug log.
+  */
+  bool handleLaneHello();
   void handleWriteError();
   void handleTimeout();
   void handleDisconnect();

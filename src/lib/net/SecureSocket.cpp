@@ -12,6 +12,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
+#include "io/StreamFilter.h"
 #include "mt/Lock.h"
 #include "net/FingerprintDatabase.h"
 #include "net/TCPSocket.h"
@@ -240,6 +241,21 @@ TCPSocket::JobResult SecureSocket::doWrite()
   }
 
   return Retry;
+}
+
+SecureSocket *SecureSocket::fromStream(deskflow::IStream *stream)
+{
+  auto *filter = dynamic_cast<StreamFilter *>(stream);
+  if (filter == nullptr) {
+    return nullptr;
+  }
+  // An adopted stream is owned (and deleted) by the filter; ClientListener builds its filters with
+  // adopt=false and keeps the socket itself, so this also rejects any chain that is not the one the
+  // handoff was designed around.
+  if (filter->adoptedStream()) {
+    return nullptr;
+  }
+  return dynamic_cast<SecureSocket *>(filter->getStream());
 }
 
 SecureSocket::DetachedTls SecureSocket::detachTls()

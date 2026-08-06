@@ -12,6 +12,7 @@
 #include "base/NetworkProtocol.h"
 #include "base/Stopwatch.h"
 #include "deskflow/Clipboard.h"
+#include "deskflow/ClipboardLane.h"
 #include "deskflow/ClipboardTypes.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
@@ -19,6 +20,7 @@
 
 #include <climits>
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -186,6 +188,17 @@ public:
   */
   std::string protocolString() const;
 
+  //! Get the clipboard lane manager
+  /*!
+  The server owns exactly one, with a session per connected 1.9+ client. ClientProxyUnknown needs it
+  to validate an incoming lane greeting; ClientProxy1_6 needs it to send. Always valid for the
+  server's lifetime. See MT-CLIPBOARD-LANE-DESIGN.md.
+  */
+  deskflow::ClipboardLaneManager &clipboardLane() const
+  {
+    return *m_clipboardLane;
+  }
+
   //! Get number of connected clients
   /*!
   Returns the number of connected clients, including the server itself.
@@ -329,6 +342,19 @@ private:
   void handleKeyboardBroadcastEvent(const Event &event);
   void handleLockCursorToScreenEvent(const Event &event);
 
+  // MouseTransfer clipboard lane: arm a 1.9+ client with a session token and tell it the lane is
+  // available. Called once per adopted client, AFTER the session exists.
+  void offerClipboardLane(BaseClientProxy *client);
+
+  // MouseTransfer clipboard lane: the configured clipboard limit expressed in BYTES.
+  // m_maximumClipboardSize is in KB and defaults to INT_MAX, so the multiplication needs a ceiling
+  // rather than a cast.
+  size_t maxClipboardBytes() const;
+
+  // MouseTransfer clipboard lane: a complete payload arrived from a peer. Runs on the MAIN thread
+  // (the lane manager posts an event to get here), so it may touch proxy state.
+  void handleLaneClipboard(const deskflow::LaneClipboardInfo &info);
+
   // event processing
   void onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum);
   void onScreensaver(bool activated);
@@ -424,6 +450,11 @@ private:
 
   IEventQueue *m_events = nullptr;
   size_t m_maximumClipboardSize = INT_MAX;
+
+  // MouseTransfer: the dedicated clipboard connections. Constructed with the server and destroyed
+  // with it (which stops and joins every lane worker), so clipboardLane() is always valid.
+  std::unique_ptr<deskflow::ClipboardLaneManager> m_clipboardLane;
+
   ClientListener *m_clientListener = nullptr;
   Stopwatch m_switchTwoTapTimer;
 

@@ -150,7 +150,10 @@ private:
     std::unique_ptr<Lane> m_lane;
   };
 
+  //! Worker entry point. Catches EVERYTHING: an escaping exception would call std::terminate.
   void runLane(Lane *lane);
+  //! The actual loop, free to throw
+  void runLaneBody(Lane *lane);
   //! Raise the stop flag, unblock the wait, join the worker, then let the connection go
   static void stopLane(std::unique_ptr<Lane> lane);
 

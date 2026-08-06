@@ -18,9 +18,12 @@
 #include "deskflow/ProtocolTypes.h"
 #include "deskflow/Screen.h"
 #include "deskflow/StreamChunker.h"
+#include "net/SecureSocket.h"
 #include "net/TCPSocket.h"
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
+#include "server/ClientProxy1_6.h"
+#include "server/ClientProxy1_9.h"
 #include "server/ClientProxyUnknown.h"
 #include "server/PrimaryClient.h"
 
@@ -55,6 +58,15 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   assert(m_screen != nullptr);
 
   std::string primaryName = getName(primaryClient);
+
+  // MouseTransfer: the clipboard lane. Built before any client can be adopted, and destroyed with
+  // the server -- its destructor stops and joins every lane worker, which is why nothing else has
+  // to think about worker lifetimes. The cap starts at whatever m_maximumClipboardSize is now and
+  // is kept in step by processOptions().
+  m_clipboardLane = std::make_unique<deskflow::ClipboardLaneManager>(m_events, maxClipboardBytes());
+  m_clipboardLane->setReceiveHandler([this](const deskflow::LaneClipboardInfo &info) {
+    handleLaneClipboard(info);
+  });
 
   // clear clipboards
   for (auto &clipboard : m_clipboards) {
@@ -298,6 +310,10 @@ void Server::adoptClient(BaseClientProxy *client)
 
   // send configuration options to client
   sendOptions(client);
+
+  // MouseTransfer: arm and advertise the dedicated clipboard connection. No-op for anything below
+  // protocol 1.9. Done after the client is in m_clients so the session and the roster agree.
+  offerClipboardLane(client);
 
   // activate screen saver on new client if active on the primary screen
   if (m_activeSaver != nullptr) {
@@ -1195,6 +1211,12 @@ void Server::processOptions()
       } else {
         m_maximumClipboardSize = static_cast<size_t>(value);
       }
+      // MouseTransfer: keep the lane's ceiling in step with the configured one. The lane enforces
+      // it on RECEIVE too (it allocates from a length the peer supplied), so a stale value there
+      // would be a real hole rather than an inconsistency.
+      if (m_clipboardLane) {
+        m_clipboardLane->setMaxPayloadBytes(maxClipboardBytes());
+      }
     }
   }
   if (m_relativeMoves && !newRelativeMoves) {
@@ -1561,6 +1583,72 @@ void Server::handleLockCursorToScreenEvent(const Event &event)
       stopRelativeMoves();
     }
   }
+}
+
+size_t Server::maxClipboardBytes() const
+{
+  // m_maximumClipboardSize is KILOBYTES (kOptionClipboardSharingSize), and its default is INT_MAX,
+  // i.e. "no limit". Multiplying that by 1024 is fine on a 64-bit size_t and overflows on a 32-bit
+  // one, which would turn "no limit" into a very small limit -- so saturate instead of wrapping.
+  constexpr size_t kBytesPerKb = 1024;
+  if (m_maximumClipboardSize > SIZE_MAX / kBytesPerKb) {
+    return SIZE_MAX;
+  }
+  return m_maximumClipboardSize * kBytesPerKb;
+}
+
+void Server::offerClipboardLane(BaseClientProxy *client)
+{
+  // A client that did not announce 1.9 has no ClientProxy1_9 and therefore cannot be told about the
+  // lane -- the cast IS the gate. Sending kMsgDLaneAdvert to an older client would not degrade it,
+  // it would kill the connection: an unknown 4-char code makes ServerProxy drain the whole stream.
+  // The primary client is not a ClientProxy at all, so it drops out here too.
+  auto *proxy = dynamic_cast<ClientProxy1_9 *>(client);
+  if (proxy == nullptr) {
+    return;
+  }
+
+  // The identity the lane must match. Empty when the connection is not peer-authenticated, in which
+  // case the lane's fingerprint check is vacuous by construction and the token alone gates it.
+  std::string fingerprint;
+  if (auto *secure = SecureSocket::fromStream(proxy->getStream()); secure != nullptr) {
+    fingerprint = secure->peerFingerprint();
+  }
+  if (fingerprint.empty()) {
+    LOG_DEBUG("clipboard lane: \"%s\" has no peer certificate; the lane will be gated on its token only",
+              getName(client).c_str());
+  }
+
+  // Register FIRST, advertise second. A client that dialled the instant it read the advert must
+  // find the session already armed, or it would be refused for a reason that is our fault.
+  const std::string token = m_clipboardLane->openSession(getName(client), fingerprint);
+  if (token.empty()) {
+    // openSession only fails when there is no secure randomness. Saying nothing is right: the
+    // client simply never learns of a lane and keeps its clipboard to itself.
+    return;
+  }
+  proxy->sendClipboardLaneAdvert(token);
+}
+
+void Server::handleLaneClipboard(const deskflow::LaneClipboardInfo &info)
+{
+  // On the MAIN thread -- the lane worker got here by posting an event precisely so that this may
+  // touch proxy state.
+  const auto found = m_clients.find(info.m_peer);
+  if (found == m_clients.end()) {
+    LOG_DEBUG("clipboard lane: dropping clipboard %d from \"%s\", which is no longer connected",
+              static_cast<int>(info.m_id), info.m_peer.c_str());
+    return;
+  }
+
+  auto *proxy = dynamic_cast<ClientProxy1_6 *>(found->second);
+  if (proxy == nullptr) {
+    return;
+  }
+
+  // Deliberately routed through the proxy rather than applied here: this must land in exactly the
+  // same state, and raise exactly the same ClipboardChanged event, as the legacy in-stream receive.
+  proxy->applyLaneClipboard(info.m_id, info.m_sequenceNumber, info.m_data);
 }
 
 void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum)
@@ -2089,6 +2177,11 @@ bool Server::removeClient(BaseClientProxy *client)
   m_events->removeHandler(ScreenShapeChanged, client->getEventTarget());
   m_events->removeHandler(ClipboardGrabbed, client->getEventTarget());
   m_events->removeHandler(ClipboardChanged, client->getEventTarget());
+
+  // MouseTransfer: the lane belongs to the main session, so it dies with it. Done BEFORE the name
+  // is erased, since the session is keyed by it. closeSession stops and joins the worker, and is a
+  // no-op for a client that never had a lane (including the primary client).
+  m_clipboardLane->closeSession(getName(client));
 
   // remove from list
   m_clients.erase(getName(client));

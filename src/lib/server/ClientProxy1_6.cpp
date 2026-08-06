@@ -6,12 +6,26 @@
 
 #include "server/ClientProxy1_6.h"
 
+#include "arch/Arch.h"
 #include "base/Log.h"
 #include "deskflow/ClipboardChunk.h"
+#include "deskflow/ClipboardLane.h"
 #include "deskflow/ProtocolUtil.h"
-#include "deskflow/StreamChunker.h"
 #include "io/IStream.h"
 #include "server/Server.h"
+
+namespace {
+
+//! Seconds between "clipboard dropped, this client has no lane" warnings, per client
+/*!
+Not a tuning knob so much as a floor on usefulness. Server::onScreenSwitch re-publishes the
+clipboard on every crossing, so the un-limited version of this warning fires several times a second
+while a pre-1.9 client is connected -- and the line that matters is the FIRST one. 30 seconds keeps
+the situation visible in a log without the first occurrence being buried under its own repetitions.
+*/
+constexpr double kNoLaneWarningInterval = 30.0;
+
+} // namespace
 
 //
 // ClientProxy1_6
@@ -21,13 +35,13 @@ ClientProxy1_6::ClientProxy1_6(const std::string &name, deskflow::IStream *strea
     : ClientProxy1_5(name, stream, server, events),
       m_events(events)
 {
-  m_events->addHandler(EventTypes::ClipboardSending, this, [this](const auto &e) {
-    ClipboardChunk::send(getStream(), e.getDataObject());
-  });
-  // MouseTransfer diagnostic: pair this with the destructor line below and with
-  // ClipboardChunk::send's stream= field. Together they answer the question the logs could not:
-  // is a ClipboardSending event still being delivered through a proxy that has already been
-  // destroyed, and onto which stream?
+  // The ClipboardSending handler that used to be registered here is GONE, with the whole
+  // StreamChunker path it served (see setClipboard below). That also retires the documented
+  // handler-leak concern: the constructor registered a handler keyed on `this`, the destructor did
+  // not remove it, and Server::removeClient cleared every clipboard handler except that one. It was
+  // measured NOT to be the cause of the 2026-07-28 storm -- an instrumented repro logged zero
+  // ClipboardChunk::send calls throughout the failure -- but with no registration there is nothing
+  // left to reason about.
   if (ClipboardChunk::diagEnabled()) {
     LOG_NOTE(
         "clipdiag: clientproxy1.6 CONSTRUCTED: proxy=%p stream=%p name=\"%s\"", static_cast<void *>(this),
@@ -38,23 +52,19 @@ ClientProxy1_6::ClientProxy1_6(const std::string &name, deskflow::IStream *strea
 
 ClientProxy1_6::~ClientProxy1_6()
 {
-  // DELIBERATELY only logging -- this destructor does NOT remove the ClipboardSending handler
-  // registered on `this` in the constructor. Adding that removal is the leading candidate FIX
-  // for the 2026-07-28 clipboard-chunk storm (Server::removeClient clears ScreenShapeChanged /
-  // ClipboardGrabbed / ClipboardChanged but not ClipboardSending, and EventQueue::dispatchEvent
-  // resolves handlers by raw void*), and it is being kept OUT of this instrumentation on
-  // purpose: fixing and measuring in the same build would destroy the evidence that the fix is
-  // the right one. Restore the removal only as a reviewed change, not as a drive-by.
   if (ClipboardChunk::diagEnabled()) {
     LOG_NOTE(
-        "clipdiag: clientproxy1.6 DESTROYED: proxy=%p stream=%p name=\"%s\" (ClipboardSending handler NOT removed)",
-        static_cast<void *>(this), static_cast<void *>(getStream()), getName().c_str()
+        "clipdiag: clientproxy1.6 DESTROYED: proxy=%p stream=%p name=\"%s\"", static_cast<void *>(this),
+        static_cast<void *>(getStream()), getName().c_str()
     );
   }
 }
 
 void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
 {
+  // Every DECISION about whether to send is unchanged and stays exactly here: the dirty check, the
+  // dirty-clearing, the copy, the marshalling. Only the TRANSPORT below is different.
+  //
   // ignore if this clipboard is already clean
   if (m_clipboard[id].m_dirty) {
     // this clipboard is now clean
@@ -62,16 +72,74 @@ void ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard *clipboard)
     Clipboard::copy(&m_clipboard[id].m_clipboard, clipboard);
 
     std::string data = m_clipboard[id].m_clipboard.marshall();
+    const size_t size = data.size();
 
-    size_t size = data.size();
-    LOG_DEBUG("sending clipboard %d to \"%s\"", id, getName().c_str());
+    // The transport swap. This used to be StreamChunker::sendClipboard(), which queued the ENTIRE
+    // train onto the main connection as one event per chunk -- in front of the keepalives the
+    // client's 9-second death timer depends on. That is the wall-off loop this whole change exists
+    // to end, so there is deliberately NO in-stream fallback: a clipboard that cannot go by lane is
+    // dropped, loudly but harmlessly, rather than being allowed back onto the path that kills the
+    // KVM link.
+    //
+    // Clearing m_dirty above without waiting for delivery is intentional and safe: the lane keeps
+    // the LATEST payload per clipboard id until it goes out or is superseded, so a lane that comes
+    // up late still delivers current state rather than replaying history.
+    using SendResult = deskflow::ClipboardLaneManager::SendResult;
+    switch (getServer()->clipboardLane().send(getName(), id, std::move(data))) {
+    case SendResult::Queued:
+      LOG_DEBUG("sending clipboard %d to \"%s\" over the lane (%u bytes)", id, getName().c_str(),
+                static_cast<uint32_t>(size));
+      break;
 
-    StreamChunker::sendClipboard(data, size, id, 0, m_events, this);
+    case SendResult::TooLarge:
+      LOG_NOTE(
+          "not sending clipboard %d to \"%s\": %u bytes is over the configured limit", id, getName().c_str(),
+          static_cast<uint32_t>(size)
+      );
+      break;
+
+    case SendResult::NoLane:
+      // An older client, or a lane that is down or has not come up yet. Rate limited: see
+      // kNoLaneWarningInterval.
+      if (const double now = ARCH->time(); now - m_lastNoLaneWarning >= kNoLaneWarningInterval) {
+        m_lastNoLaneWarning = now;
+        LOG_WARN(
+            "clipboard %d not delivered to \"%s\": no clipboard lane (client is older than protocol "
+            "1.9, or its lane is down)",
+            id, getName().c_str()
+        );
+      }
+      break;
+    }
   }
+}
+
+void ClientProxy1_6::applyLaneClipboard(ClipboardID id, uint32_t seqNum, const std::string &data)
+{
+  if (id >= kClipboardEnd) {
+    return;
+  }
+
+  LOG_DEBUG("received client \"%s\" clipboard %d over the lane, seqnum=%d, size=%d", getName().c_str(), id, seqNum,
+            static_cast<int>(data.size()));
+
+  // Identical to recvClipboard()'s completion branch, on purpose -- same state, same event, so
+  // nothing downstream can behave differently depending on which transport carried the bytes.
+  m_clipboard[id].m_clipboard.unmarshall(data, 0);
+  m_clipboard[id].m_sequenceNumber = seqNum;
+
+  auto *info = new ClipboardInfo;
+  info->m_id = id;
+  info->m_sequenceNumber = seqNum;
+  m_events->addEvent(Event(EventTypes::ClipboardChanged, getEventTarget(), info));
 }
 
 bool ClientProxy1_6::recvClipboard()
 {
+  // LEGACY RECEIVE -- deliberately untouched. A pre-1.9 client still sends its clipboard in-stream,
+  // and a new server must keep understanding it; this is the half of the mixed-mesh story that
+  // continues to work in both directions.
+  //
   // parse message
   ClipboardID id;
   uint32_t seq;
