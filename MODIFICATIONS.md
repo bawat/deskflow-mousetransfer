@@ -1012,3 +1012,15 @@ in-process only (`MSWindowsDesks` derives its ids from `DESKFLOW_HOOK_LAST_MSG` 
 
 No behaviour changes for untagged input, for clients (the message is only posted by the primary's
 installed hook), or when nothing injects tagged moves.
+
+### Jump diagnostics: name the reason when a relayed delta teleports the client cursor (2026-08-09)
+
+**Files:** `src/lib/platform/MSWindowsScreen.h`, `MSWindowsScreen.cpp`
+
+Diagnostic only — no relayed behaviour changes. `onMouseMove` now keeps a small ring of the events
+that touch the delta reference (H = hardware motion processed, I = tagged-injection bookkeeping,
+W/C = the two warp saves, B = a bogus-zone drop) and, whenever a single relayed motion's delta
+exceeds 128 px on either axis (beyond any per-event mouse report; the class users see as the
+client's cursor "teleporting"), logs `MT-jumpdiag:` at INFO with the event, the saved reference it
+was computed against, and the ring with millisecond ages — enough to see which bookkeeping step
+went missing or stale. The delta is still relayed unchanged; the log is the whole feature.

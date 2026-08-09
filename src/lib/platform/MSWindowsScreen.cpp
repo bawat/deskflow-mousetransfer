@@ -549,6 +549,7 @@ void MSWindowsScreen::warpCursor(int32_t x, int32_t y)
   }
 
   // save position to compute delta of next motion
+  mtDiagPush('C', x, y); // Merged-fork jump diag
   saveMousePosition(x, y);
 }
 
@@ -954,6 +955,7 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
     // tagged moves it passes through). Keep the "last known position" honest so the next hardware
     // motion's delta does not include the injected displacement -- bookkeeping only, nothing is
     // sent to any client.
+    mtDiagPush('I', static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
     saveMousePosition(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
     return true;
 
@@ -962,6 +964,7 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
 
   case DESKFLOW_MSG_PRE_WARP: {
     // save position to compute delta of next motion
+    mtDiagPush('W', static_cast<int32_t>(wParam), static_cast<int32_t>(lParam)); // Merged-fork jump diag
     saveMousePosition(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
 
     // we warped the mouse.  discard events until we find the
@@ -1276,6 +1279,24 @@ bool MSWindowsScreen::onMouseButton(WPARAM wParam, LPARAM lParam)
 //      seems)
 //   5. sends the delta movement to the client (could be +1,+1 or -1,+4 for
 //   example)
+// Merged-fork: append one event to the jump-diagnostics ring (see MSWindowsScreen.h). Screen
+// thread only, O(1), no allocation.
+void MSWindowsScreen::mtDiagPush(char kind, int32_t x, int32_t y)
+{
+  MtDiagEvent &e = m_mtDiag[m_mtDiagNext];
+  e.kind = kind;
+  e.x = x;
+  e.y = y;
+  e.tick = GetTickCount();
+  m_mtDiagNext = (m_mtDiagNext + 1) % 8;
+}
+
+// Merged-fork: a single relayed hardware motion larger than this (either axis, px) is beyond any
+// per-event mouse report (even a violent flick at low polling rates stays under ~100 px/event)
+// and almost certainly means the delta reference was WRONG -- exactly the class the owner sees as
+// the viewer's cursor "teleporting". Diagnostic only: the delta is still relayed unchanged.
+static const int32_t kMtJumpDiagPx = 128;
+
 bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
 {
   // compute motion delta (relative to the last known
@@ -1284,6 +1305,32 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
   int32_t y = my - m_yCursor;
 
   LOG_DEBUG2("mouse move - motion delta: %+d=(%+d - %+d),%+d=(%+d - %+d)", x, mx, m_xCursor, y, my, m_yCursor);
+
+  // Merged-fork jump diagnostics: record the processed hardware event, and NAME THE REASON when
+  // a relayed delta is implausibly large for one motion. The dump carries the event, the saved
+  // reference it was computed against, and the ring of recent reference-touching events
+  // (H hardware / I tagged-injection / W,C warps / B bogus-drops) with ms ages -- enough to see
+  // WHICH bookkeeping step went missing or stale when the viewer's cursor jumps.
+  mtDiagPush('H', mx, my);
+  if (!m_isOnScreen && (x > kMtJumpDiagPx || x < -kMtJumpDiagPx || y > kMtJumpDiagPx || y < -kMtJumpDiagPx)) {
+    char ring[256];
+    int off = 0;
+    uint32_t now = GetTickCount();
+    for (int i = 0; i < 8; ++i) {
+      const MtDiagEvent &e = m_mtDiag[(m_mtDiagNext + i) % 8];
+      if (e.kind == 0 || off >= (int)sizeof(ring) - 32) {
+        continue;
+      }
+      off += snprintf(
+          ring + off, sizeof(ring) - off, " %c(%d,%d)@-%ums", e.kind, e.x, e.y, (unsigned)(now - e.tick)
+      );
+    }
+    ring[sizeof(ring) - 1] = '\0';
+    LOG_INFO(
+        "MT-jumpdiag: relaying delta %+d,%+d (event %d,%d vs saved %d,%d); recent:%s", x, y, mx, my, m_xCursor,
+        m_yCursor, ring
+    );
+  }
 
   // ignore if the mouse didn't move or if message posted prior
   // to last mark change.
@@ -1315,6 +1362,7 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
         -y + bogusZoneSize > m_yCenter - m_y || y + bogusZoneSize > m_y + m_h - m_yCenter) {
 
       LOG_DEBUG("dropped bogus delta motion: %+d,%+d", x, y);
+      mtDiagPush('B', x, y); // Merged-fork jump diag: a dropped delta is a stall the ring should show
     } else {
       // send motion
       sendEvent(EventTypes::PrimaryScreenMotionOnSecondary, MotionInfo::alloc(x, y));

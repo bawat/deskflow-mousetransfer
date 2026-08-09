@@ -225,6 +225,24 @@ private: // HACK
   // save last position of mouse to compute next delta movement
   void saveMousePosition(int32_t x, int32_t y);
 
+  // Merged-fork: JUMP DIAGNOSTICS (owner-requested 2026-08-09 -- "log the reason why" the
+  // client's cursor teleports). A ring of the recent events that touched the delta reference,
+  // dumped by onMouseMove whenever a relayed delta is implausibly large for one hardware motion.
+  // Kinds: H = hardware motion processed, I = tagged-injection bookkeeping (DESKFLOW_MSG_INJECT_AT),
+  // W = warpCursorNoFlush's PRE_WARP save, C = warpCursor's post-discard save, B = a delta the
+  // bogus-zone filter dropped. Fixed-size, member (never a shared static), written only on the
+  // screen thread.
+  struct MtDiagEvent
+  {
+    char kind = 0;
+    int32_t x = 0;
+    int32_t y = 0;
+    uint32_t tick = 0;
+  };
+  MtDiagEvent m_mtDiag[8];
+  int m_mtDiagNext = 0;
+  void mtDiagPush(char kind, int32_t x, int32_t y);
+
   // check if it is a modifier key repeating message
   bool isModifierRepeat(KeyModifierMask oldState, KeyModifierMask state, WPARAM wParam) const;
 
