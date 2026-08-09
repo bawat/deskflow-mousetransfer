@@ -19,10 +19,19 @@
 #define DESKFLOW_MSG_MOUSE_MOVE WM_APP + 0x0015   // x; y
 #define DESKFLOW_MSG_POST_WARP WM_APP + 0x0016    // <unused>; <unused>
 #define DESKFLOW_MSG_PRE_WARP WM_APP + 0x0017     // x; y
-#define DESKFLOW_MSG_SCREEN_SAVER WM_APP + 0x0018 // activated; <unused>
-#define DESKFLOW_MSG_DEBUG WM_APP + 0x0019        // data, data
+// Merged-fork: a TAGGED local injection (kDeskflowLocalInjectSignature) moved the physical
+// cursor to x;y. Bookkeeping only -- the screen must keep its "last known position" honest
+// (MSWindowsScreen::onMouseMove computes every relayed hardware delta against it), or the
+// displacement replays onto the client's cursor as a jump on the next real motion. Inside the
+// INPUT_FIRST..INPUT_LAST range ON PURPOSE: warpCursor()'s discard loop must flush a stale one
+// exactly like any other queued input message, because the warp re-saves the true position
+// itself. SCREEN_SAVER and DEBUG shift up one slot; every id is symbolic and in-process only
+// (MSWindowsDesks derives its own ids from DESKFLOW_HOOK_LAST_MSG, so they follow).
+#define DESKFLOW_MSG_INJECT_AT WM_APP + 0x0018    // x; y
+#define DESKFLOW_MSG_SCREEN_SAVER WM_APP + 0x0019 // activated; <unused>
+#define DESKFLOW_MSG_DEBUG WM_APP + 0x001a        // data, data
 #define DESKFLOW_MSG_INPUT_FIRST DESKFLOW_MSG_KEY
-#define DESKFLOW_MSG_INPUT_LAST DESKFLOW_MSG_PRE_WARP
+#define DESKFLOW_MSG_INPUT_LAST DESKFLOW_MSG_INJECT_AT
 #define DESKFLOW_HOOK_LAST_MSG DESKFLOW_MSG_DEBUG
 
 #define DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY VK_CANCEL

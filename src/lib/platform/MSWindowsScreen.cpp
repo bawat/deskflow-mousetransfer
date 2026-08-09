@@ -949,6 +949,14 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
   case DESKFLOW_MSG_MOUSE_MOVE:
     return onMouseMove(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
 
+  case DESKFLOW_MSG_INJECT_AT:
+    // Merged-fork: a TAGGED local injection moved the physical cursor (mouseLLHook posts this for
+    // tagged moves it passes through). Keep the "last known position" honest so the next hardware
+    // motion's delta does not include the injected displacement -- bookkeeping only, nothing is
+    // sent to any client.
+    saveMousePosition(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
+    return true;
+
   case DESKFLOW_MSG_MOUSE_WHEEL:
     return onMouseWheel(static_cast<int32_t>(lParam), static_cast<int32_t>(wParam));
 

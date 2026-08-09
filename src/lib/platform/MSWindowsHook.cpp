@@ -663,8 +663,18 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
     MSLLHOOKSTRUCT *info = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
 
     bool const injected = info->flags & LLMHF_INJECTED;
-    // Merged-fork: our own tagged injection goes to the local OS, not the client.
+    // Merged-fork: our own tagged injection goes to the local OS, not the client -- but a tagged
+    // MOVE still physically displaces the cursor, and the screen computes every relayed hardware
+    // delta against its saved "last known position" (MSWindowsScreen::onMouseMove, m_xCursor). A
+    // displacement the screen never hears about replays onto the client's cursor as a JUMP on the
+    // next real motion. So a tagged move also tells the screen where the cursor went -- pure
+    // bookkeeping, nothing is relayed -- which is what lets real input injected by the RDP window
+    // handoff (a viewer-driven scrollbar drag is a real button HELD across many relayed motions)
+    // coexist with live relaying.
     if (injected && info->dwExtraInfo == kDeskflowLocalInjectSignature) {
+      if (wParam == WM_MOUSEMOVE) {
+        PostThreadMessage(g_threadID, DESKFLOW_MSG_INJECT_AT, info->pt.x, info->pt.y);
+      }
       return CallNextHookEx(g_mouseLL, code, wParam, lParam);
     }
     if (!g_isPrimary && injected) {

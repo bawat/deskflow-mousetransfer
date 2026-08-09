@@ -987,3 +987,28 @@ nothing).
 
 No behaviour changes when the signal file does not exist — one `ifstream` open per 0.2 s tick while
 the cursor is away is the whole steady-state cost.
+
+### Tagged injected moves keep the relay's saved cursor position honest (2026-08-09)
+
+**Files:** `src/lib/platform/MSWindowsHook.h`, `MSWindowsHook.cpp`, `MSWindowsScreen.cpp`
+
+The local-inject passthrough (the first modification in this file) delivers a tagged event to the
+local OS and hides it from the relay — but a tagged MOUSE MOVE still physically displaces the
+cursor, and `MSWindowsScreen::onMouseMove` computes every relayed hardware delta against its saved
+"last known position" (`m_xCursor`/`m_yCursor`), which the hidden move left stale. The next real
+motion therefore relayed a delta that INCLUDED the injected displacement — the client's cursor
+jumped by (injected position − saved position). Harmless for the passthrough's original one-shot
+uses; fatal for the RDP window handoff's real input, where a viewer-driven drag is a real button
+HELD at a real position across many relayed motions (a Save As scrollbar drag teleported the
+viewer's own cursor on its first movement).
+
+Fix, pure bookkeeping: `mouseLLHook` now posts a new `DESKFLOW_MSG_INJECT_AT` (x; y) to the screen
+thread for every tagged move it passes through, and `onPreDispatchPrimary` answers it with
+`saveMousePosition` alone — nothing is relayed, nothing is warped. The new message sits INSIDE the
+`DESKFLOW_MSG_INPUT_FIRST..LAST` range on purpose, so `warpCursor()`'s discard loop flushes a stale
+one exactly like any other queued input message (the warp re-saves the true position itself);
+`SCREEN_SAVER` and `DEBUG` shift up one slot, which is safe because every id is symbolic and
+in-process only (`MSWindowsDesks` derives its ids from `DESKFLOW_HOOK_LAST_MSG` and follows).
+
+No behaviour changes for untagged input, for clients (the message is only posted by the primary's
+installed hook), or when nothing injects tagged moves.
