@@ -950,17 +950,37 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
   case DESKFLOW_MSG_MOUSE_MOVE:
     return onMouseMove(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
 
-  case DESKFLOW_MSG_INJECT_AT:
+  case DESKFLOW_MSG_INJECT_AT: {
     // Merged-fork: a TAGGED local injection moved the physical cursor (mouseLLHook posts this for
     // tagged moves it passes through). Keep the "last known position" honest so the next hardware
     // motion's delta does not include the injected displacement -- bookkeeping only, nothing is
     // sent to any client.
-    mtDiagPush('I', static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
-    saveMousePosition(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
+    //
+    // CLAMPED to the screen bounds: an absolute SendInput can NAME a point beyond the edge (the
+    // hook's pt for an injected move is the unclamped request -- an RDP-resized window can hang
+    // off-screen and the viewer aims at its off-screen pixels), but the OS pins the real cursor
+    // at the edge. Saving the request instead of the truth made every following hardware delta
+    // include the difference (measured 2026-08-09: injections aimed at x=2143 on a 1920 screen,
+    // -223 px teleports on the client). Same bounds the bogus filter reads (m_x/m_y/m_w/m_h).
+    int32_t ix = static_cast<int32_t>(wParam);
+    int32_t iy = static_cast<int32_t>(lParam);
+    if (ix < m_x) {
+      ix = m_x;
+    } else if (ix > m_x + m_w - 1) {
+      ix = m_x + m_w - 1;
+    }
+    if (iy < m_y) {
+      iy = m_y;
+    } else if (iy > m_y + m_h - 1) {
+      iy = m_y + m_h - 1;
+    }
+    mtDiagPush('I', ix, iy);
+    saveMousePosition(ix, iy);
     m_mtLastInjectTick = GetTickCount();
-    m_mtLastInjectX = static_cast<int32_t>(wParam);
-    m_mtLastInjectY = static_cast<int32_t>(lParam);
+    m_mtLastInjectX = ix;
+    m_mtLastInjectY = iy;
     return true;
+  }
 
   case DESKFLOW_MSG_MOUSE_WHEEL:
     return onMouseWheel(static_cast<int32_t>(lParam), static_cast<int32_t>(wParam));

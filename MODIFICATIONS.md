@@ -1063,3 +1063,14 @@ the LAST INJECTED point — where the eaten-events cursor actually is — so eve
 relays in full. Ordering is exact because `DESKFLOW_MSG_INJECT_AT` and `DESKFLOW_MSG_MOUSE_MOVE`
 arrive in hook order: the anchor at processing time is always the injection the cursor sat at when
 the motion was stamped. Non-injection relaying is untouched (warp + its own save, as always).
+
+### INJECT_AT saves the clamped truth, not the request (2026-08-09)
+
+**File:** `src/lib/platform/MSWindowsScreen.cpp`
+
+An absolute `SendInput` can name a point beyond the screen edge (an RDP-resized window can hang
+off-screen and the viewer aims at its off-screen pixels), but the OS pins the real cursor at the
+edge. The INJECT_AT bookkeeping saved the unclamped request, so every following hardware delta
+included the difference (measured: injections aimed at x=2143 on a 1920-wide screen produced
+−223 px client-cursor teleports). The handler now clamps the saved position to the screen bounds
+the bogus filter already reads.
