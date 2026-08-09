@@ -957,6 +957,7 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
     // sent to any client.
     mtDiagPush('I', static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
     saveMousePosition(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
+    m_mtLastInjectTick = GetTickCount();
     return true;
 
   case DESKFLOW_MSG_MOUSE_WHEEL:
@@ -1327,7 +1328,7 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     }
     ring[sizeof(ring) - 1] = '\0';
     LOG_INFO(
-        "MT-jumpdiag: relaying delta %+d,%+d (event %d,%d vs saved %d,%d); recent:%s", x, y, mx, my, m_xCursor,
+        "MT-jumpdiag: large delta %+d,%+d (event %d,%d vs saved %d,%d); recent:%s", x, y, mx, my, m_xCursor,
         m_yCursor, ring
     );
   }
@@ -1345,12 +1346,32 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     // motion on primary screen
     sendEvent(EventTypes::PrimaryScreenMotionOnPrimary, MotionInfo::alloc(m_xCursor, m_yCursor));
   } else {
+    // Merged-fork: while a TAGGED INJECTION STREAM owns the cursor (an RDP real drag: the shadow
+    // server re-positions the cursor along the viewer's drag path every few ms), the per-motion
+    // warp below FIGHTS it -- the cursor oscillates centre<->drag-position through the OS input
+    // pipeline, and hardware events get stamped against whichever writer won at their instant, so
+    // deltas of (drag position - centre) scale escape the bogus filter and land on the client as
+    // cursor TELEPORTS (measured live 2026-08-09: MT-jumpdiag ring "W(960,540) I(1918,88).. H
+    // stamped at the other writer's position", client jumps matching the leaked deltas to the
+    // pixel). Suppressing the warp collapses every reference into the drag neighbourhood, so an
+    // interleaving error is bounded by one injection step (a few px), not half a screen. The
+    // stream's end re-centres the cursor itself (the button-up's snap-home is a tagged move), and
+    // the suppression CANNOT STICK: it expires 100 ms after the last injection unless a REAL
+    // mouse button is still held (the drag), and even then 5 s after the last injection --
+    // GetAsyncKeyState is a cheap userland read, no shell-out, per relayed motion.
+    uint32_t mtSinceInject = GetTickCount() - m_mtLastInjectTick;
+    bool mtButtonHeld = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
+                        (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
+    bool mtInjectionStream = (m_mtLastInjectTick != 0) && (mtSinceInject < (mtButtonHeld ? 5000u : 100u));
+
     // the motion is on the secondary screen, so we warp mouse back to
     // center on the server screen. if we don't do this, then the mouse
     // will always try to return to the original entry point on the
     // secondary screen.
-    LOG_DEBUG2("centering cursor on motion: %+d,%+d", m_xCenter, m_yCenter);
-    warpCursorNoFlush(m_xCenter, m_yCenter);
+    if (!mtInjectionStream) {
+      LOG_DEBUG2("centering cursor on motion: %+d,%+d", m_xCenter, m_yCenter);
+      warpCursorNoFlush(m_xCenter, m_yCenter);
+    }
 
     // examine the motion.  if it's about the distance
     // from the center of the screen to an edge then

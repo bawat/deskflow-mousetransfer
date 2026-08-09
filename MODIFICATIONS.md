@@ -1024,3 +1024,23 @@ exceeds 128 px on either axis (beyond any per-event mouse report; the class user
 client's cursor "teleporting"), logs `MT-jumpdiag:` at INFO with the event, the saved reference it
 was computed against, and the ring with millisecond ages — enough to see which bookkeeping step
 went missing or stale. The delta is still relayed unchanged; the log is the whole feature.
+
+### Suppress the per-motion warp while a tagged injection stream owns the cursor (2026-08-09)
+
+**Files:** `src/lib/platform/MSWindowsScreen.h`, `MSWindowsScreen.cpp`
+
+The measured cause of the RDP handoff's remaining client-cursor teleports (MT-jumpdiag, same day):
+during a viewer-driven real drag the shadow server re-positions the cursor along the drag path with
+tagged injections every few ms, while `onMouseMove` warps it back to the screen centre after every
+relayed hardware motion. Two writers oscillate the cursor centre↔drag-position through the OS input
+pipeline, hardware events get stamped against whichever writer won at their instant, and deltas of
+(drag position − centre) scale escape the bogus-zone filter and reach the client as teleports —
+the client's recorded jumps matched the leaked deltas to the pixel.
+
+`onMouseMove` now skips the warp while a tagged injection stream is live: within 100 ms of the last
+`DESKFLOW_MSG_INJECT_AT`, extended to 5 s while a real mouse button is held (the drag), read with
+`GetAsyncKeyState` (cheap userland call, per relayed motion, no shell-out). With the warp silent,
+every reference stays in the drag neighbourhood, so an interleaving error is bounded by one
+injection step (a few px) rather than half a screen. The stream re-centres the cursor itself when
+it ends (the button-up's batch snap-homes with a tagged move), and the suppression cannot stick —
+both bounds expire on their own. Relaying itself is unchanged; only the warp is gated.

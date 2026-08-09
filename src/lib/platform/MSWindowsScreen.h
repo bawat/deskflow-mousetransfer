@@ -243,6 +243,11 @@ private: // HACK
   int m_mtDiagNext = 0;
   void mtDiagPush(char kind, int32_t x, int32_t y);
 
+  // Merged-fork: when the last DESKFLOW_MSG_INJECT_AT arrived (GetTickCount). While a tagged
+  // injection stream owns the cursor (an RDP real drag), onMouseMove suppresses its
+  // warp-to-centre -- see the comment there for the measured teleport the warp caused.
+  uint32_t m_mtLastInjectTick = 0;
+
   // check if it is a modifier key repeating message
   bool isModifierRepeat(KeyModifierMask oldState, KeyModifierMask state, WPARAM wParam) const;
 
