@@ -958,6 +958,8 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
     mtDiagPush('I', static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
     saveMousePosition(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
     m_mtLastInjectTick = GetTickCount();
+    m_mtLastInjectX = static_cast<int32_t>(wParam);
+    m_mtLastInjectY = static_cast<int32_t>(lParam);
     return true;
 
   case DESKFLOW_MSG_MOUSE_WHEEL:
@@ -1371,6 +1373,19 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     if (!mtInjectionStream) {
       LOG_DEBUG2("centering cursor on motion: %+d,%+d", m_xCenter, m_yCenter);
       warpCursorNoFlush(m_xCenter, m_yCenter);
+    } else {
+      // Merged-fork: the RELAY-mode hook EATS every hardware motion (the physical cursor never
+      // moves from hardware while relaying) -- each event's pt is just (current cursor + that
+      // event's own delta). The warp used to re-sync the saved position to the cursor after every
+      // event, which is the ONLY reason successive deltas came out right; with the warp suppressed
+      // the first motion after an injection relayed d1 but saved advanced to (anchor + d1) while
+      // the cursor STAYED at the anchor, so the next motion relayed d2 - d1 and steady hand motion
+      // cancelled itself to a crawl (owner: "a lot of resistance"; measured ~77 px/s during a
+      // fast drag, 2026-08-09). Re-anchor the saved position to where the cursor actually IS --
+      // the last injected point -- so every hardware delta relays in full. Ordering stays exact:
+      // INJECT_AT and MOUSE_MOVE arrive in hook order, so the anchor here is always the injection
+      // the cursor sat at when this motion was stamped.
+      saveMousePosition(m_mtLastInjectX, m_mtLastInjectY);
     }
 
     // examine the motion.  if it's about the distance

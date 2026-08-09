@@ -1044,3 +1044,22 @@ every reference stays in the drag neighbourhood, so an interleaving error is bou
 injection step (a few px) rather than half a screen. The stream re-centres the cursor itself when
 it ends (the button-up's batch snap-homes with a tagged move), and the suppression cannot stick —
 both bounds expire on their own. Relaying itself is unchanged; only the warp is gated.
+
+### Re-anchor the saved position during an injection stream (2026-08-09, completes the previous fix)
+
+**Files:** `src/lib/platform/MSWindowsScreen.h`, `MSWindowsScreen.cpp`
+
+The warp suppression above stopped the teleports and immediately revealed what else the warp had
+been doing: the RELAY-mode hook EATS every hardware motion (the physical cursor never moves from
+hardware while relaying — each event's pt is just current-cursor + that event's own delta), and the
+per-motion warp was what re-synced the saved position to the actual cursor so successive deltas
+came out right. With the warp suppressed, the first motion after an injection relayed d1 correctly
+but left `saved` advanced to (anchor + d1) while the cursor stayed at the anchor — so the next
+motion relayed d2 − d1, and a steady drag cancelled itself to a crawl (owner: "a lot of resistance
+to movement"; measured ~77 px/s tracking during a fast drag).
+
+Fix: while the injection stream is live, after relaying each motion, `saveMousePosition` back to
+the LAST INJECTED point — where the eaten-events cursor actually is — so every hardware delta
+relays in full. Ordering is exact because `DESKFLOW_MSG_INJECT_AT` and `DESKFLOW_MSG_MOUSE_MOVE`
+arrive in hook order: the anchor at processing time is always the injection the cursor sat at when
+the motion was stamped. Non-injection relaying is untouched (warp + its own save, as always).
