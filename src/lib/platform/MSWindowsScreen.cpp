@@ -1406,6 +1406,22 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
       // INJECT_AT and MOUSE_MOVE arrive in hook order, so the anchor here is always the injection
       // the cursor sat at when this motion was stamped.
       saveMousePosition(m_mtLastInjectX, m_mtLastInjectY);
+
+      // ... EXCEPT that SendInput's non-interleaving promise does NOT extend to how a concurrent
+      // HARDWARE event gets its position stamped. Measured (2026-08-09, wheel batches): the batch
+      // moves the cursor to the wheel point and snap-homes, and a hardware motion stamped AT THE
+      // WHEEL POINT is delivered AFTER the snap-home's INJECT_AT -- its delta against the home
+      // anchor is the whole injected displacement (-845 relayed, the owner's wheel teleport;
+      // drags never showed it because their injections track the cursor within pixels). During an
+      // injection stream an honest per-event hand delta is SMALL, so a delta of displacement
+      // scale is provably mis-stamped: drop it. The re-anchor above has already restored the
+      // truth for the next event, so the cost is one lost hand-motion event during a batch --
+      // invisible -- instead of a screen-scale jump.
+      if (x > kMtJumpDiagPx || x < -kMtJumpDiagPx || y > kMtJumpDiagPx || y < -kMtJumpDiagPx) {
+        LOG_DEBUG("dropped a mis-stamped injection-stream motion: %+d,%+d", x, y);
+        mtDiagPush('B', x, y);
+        return true;
+      }
     }
 
     // examine the motion.  if it's about the distance

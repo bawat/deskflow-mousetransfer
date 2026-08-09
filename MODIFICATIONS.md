@@ -1074,3 +1074,16 @@ edge. The INJECT_AT bookkeeping saved the unclamped request, so every following 
 included the difference (measured: injections aimed at x=2143 on a 1920-wide screen produced
 −223 px client-cursor teleports). The handler now clamps the saved position to the screen bounds
 the bogus filter already reads.
+
+### Drop mis-stamped hardware motions during an injection stream (2026-08-09)
+
+**File:** `src/lib/platform/MSWindowsScreen.cpp`
+
+SendInput's non-interleaving promise does not extend to how a concurrent hardware event gets its
+position stamped: a wheel batch (move to the point → wheel → snap home) can have a hardware motion
+stamped AT the wheel point yet delivered AFTER the snap-home's INJECT_AT, so its delta against the
+home anchor is the whole injected displacement (measured: −845 relayed; drags never showed it
+because their injections track the cursor within pixels). During an injection stream an honest
+per-event hand delta is small, so a delta of displacement scale is provably mis-stamped — it is
+dropped (ring kind 'B'), and the re-anchor has already restored the truth for the next event. Cost:
+one lost hand-motion event during a batch, instead of a screen-scale client-cursor jump.
