@@ -212,6 +212,15 @@ private:
   bool isDeskAccessible(const Desk *desk) const;
   void handleCheckDesk();
 
+  // MouseTransfer (RDP window handoff foreground hold): poll the wrapper's rdp-fg-hold file and
+  // keep the window it names foreground while the shared cursor is away. checkRdpFgHold runs on
+  // the event thread (piggybacked on handleCheckDesk's 0.2s timer, the same cadence the
+  // switchreq poll blessed); deskRdpFgHold does the actual foreground work on the desk thread,
+  // where deskLeave's own proven AttachThreadInput recipe lives. See deskRdpFgHold for why only
+  // this process can do it at all.
+  void checkRdpFgHold();
+  void deskRdpFgHold(Desk *desk, HWND hwnd);
+
   // EVENT_SYSTEM_DESKTOPSWITCH WinEvent callback: re-syncs key state on a desktop switch (the
   // event-driven fix for the Ctrl+Alt+Del / secure-desktop stuck-modifier). See enable().
   static void CALLBACK onDesktopSwitchEvent(
@@ -288,6 +297,16 @@ private:
 
   // options
   bool m_leaveForegroundOption;
+
+  // MouseTransfer (RDP window handoff foreground hold) — see checkRdpFgHold/deskRdpFgHold.
+  // m_fgHoldFile is the signal file's path (resolved once in enable()); m_fgHoldActive is the
+  // EVENT thread's view ("a hold is in force"), used to send the release exactly once;
+  // m_fgHoldHwnd is the DESK thread's state (the window currently held foreground), used to
+  // restore the hider on release and to keep deskLeave from saving the held window as the
+  // foreground-to-restore.
+  std::string m_fgHoldFile;
+  bool m_fgHoldActive = false;
+  HWND m_fgHoldHwnd = nullptr;
 
   IEventQueue *m_events;
 };

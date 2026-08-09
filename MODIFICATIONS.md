@@ -959,3 +959,31 @@ configured limit", since those are different numbers precisely when the ceiling 
 
 **No emitted `clipboardSharingSize` and no wrapper file was touched.** The operational knob (§12
 recommendation 1, 32 MB) remains the owner's decision.
+
+## RDP window handoff: hold an exported window foreground during viewer interaction (2026-08-09)
+
+`src/lib/platform/MSWindowsDesks.{h,cpp}`. The MouseTransfer wrapper exports a window over RDP to a
+peer (its "RDP window handoff" feature) and delivers the viewer's typing as `SendInput` tagged with
+the local-inject signature — real input, which the OS routes to the FOREGROUND thread's focus
+window. But while the shared cursor is away, `deskLeave` has made this core's own `DeskflowDesk`
+hider the foreground window (primary + low-level hooks), and the non-elevated wrapper cannot take
+foreground back from a LocalSystem+UIAccess-owned window: UIPI refuses the steal, so the viewer's
+keystrokes landed on the wrong window and typing appeared dead. Only this process can reliably
+reassign its own foreground, so it does.
+
+Mechanism (mirrors the switchreq file poll): the wrapper writes `<hwnd> <pid>` (both decimal; pid =
+the wrapper's own) to a signal file — `MOUSETRANSFER_RDPFGFILE`, else `rdp-fg-hold` relative to the
+CWD (the bundle dir) — while a viewer is interacting with that export, and deletes it when the
+episode ends. `checkRdpFgHold()`, piggybacked on the existing 0.2 s desk-check timer, honours the
+hold only while (a) the cursor is away (`m_isOnScreen` false), (b) the named window is alive, and
+(c) the WRITER process is alive (a crashed wrapper must not leave its export pinned). While all
+three hold, the desk thread (`deskRdpFgHold`, `DESKFLOW_MSG_RDP_FG_HOLD`) keeps that window
+foreground with deskLeave's own AttachThreadInput recipe, RE-ASSERTING each tick — a hold, not a
+one-shot. On release while still away (primary + low-level), the `DeskflowDesk` hider is put back
+in charge, leaving `desk->m_foregroundWindow` untouched so `deskEnter` still restores the window
+the user actually had foreground. `deskLeave` additionally refuses to save a held window as the
+foreground-to-restore (it is invisible; restoring it at enter would strand the user typing into
+nothing).
+
+No behaviour changes when the signal file does not exist — one `ifstream` open per 0.2 s tick while
+the cursor is away is the whole steady-state cost.

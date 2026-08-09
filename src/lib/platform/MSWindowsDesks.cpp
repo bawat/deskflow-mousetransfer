@@ -21,6 +21,8 @@
 #include "platform/MSWindowsHook.h"
 #include "platform/MSWindowsScreen.h"
 
+#include <cstdlib>
+#include <fstream>
 #include <malloc.h>
 
 // these are only defined when WINVER >= 0x0500
@@ -80,6 +82,8 @@
 #define DESKFLOW_MSG_FAKE_REL_MOVE DESKFLOW_HOOK_LAST_MSG + 11
 // enable; <unused>
 #define DESKFLOW_MSG_FAKE_INPUT DESKFLOW_HOOK_LAST_MSG + 12
+// MouseTransfer (RDP window handoff foreground hold): HWND to hold foreground (0 = release); <unused>
+#define DESKFLOW_MSG_RDP_FG_HOLD DESKFLOW_HOOK_LAST_MSG + 13
 
 static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
 {
@@ -154,6 +158,16 @@ void MSWindowsDesks::enable()
   // change but as far as i can tell it doesn't.
   m_timer = m_events->newTimer(0.2, nullptr);
   m_events->addHandler(EventTypes::Timer, m_timer, [this](const auto &) { handleCheckDesk(); });
+
+  // MouseTransfer (RDP window handoff foreground hold): resolve the signal file the wrapper
+  // writes. Same convention as the server's switchreq poll — an env override, else a well-known
+  // name relative to the CWD (the launcher sets the core's CWD to its bundle dir, where the
+  // wrapper writes its other core-facing files: coremode, switchreq, userquit).
+  if (const char *env = std::getenv("MOUSETRANSFER_RDPFGFILE"); env != nullptr && *env != '\0') {
+    m_fgHoldFile = env;
+  } else {
+    m_fgHoldFile = "rdp-fg-hold";
+  }
 
   // MouseTransfer fix (stuck-AltGr via Ctrl+Alt+Del / UAC secure desktop): get an EVENT-DRIVEN
   // notification of desktop switches and re-sync the key state on each one. The Secure Attention
@@ -609,6 +623,14 @@ void MSWindowsDesks::deskLeave(Desk *desk, HKL keyLayout)
     // need to disable the window on deskEnter.
     else {
       desk->m_foregroundWindow = getForegroundWindow();
+      // MouseTransfer (RDP window handoff foreground hold): never save the held export as the
+      // foreground-to-restore — it is an INVISIBLE window, and deskEnter restoring it would leave
+      // the user typing into nothing when the cursor comes home. Can only happen if a leave races
+      // the wrapper's own cursor-home clear of the hold file (the hold is normally released before
+      // any re-leave).
+      if (m_fgHoldHwnd != nullptr && desk->m_foregroundWindow == m_fgHoldHwnd) {
+        desk->m_foregroundWindow = nullptr;
+      }
       if (desk->m_foregroundWindow != nullptr) {
         EnableWindow(desk->m_window, TRUE);
         SetActiveWindow(desk->m_window);
@@ -778,6 +800,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
           DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY, DESKFLOW_HOOK_FAKE_INPUT_SCANCODE, msg.wParam ? 0 : KEYEVENTF_KEYUP
       );
       break;
+
+    case DESKFLOW_MSG_RDP_FG_HOLD:
+      deskRdpFgHold(desk, reinterpret_cast<HWND>(msg.wParam));
+      break;
     }
 
     // notify that message was processed
@@ -907,6 +933,119 @@ void MSWindowsDesks::handleCheckDesk()
     BOOL running;
     SystemParametersInfo(SPI_GETSCREENSAVERRUNNING, 0, &running, FALSE);
     PostThreadMessage(m_threadID, DESKFLOW_MSG_SCREEN_SAVER, running, 0);
+  }
+
+  // MouseTransfer (RDP window handoff foreground hold) — same 0.2s cadence, negligible cost
+  // beside checkDesk()'s OpenInputDesktop.
+  checkRdpFgHold();
+}
+
+// MouseTransfer (RDP window handoff foreground hold), the event-thread half.
+//
+// WHY: the wrapper exports a window over RDP and delivers the viewer's typing as tagged
+// SendInput — real input, which lands on the FOREGROUND thread's focus window. While the shared
+// cursor is away this core's own deskLeave has made the DeskflowDesk hider the foreground window,
+// and the wrapper (non-elevated) cannot take foreground back from a LocalSystem+UIAccess-owned
+// window (UIPI refuses the steal — measured live, owner round 10N/10P: "typing dies"). Only THIS
+// process can reliably reassign it, and while the hider is foreground it is trivially allowed to
+// (the foreground process may always give foreground away).
+//
+// CONTRACT: the wrapper writes "<hwnd> <pid>" (both decimal; pid = the wrapper's own) to the
+// signal file while a viewer is interacting with that export, and deletes the file when the
+// episode ends. The hold is honoured only while (a) the cursor is away (m_isOnScreen false — the
+// wrapper's own cursor-home gate clears the file first, this is the backstop), (b) the named
+// window is alive, and (c) the WRITER is alive — a wrapper that crashed mid-episode must not
+// leave its export pinned foreground (PID reuse could defeat (c) in principle, but the hold also
+// requires (a) and (b), and the wrapper clears the file in every orderly path).
+//
+// The re-assert is the point: this runs every 0.2s and re-takes the foreground whenever something
+// else has it, which is what makes the hold a HOLD rather than deskLeave's one-shot steal.
+void MSWindowsDesks::checkRdpFgHold()
+{
+  HWND want = nullptr;
+  if (!m_isOnScreen && !m_fgHoldFile.empty()) {
+    std::ifstream in(m_fgHoldFile);
+    unsigned long long hwndVal = 0;
+    unsigned long long pidVal = 0;
+    if (in && (in >> hwndVal >> pidVal) && hwndVal != 0 && pidVal != 0) {
+      HWND hwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(hwndVal));
+      if (IsWindow(hwnd)) {
+        // Writer liveness: SYNCHRONIZE is enough to wait, and a signaled process object means
+        // the wrapper is gone. One OpenProcess per tick, only while a hold file exists.
+        if (HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pidVal))) {
+          if (WaitForSingleObject(proc, 0) == WAIT_TIMEOUT) {
+            want = hwnd;
+          }
+          CloseHandle(proc);
+        }
+      }
+    }
+  }
+
+  if (want != nullptr) {
+    m_fgHoldActive = true;
+    // Only bother the desk thread when the hold is not already satisfied.
+    if (GetForegroundWindow() != want) {
+      sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(want), 0);
+    }
+  } else if (m_fgHoldActive) {
+    m_fgHoldActive = false;
+    sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, 0, 0);
+  }
+}
+
+// MouseTransfer (RDP window handoff foreground hold), the desk-thread half. Mirrors deskLeave's
+// proven AttachThreadInput + SetForegroundWindow recipe — the desk thread is where that recipe
+// already runs, so the hold has exactly the same thread semantics as the steal it overrides.
+void MSWindowsDesks::deskRdpFgHold(Desk *desk, HWND hwnd)
+{
+  if (hwnd != nullptr) {
+    if (!IsWindow(hwnd)) {
+      return;
+    }
+    if (m_fgHoldHwnd != hwnd) {
+      LOG_DEBUG("rdp fg-hold: holding window 0x%08x foreground for viewer input", hwnd);
+    }
+    m_fgHoldHwnd = hwnd;
+    HWND fg = GetForegroundWindow();
+    if (fg == hwnd) {
+      return;
+    }
+    DWORD thisThread =
+        (desk->m_window != nullptr) ? GetWindowThreadProcessId(desk->m_window, nullptr) : GetCurrentThreadId();
+    DWORD thatThread = (fg != nullptr) ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    if (thatThread != 0 && thatThread != thisThread) {
+      AttachThreadInput(thatThread, thisThread, TRUE);
+    }
+    SetForegroundWindow(hwnd);
+    if (thatThread != 0 && thatThread != thisThread) {
+      AttachThreadInput(thatThread, thisThread, FALSE);
+    }
+  } else {
+    if (m_fgHoldHwnd == nullptr) {
+      return;
+    }
+    LOG_DEBUG("rdp fg-hold: released");
+    m_fgHoldHwnd = nullptr;
+    // Put the hider back in charge if we are still away and deskLeave would have held it —
+    // primary + low-level hooks is the one case deskLeave grabs foreground (so relayed keyboard
+    // state isn't mangled by whatever app is foreground; see deskLeave's own comment). The
+    // pre-leave foreground saved in desk->m_foregroundWindow is deliberately untouched: deskEnter
+    // still restores the window the USER had foreground before the leave.
+    if (!m_isOnScreen && m_isPrimary && desk->m_lowLevel && desk->m_window != nullptr) {
+      EnableWindow(desk->m_window, TRUE);
+      SetActiveWindow(desk->m_window);
+      HWND fg = GetForegroundWindow();
+      DWORD thisThread = GetWindowThreadProcessId(desk->m_window, nullptr);
+      DWORD thatThread = (fg != nullptr) ? GetWindowThreadProcessId(fg, nullptr) : 0;
+      if (thatThread != 0 && thatThread != thisThread) {
+        AttachThreadInput(thatThread, thisThread, TRUE);
+      }
+      SetForegroundWindow(desk->m_window);
+      if (thatThread != 0 && thatThread != thisThread) {
+        AttachThreadInput(thatThread, thisThread, FALSE);
+      }
+    }
   }
 }
 
