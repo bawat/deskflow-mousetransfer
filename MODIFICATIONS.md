@@ -333,6 +333,34 @@ Surfacing it on stdout (which the wrapper already tails as a black box) gives th
 release signal; the server then drives the drop to the active-screen peer over its own control
 channel. Verified live .12/.18/.65: the `.12→.65` cross-client drop lands on the first release.
 
+### Core->wrapper event push (loopback UDP) + stdout flush (2026-08-10)
+
+`ConsoleLogOutputter::write` (`src/lib/base/LogOutputters.cpp`) now, on **Windows only**:
+
+1. `fflush(stdout)` / `fflush(stderr)` after the existing `std::cout.flush()`, and
+2. fire-and-forget sends the **verbatim log line** over a loopback UDP datagram to
+   `127.0.0.1:24820` whenever the line carries one of four latency-sensitive transition
+   markers: `entering screen`, `leaving screen`, `switch from "` or `mousetransfer lbutton up`.
+
+**Additive only — no behaviour change to the KVM path, and no new log output.** A small
+anonymous-namespace helper (guarded by `#if defined(_WIN32)`) owns one process-lifetime
+non-blocking UDP socket; the needle set is exactly the substrings the wrapper's own log
+classifier keys on. The port is fixed (env override `MOUSETRANSFER_CORENOTIFY_PORT` for
+emergencies, must match on both sides). `winsock2.h`/`ws2tcpip.h` are included at the very top
+of the file (before `arch/Arch.h`, which can pull in `windows.h`) to avoid the winsock1/2 clash;
+`ws2_32.lib` is linked via `#pragma comment`.
+
+Why: the MouseTransfer wrapper learns that the shared cursor has crossed a seam (and sees the
+left-button-up drop marker) by watching this core's stdout. When the core runs **elevated**
+(LocalSystem) its stdout is redirected to `coreout.log`, which the CRT block-buffers, and the
+wrapper reads it back with a tailing poll — together adding variable, sometimes-large latency
+that has broken drag handoffs with a few-hundred-ms freshness window (an RDP window-drag handoff
+missed its 400 ms latch because `leaving screen` arrived late). The push gives the wrapper the
+same events **event-driven** (it blocks on the socket, no poll); the `fflush` independently keeps
+the existing log-tail timely as a fallback. Both are pure **process-boundary** emits — a datagram
+and a file write — so nothing links the wrapper to this GPL core. The wrapper de-duplicates by
+line, so an older wrapper (log-tail only) or a lost datagram still works via the tail.
+
 ### Re-sync key state on screen transition (fix chronic stuck-AltGr / stuck modifier) (2026-06-28)
 
 `MSWindowsScreen::enter()` and `::leave()` (`src/lib/platform/MSWindowsScreen.cpp`) now call

@@ -7,8 +7,23 @@
  */
 
 #include "base/LogOutputters.h"
+
+#if defined(_WIN32)
+// winsock2.h MUST be included before any windows.h (which arch/Arch.h can pull in
+// transitively) or the old winsock.h gets dragged in first and clashes. Included here,
+// at the very top, purely for the MouseTransfer core->wrapper low-latency event push
+// implemented in ConsoleLogOutputter::write below (a loopback UDP datagram — a pure
+// process-boundary emit, no linking against the wrapper). See MODIFICATIONS.md.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
 #include "arch/Arch.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 #include <QFile>
@@ -16,6 +31,100 @@
 #include <QTextStream>
 
 constexpr auto s_logFileSizeLimit = 1024 * 1024; //!< Max Log size before rotating (1Mb)
+
+// ---------------------------------------------------------------------------
+// MouseTransfer core->wrapper low-latency event push (Windows only)
+//
+// The MouseTransfer wrapper learns about the shared cursor crossing a seam (and the
+// left-button-up drop marker) by watching this core's stdout. When the core runs
+// ELEVATED (LocalSystem) its stdout is REDIRECTED to a file (coreout.log) which the CRT
+// block-buffers, and the wrapper reads it back with a tailing poll — together adding
+// variable, sometimes-large latency that has broken drag handoffs whose freshness window
+// is a few hundred ms.
+//
+// This adds a PUSH beside the existing log: the instant one of the latency-sensitive
+// transition lines is logged, we fire-and-forget a tiny loopback UDP datagram carrying the
+// VERBATIM log line to a fixed 127.0.0.1 port. The wrapper BLOCKS on that socket (no poll)
+// and parses the datagram with the exact same line classifier it already uses for the log,
+// so the two paths are interchangeable and the log-tail remains a complete fallback for an
+// older wrapper/core or a lost datagram (the wrapper de-duplicates by line).
+//
+// This is a pure PROCESS-BOUNDARY emit — a datagram, like writing a log line — so no GPL
+// code enters the wrapper and nothing links across the boundary. See MODIFICATIONS.md
+// "Core->wrapper event push (loopback UDP) + stdout flush".
+#if defined(_WIN32)
+namespace {
+
+// mtNotifyPort is the fixed loopback UDP port the wrapper listens on. It sits in the
+// MouseTransfer port block (Deskflow 24800, dev-update 24810, control 24811, audio 24812,
+// screen 24815, mtfs 24816, browser-bridge 24817, PiP 24818, discord 24819) — core-notify
+// is 24820. MUST match the wrapper's coreNotifyDefaultPort. The env override is an
+// emergency escape hatch only and MUST be set identically on both sides.
+unsigned short mtNotifyPort()
+{
+  static const unsigned short port = [] {
+    if (const char *e = std::getenv("MOUSETRANSFER_CORENOTIFY_PORT")) {
+      const int v = std::atoi(e);
+      if (v > 0 && v < 65536) {
+        return static_cast<unsigned short>(v);
+      }
+    }
+    return static_cast<unsigned short>(24820);
+  }();
+  return port;
+}
+
+// mtNotifySocket lazily creates the one process-lifetime non-blocking UDP socket used for
+// the push. WSAStartup is refcounted/idempotent (the core already uses Winsock elsewhere,
+// but we must not depend on its init order); we never WSACleanup — the socket lives for the
+// whole process. Returns INVALID_SOCKET if the socket could not be created, in which case
+// every push is silently skipped (the log-tail fallback still works).
+SOCKET mtNotifySocket()
+{
+  static const SOCKET sock = [] {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+      return static_cast<SOCKET>(INVALID_SOCKET);
+    }
+    // Non-blocking: a full send buffer must never stall the log mutex this runs under.
+    u_long nonblocking = 1;
+    ioctlsocket(s, FIONBIO, &nonblocking);
+    return s;
+  }();
+  return sock;
+}
+
+// mtMaybePushEvent sends line verbatim over loopback UDP iff it carries one of the four
+// latency-sensitive transition markers the wrapper routes event-driven. The needle set is
+// exactly the substrings the wrapper's own log classifier keys on, so the push and the log
+// carry identical information. Fire-and-forget: any sendto error (no listener yet, buffer
+// full) is ignored — the wrapper's log tail is the fallback.
+void mtMaybePushEvent(const char *line)
+{
+  if (line == nullptr) {
+    return;
+  }
+  if (std::strstr(line, "leaving screen") == nullptr && std::strstr(line, "entering screen") == nullptr &&
+      std::strstr(line, "switch from \"") == nullptr && std::strstr(line, "mousetransfer lbutton up") == nullptr) {
+    return;
+  }
+  const SOCKET s = mtNotifySocket();
+  if (s == INVALID_SOCKET) {
+    return;
+  }
+  sockaddr_in addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(mtNotifyPort());
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 — local only, no external sender can reach it
+  const size_t len = strnlen(line, 2048);
+  sendto(s, line, static_cast<int>(len), 0, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
+}
+
+} // namespace
+#endif // _WIN32
 
 //
 // StopLogOutputter
@@ -57,6 +166,19 @@ bool ConsoleLogOutputter::write(LogLevel level, const QString &msg)
   else
     std::cout << qPrintable(msg) << std::endl;
   std::cout.flush();
+#if defined(_WIN32)
+  // MouseTransfer: when this core's stdout is REDIRECTED to a file (the elevated LocalSystem
+  // case), the CRT full-buffers it, so std::cout.flush() above can still leave the line sitting
+  // in the C stdio buffer — unseen by the wrapper's log tail for a variable, sometimes-large
+  // time. Drain it now so the log-tail FALLBACK stays timely. Cheap: same per-line cadence the
+  // existing flush already pays.
+  fflush(stdout);
+  fflush(stderr);
+  // ...and PUSH the latency-sensitive transition events (verbatim line) over the loopback event
+  // channel, so the wrapper receives them event-driven rather than via the slow tail. No-op for
+  // any line that isn't one of the tracked transitions. See the notifier block above.
+  mtMaybePushEvent(qPrintable(msg));
+#endif
   return true;
 }
 
