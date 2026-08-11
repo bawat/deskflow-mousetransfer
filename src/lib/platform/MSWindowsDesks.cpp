@@ -993,10 +993,21 @@ void MSWindowsDesks::checkRdpFgHold()
   }
 
   if (want != nullptr) {
+    // MouseTransfer: follow a modal OWNED dialog. If the held export window (an app like Notepad)
+    // has an active owned pop-up -- a Save As dialog and the like -- THAT is the window Windows
+    // treats as foreground, and it is shown on the far side as its own crop. Holding the OWNER would
+    // fight the dialog for foreground on every 0.2s tick, so the dialog can never keep focus
+    // (owner-reported: "Save As acquires focus for a second, then Notepad steals it back").
+    // GetLastActivePopup returns the dialog when one is up, else the window itself, so the hold
+    // tracks whichever window the viewer's input is actually meant to reach.
+    HWND active = want;
+    if (HWND pop = GetLastActivePopup(want); pop != nullptr && pop != want && IsWindow(pop)) {
+      active = pop;
+    }
     m_fgHoldActive = true;
     // Only bother the desk thread when the hold is not already satisfied.
-    if (GetForegroundWindow() != want) {
-      sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(want), 0);
+    if (GetForegroundWindow() != active) {
+      sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
     }
   } else if (m_fgHoldActive) {
     m_fgHoldActive = false;

@@ -1135,3 +1135,17 @@ substitutes that park for the screen centre in `leave()` and in `onMouseMove`'s 
 wherever the cursor actually rests. With no park published (any non-handoff moment) behaviour is
 byte-for-byte the stock centre-warp. The wrapper keeps the park off every window it streams and with
 enough edge margin that a single hand-motion delta never clamps or trips the bogus guard.
+
+### RDP window handoff: fg-hold follows a modal owned dialog (2026-08-11)
+
+**File:** `src/lib/platform/MSWindowsDesks.cpp`
+
+`checkRdpFgHold` re-asserts the exported window's foreground every 0.2s so the viewer's injected
+input reaches it. But the wrapper writes the *export* window (e.g. Notepad) to `rdp-fg-hold`, so
+when that app opens a modal OWNED dialog (Save As), the hold fought the dialog for foreground every
+tick — the dialog is shown on the far side as its own crop but could never keep focus
+(owner-reported: "Save As acquires focus for a second, then Notepad steals it back"). The assertion
+now resolves the held window through `GetLastActivePopup`, which returns the active owned pop-up when
+one is up and the window itself otherwise, so the hold tracks whichever window Windows actually
+treats as foreground. Robust to which hwnd the file names (owner or dialog both resolve to the
+dialog), and a no-op when there is no pop-up.
