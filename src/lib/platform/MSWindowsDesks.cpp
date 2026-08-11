@@ -169,6 +169,13 @@ void MSWindowsDesks::enable()
     m_fgHoldFile = "rdp-fg-hold";
   }
 
+  // MouseTransfer (RDP adaptive cursor park): the sibling signal file, resolved the same way.
+  if (const char *env = std::getenv("MOUSETRANSFER_RDPPARKFILE"); env != nullptr && *env != '\0') {
+    m_rdpParkFile = env;
+  } else {
+    m_rdpParkFile = "rdp-park";
+  }
+
   // MouseTransfer fix (stuck-AltGr via Ctrl+Alt+Del / UAC secure desktop): get an EVENT-DRIVEN
   // notification of desktop switches and re-sync the key state on each one. The Secure Attention
   // Sequence routes the Ctrl+Alt key-UP to the Winlogon secure desktop, which our low-level hook
@@ -938,6 +945,9 @@ void MSWindowsDesks::handleCheckDesk()
   // MouseTransfer (RDP window handoff foreground hold) — same 0.2s cadence, negligible cost
   // beside checkDesk()'s OpenInputDesktop.
   checkRdpFgHold();
+
+  // MouseTransfer (RDP adaptive cursor park) — same cadence, same one-file-read cost.
+  checkRdpPark();
 }
 
 // MouseTransfer (RDP window handoff foreground hold), the event-thread half.
@@ -992,6 +1002,49 @@ void MSWindowsDesks::checkRdpFgHold()
     m_fgHoldActive = false;
     sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, 0, 0);
   }
+}
+
+// MouseTransfer (RDP adaptive cursor park). Read the point the wrapper wants the away cursor to
+// rest at (off the window it is streaming over RDP) and publish it for MSWindowsScreen's warp path.
+// No foreground/desk work — this only stores a value, so unlike checkRdpFgHold there is no
+// desk-thread half. Honoured only while the cursor is AWAY (m_isOnScreen false) and the writer is
+// alive; otherwise "no park" is published and the warp falls back to the screen centre. The file is
+// "<x> <y> <pid>" (decimal, x/y signed virtual-screen coords), the same shape and liveness rule as
+// rdp-fg-hold. Running purely on the event thread; getRdpPark on the hook thread reads the atomic.
+void MSWindowsDesks::checkRdpPark()
+{
+  uint64_t packed = UINT64_MAX; // no park
+  if (!m_isOnScreen && !m_rdpParkFile.empty()) {
+    std::ifstream in(m_rdpParkFile);
+    long long x = 0, y = 0;
+    unsigned long long pidVal = 0;
+    if (in && (in >> x >> y >> pidVal) && pidVal != 0) {
+      // Writer liveness, exactly as checkRdpFgHold: a signaled process object means the wrapper is
+      // gone and its park is stale — fall back to the centre. One OpenProcess per tick, only while a
+      // park file exists.
+      if (HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pidVal))) {
+        if (WaitForSingleObject(proc, 0) == WAIT_TIMEOUT) {
+          packed = (static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(x))) << 32) |
+                   static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(y)));
+        }
+        CloseHandle(proc);
+      }
+    }
+  }
+  m_rdpPark.store(packed, std::memory_order_relaxed);
+}
+
+// MouseTransfer (RDP adaptive cursor park): hand the published park to the warp path. Returns false
+// (leaving x/y untouched) when no park is active, so the caller keeps the screen centre.
+bool MSWindowsDesks::getRdpPark(int32_t &x, int32_t &y) const
+{
+  const uint64_t v = m_rdpPark.load(std::memory_order_relaxed);
+  if (v == UINT64_MAX) {
+    return false;
+  }
+  x = static_cast<int32_t>(static_cast<uint32_t>(v >> 32));
+  y = static_cast<int32_t>(static_cast<uint32_t>(v & 0xFFFFFFFFULL));
+  return true;
 }
 
 // MouseTransfer (RDP window handoff foreground hold), the desk-thread half. Mirrors deskLeave's

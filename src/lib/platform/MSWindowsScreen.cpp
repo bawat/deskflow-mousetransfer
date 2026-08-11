@@ -293,8 +293,13 @@ void MSWindowsScreen::leave()
   m_desks->leave(m_keyLayout);
 
   if (m_isPrimary) {
-    LOG_DEBUG1("centering cursor on leave: %+d, %+d", m_xCenter, m_yCenter);
-    warpCursor(m_xCenter, m_yCenter);
+    // MouseTransfer (RDP adaptive cursor park): rest at the wrapper's off-window park if it has one,
+    // else the screen centre. Best-effort at leave (the park may not be published for the first few
+    // hundred ms); onMouseMove re-centres to the park on the next motion regardless.
+    int32_t cx, cy;
+    rdpWarpCentre(cx, cy);
+    LOG_DEBUG1("centering cursor on leave: %+d, %+d", cx, cy);
+    warpCursor(cx, cy);
 
     // disable special key sequences on win95 family
     enableSpecialKeys(false);
@@ -535,6 +540,21 @@ void MSWindowsScreen::reconfigure(uint32_t activeSides)
 uint32_t MSWindowsScreen::activeSides()
 {
   return m_hook.getSides();
+}
+
+void MSWindowsScreen::rdpWarpCentre(int32_t &cx, int32_t &cy) const
+{
+  // MouseTransfer (RDP adaptive cursor park): default to the screen centre; if the wrapper has
+  // published an off-window park (only while a handoff is live and the cursor is away), use it.
+  cx = m_xCenter;
+  cy = m_yCenter;
+  if (m_desks != nullptr) {
+    int32_t px = 0, py = 0;
+    if (m_desks->getRdpPark(px, py)) {
+      cx = px;
+      cy = py;
+    }
+  }
 }
 
 void MSWindowsScreen::warpCursor(int32_t x, int32_t y)
@@ -1390,9 +1410,14 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     // center on the server screen. if we don't do this, then the mouse
     // will always try to return to the original entry point on the
     // secondary screen.
+    // MouseTransfer (RDP adaptive cursor park): the rest point is the wrapper's off-window park while
+    // a handoff is live, else the screen centre. The bogus-delta guard below MUST use the same point,
+    // so the usable-delta room is measured from wherever the cursor actually rests.
+    int32_t cx, cy;
+    rdpWarpCentre(cx, cy);
     if (!mtInjectionStream) {
-      LOG_DEBUG2("centering cursor on motion: %+d,%+d", m_xCenter, m_yCenter);
-      warpCursorNoFlush(m_xCenter, m_yCenter);
+      LOG_DEBUG2("centering cursor on motion: %+d,%+d", cx, cy);
+      warpCursorNoFlush(cx, cy);
     } else {
       // Merged-fork: the RELAY-mode hook EATS every hardware motion (the physical cursor never
       // moves from hardware while relaying) -- each event's pt is just (current cursor + that
@@ -1430,8 +1455,8 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     // ignore (see warpCursorNoFlush() for a further
     // description).
     static int32_t bogusZoneSize = 10;
-    if (-x + bogusZoneSize > m_xCenter - m_x || x + bogusZoneSize > m_x + m_w - m_xCenter ||
-        -y + bogusZoneSize > m_yCenter - m_y || y + bogusZoneSize > m_y + m_h - m_yCenter) {
+    if (-x + bogusZoneSize > cx - m_x || x + bogusZoneSize > m_x + m_w - cx ||
+        -y + bogusZoneSize > cy - m_y || y + bogusZoneSize > m_y + m_h - cy) {
 
       LOG_DEBUG("dropped bogus delta motion: %+d,%+d", x, y);
       mtDiagPush('B', x, y); // Merged-fork jump diag: a dropped delta is a stall the ring should show

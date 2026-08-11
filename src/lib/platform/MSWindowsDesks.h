@@ -13,6 +13,8 @@
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
 
+#include <atomic>
+#include <cstdint>
 #include <map>
 #include <string>
 
@@ -112,6 +114,12 @@ public:
   This tells the desks that the display size has changed.
   */
   void setShape(int32_t x, int32_t y, int32_t width, int32_t height, int32_t xCenter, int32_t yCenter, bool isMultimon);
+
+  // MouseTransfer (RDP adaptive cursor park): hand the wrapper-published off-window rest point to
+  // MSWindowsScreen's warp path. Returns false (x/y untouched) when no park is active, so the caller
+  // keeps the screen centre. Public because MSWindowsScreen calls it; the poll that fills it
+  // (checkRdpPark) stays private. Thread-safe (a single lock-free atomic).
+  bool getRdpPark(int32_t &x, int32_t &y) const;
 
   //! Install/uninstall screensaver hooks
   /*!
@@ -221,6 +229,16 @@ private:
   void checkRdpFgHold();
   void deskRdpFgHold(Desk *desk, HWND hwnd);
 
+  // MouseTransfer (RDP window handoff — ADAPTIVE CURSOR PARK): poll the wrapper's rdp-park file and
+  // publish the point the shared cursor should REST at while it is away on a client, so it does not
+  // sit on top of the window the origin is streaming over RDP (which the wrapper positioned it off
+  // of). Same file+liveness convention as checkRdpFgHold, same 0.2s handleCheckDesk cadence.
+  // getRdpPark hands the current park (if any) to MSWindowsScreen, which substitutes it for the
+  // screen centre in leave()/onMouseMove()'s warp-and-recentre — see MSWindowsScreen::rdpWarpCentre.
+  // Storage is a single lock-free atomic (packed x:y, UINT64_MAX = unset) because checkRdpPark runs
+  // on the event thread and getRdpPark is read from the primary hook path on another thread.
+  void checkRdpPark();
+
   // EVENT_SYSTEM_DESKTOPSWITCH WinEvent callback: re-syncs key state on a desktop switch (the
   // event-driven fix for the Ctrl+Alt+Del / secure-desktop stuck-modifier). See enable().
   static void CALLBACK onDesktopSwitchEvent(
@@ -307,6 +325,14 @@ private:
   std::string m_fgHoldFile;
   bool m_fgHoldActive = false;
   HWND m_fgHoldHwnd = nullptr;
+
+  // MouseTransfer (RDP adaptive cursor park) — see checkRdpPark/getRdpPark. m_rdpParkFile is the
+  // signal file's path (resolved once in enable(), beside m_fgHoldFile); m_rdpPark is the published
+  // park, packed as (uint32(x) << 32 | uint32(y)), with UINT64_MAX meaning "no park — use the screen
+  // centre". A computed off-window park is never exactly (-1,-1), so it can never collide with the
+  // sentinel. Written only by checkRdpPark (event thread), read only by getRdpPark (hook thread).
+  std::string m_rdpParkFile;
+  std::atomic<uint64_t> m_rdpPark{UINT64_MAX};
 
   IEventQueue *m_events;
 };

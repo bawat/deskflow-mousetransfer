@@ -1115,3 +1115,23 @@ because their injections track the cursor within pixels). During an injection st
 per-event hand delta is small, so a delta of displacement scale is provably mis-stamped — it is
 dropped (ring kind 'B'), and the re-anchor has already restored the truth for the next event. Cost:
 one lost hand-motion event during a batch, instead of a screen-scale client-cursor jump.
+
+### RDP window handoff: adaptive cursor park (2026-08-11)
+
+**Files:** `src/lib/platform/MSWindowsDesks.{h,cpp}`, `src/lib/platform/MSWindowsScreen.{h,cpp}`
+
+While the shared cursor is away on a client, the primary parks its own cursor at the screen centre
+(`m_xCenter/m_yCenter`) and relays hand motion as deltas measured from there (the low-level hook
+eats hardware motion, so the physical cursor never budges — see `onMouseMove`). During an RDP window
+handoff that centre sits **on top of** the window being streamed to the far side, so the streamed
+source cursor is drawn over the content and its hover highlights the wrong element.
+
+The wrapper now publishes an off-window rest point in a sibling signal file, `rdp-park`
+(`"<x> <y> <pid>"`, decimal, same liveness rule as `rdp-fg-hold`). `MSWindowsDesks::checkRdpPark`
+polls it on the existing 0.2 s `handleCheckDesk` cadence — only while the cursor is away and the
+writer is alive — into one lock-free atomic (`getRdpPark`). `MSWindowsScreen::rdpWarpCentre`
+substitutes that park for the screen centre in `leave()` and in `onMouseMove`'s warp-and-recentre,
+**and the bogus-delta guard uses the same point**, so the usable-delta room is measured from
+wherever the cursor actually rests. With no park published (any non-handoff moment) behaviour is
+byte-for-byte the stock centre-warp. The wrapper keeps the park off every window it streams and with
+enough edge margin that a single hand-motion delta never clamps or trips the bogus guard.

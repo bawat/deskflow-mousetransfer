@@ -180,6 +180,13 @@ private: // HACK
   // warp cursor without discarding queued events
   void warpCursorNoFlush(int32_t x, int32_t y);
 
+  // MouseTransfer (RDP adaptive cursor park): the point the away cursor is warped/re-centred to.
+  // Normally the screen centre (m_xCenter/m_yCenter); during an RDP window handoff the wrapper
+  // publishes an off-window park (MSWindowsDesks::getRdpPark) so the streamed source cursor rests
+  // off the window instead of on top of it. onMouseMove's bogus-delta guard uses the SAME point, so
+  // the usable-delta room stays measured from wherever the cursor actually rests.
+  void rdpWarpCentre(int32_t &cx, int32_t &cy) const;
+
   // discard posted messages
   void nextMark();
 
