@@ -1002,6 +1002,15 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
     return true;
   }
 
+  case DESKFLOW_MSG_TOUCH_ECHO:
+    // Merged-fork: the hook ATE a pen/touch-promoted mouse event while relaying (see
+    // mouseLLHook). Ring it as 'T' so a teleport investigation can SEE the suppressed echoes.
+    // Bookkeeping is deliberately untouched: the event was eaten, the parked cursor never
+    // moved, so the delta anchor is still the truth.
+    mtDiagPush('T', static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
+    LOG_DEBUG1("ate pen/touch-promoted mouse echo at %d,%d", static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
+    return true;
+
   case DESKFLOW_MSG_MOUSE_WHEEL:
     return onMouseWheel(static_cast<int32_t>(lParam), static_cast<int32_t>(wParam));
 
@@ -1352,8 +1361,9 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
   // Merged-fork jump diagnostics: record the processed hardware event, and NAME THE REASON when
   // a relayed delta is implausibly large for one motion. The dump carries the event, the saved
   // reference it was computed against, and the ring of recent reference-touching events
-  // (H hardware / I tagged-injection / W,C warps / B bogus-drops) with ms ages -- enough to see
-  // WHICH bookkeeping step went missing or stale when the viewer's cursor jumps.
+  // (H hardware / I tagged-injection / W,C warps / B bogus-drops / T eaten pen-touch echoes)
+  // with ms ages -- enough to see WHICH bookkeeping step went missing or stale when the
+  // viewer's cursor jumps.
   mtDiagPush('H', mx, my);
   if (!m_isOnScreen && (x > kMtJumpDiagPx || x < -kMtJumpDiagPx || y > kMtJumpDiagPx || y < -kMtJumpDiagPx)) {
     char ring[256];

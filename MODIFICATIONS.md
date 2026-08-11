@@ -1149,3 +1149,46 @@ now resolves the held window through `GetLastActivePopup`, which returns the act
 one is up and the window itself otherwise, so the hold tracks whichever window Windows actually
 treats as foreground. Robust to which hwnd the file names (owner or dialog both resolve to the
 dialog), and a no-op when there is no pop-up.
+
+### Eat pen/touch-promoted mouse echoes while relaying (2026-08-11)
+
+**Files:** `src/lib/platform/MSWindowsHook.{h,cpp}`, `src/lib/platform/MSWindowsScreen.{h,cpp}`
+
+Dragging inside the RDP view of a **UWP** window (Windows Clock, `ApplicationFrameWindow`)
+teleported the shared cursor off the destination screen and deep into a neighbouring one
+(observed twice, 2026-08-11 12:53 and 13:10: `MT-jumpdiag` park `1348,540`, promoted events at
+`799,318` / `228,290`, relayed deltas `-549,-222` / `-1120,-250`, each followed by
+`switch … entering screen` at a **mid-screen** point — an overshoot, not an edge crossing).
+
+Cause: UWP content ignores posted mouse input, so the shadow drives it with `InjectTouchInput`.
+Touch injection moves no cursor and carries no `kDeskflowLocalInjectSignature` tag, so none of the
+tagged-injection bookkeeping (`DESKFLOW_MSG_INJECT_AT`, the injection-stream guard) ever arms.
+Windows then **promotes** the touch to mouse events at the touch point, and the primary's relay
+read their stamped ABSOLUTE positions as hand motion measured against the parked cursor — a
+park-to-grab-point delta, relayed, is the teleport. The adaptive cursor park (2026-08-11) did not
+cause this; it moved the park further from typical grab points, making the bogus deltas ~3× larger
+and finally big enough to cross a seam.
+
+Verified live on the fleet (a probe mirroring the shadow's exact injection under a `WH_MOUSE_LL`
+hook): promoted moves arrive flagged `LLMHF_INJECTED` with the **documented pen/touch signature in
+`dwExtraInfo`** — upper 24 bits `0xFF515700` (`MI_WP_SIGNATURE`, mask `0xFFFFFF00`; low-byte bit
+`0x80` = touch — Microsoft, "Distinguishing Pen Input from Mouse and Touch") — and the promotion
+really does move the origin cursor. (Windows also emits one **bare** `LBUTTONDOWN`/`UP` pair with
+no flags and no signature during promotion; those carry no position payload and relay as
+near-duplicates of the real clicks, so they are left alone.)
+
+Fix, in `mouseLLHook`: while the hook is RELAYING (`kHOOK_RELAY_EVENTS`), an event whose
+`dwExtraInfo` carries `MI_WP_SIGNATURE` is **eaten** — the same fate every hardware event already
+meets in relay mode, minus the relay. No bookkeeping correction is needed: the event never reaches
+the relay, and the parked cursor never moved (relay mode was already eating these events locally —
+the incident's Clock drag worked throughout, which also proves eating the echo does not disturb the
+touch gesture itself; UWP consumes the pointer input directly). The match is on the signature
+alone, not `LLMHF_INJECTED`, so a **real touchscreen's** promoted echoes — which would hit the
+identical park-delta math — are covered too. On-screen behaviour (`kHOOK_WATCH_JUMP_ZONE`,
+absolute coordinates, touchscreen seam-crossing) is deliberately unchanged.
+
+Diagnostics: each eaten echo posts a new screen-thread message, `DESKFLOW_MSG_TOUCH_ECHO`
+(`WM_APP+0x28` — deliberately outside `INPUT_FIRST..INPUT_LAST` and numbered past the
+`MSWindowsDesks` id block, which derives `DESKFLOW_HOOK_LAST_MSG+1..+13`), which records a `'T'`
+event in the `MT-jumpdiag` ring — so the suppression is visible to a later teleport investigation
+instead of silent.

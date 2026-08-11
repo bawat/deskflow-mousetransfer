@@ -46,6 +46,15 @@ static const char *g_name = "dfwhook";
 // active screen, neither of which can work if the core eats the injected key.
 static const ULONG_PTR kDeskflowLocalInjectSignature = 0x0DF10CA1; // "DF local"
 
+// Windows stamps every mouse event it SYNTHESIZES from pen/touch pointer input with this
+// signature in the upper 24 bits of dwExtraInfo (Microsoft, "Distinguishing Pen Input from
+// Mouse and Touch": MI_WP_SIGNATURE 0xFF515700, mask 0xFFFFFF00; the low byte carries per-event
+// info -- bit 0x80 set = touch, clear = pen. Both are promoted ECHOES of pointer input, so we
+// match the signature alone). Verified live on this fleet 2026-08-11 (touchprobe: InjectTouchInput
+// promotes to LL mouse events carrying exactly this signature).
+static const ULONG_PTR kMouseFromPenTouchSignature = 0xFF515700;
+static const ULONG_PTR kMouseFromPenTouchMask = 0xFFFFFF00;
+
 static DWORD g_processID = 0;
 static DWORD g_threadID = 0;
 static HHOOK g_getMessage = nullptr;
@@ -676,6 +685,26 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
         PostThreadMessage(g_threadID, DESKFLOW_MSG_INJECT_AT, info->pt.x, info->pt.y);
       }
       return CallNextHookEx(g_mouseLL, code, wParam, lParam);
+    }
+    // Merged-fork: a mouse event PROMOTED from pen/touch (Windows stamps MI_WP_SIGNATURE into
+    // dwExtraInfo -- see the constant above) is the OS's own echo of pointer input, never
+    // hand-on-mouse motion. While RELAYING, every hardware event is eaten and its STAMPED
+    // position is measured against the parked cursor -- but a promoted echo's position is an
+    // ABSOLUTE point (the RDP handoff drives UWP windows with InjectTouchInput, which moves no
+    // cursor, carries no local-inject tag, and so arms none of the INJECT_AT bookkeeping), so
+    // treating it as hardware relays a park-to-grab-point delta: the owner's cursor TELEPORTS
+    // off the destination screen (2026-08-11, MT-jumpdiag: park 1348,540, promoted events at
+    // 799,318 / 228,290, relayed deltas -549,-222 / -1120,-250, "switch ... entering" lands
+    // mid-screen). Eat the echo -- the same fate every hardware event already meets in relay
+    // mode, minus the relay; the touch gesture itself reached the app through the pointer
+    // stack (the incident's Clock drag worked while these echoes were being eaten), and the
+    // parked cursor never moved, so no bookkeeping correction is needed. Covers buttons and
+    // wheel too: a promoted click relayed to the active screen would be a DUPLICATE (the real
+    // click already happened there). On-screen behaviour (kHOOK_WATCH_JUMP_ZONE -- absolute
+    // coordinates, real-touchscreen seam crossing) is deliberately unchanged.
+    if (g_mode == kHOOK_RELAY_EVENTS && (info->dwExtraInfo & kMouseFromPenTouchMask) == kMouseFromPenTouchSignature) {
+      PostThreadMessage(g_threadID, DESKFLOW_MSG_TOUCH_ECHO, info->pt.x, info->pt.y);
+      return 1;
     }
     if (!g_isPrimary && injected) {
       return CallNextHookEx(g_mouseLL, code, wParam, lParam);

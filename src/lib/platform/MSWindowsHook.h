@@ -33,6 +33,14 @@
 #define DESKFLOW_MSG_INPUT_FIRST DESKFLOW_MSG_KEY
 #define DESKFLOW_MSG_INPUT_LAST DESKFLOW_MSG_INJECT_AT
 #define DESKFLOW_HOOK_LAST_MSG DESKFLOW_MSG_DEBUG
+// Merged-fork: mouseLLHook ATE a pen/touch-promoted mouse event while relaying (x; y = the
+// event's stamped position). Diagnostic only -- the jump-diag ring records it as 'T' so a
+// teleport investigation can SEE the suppressed echoes; no bookkeeping changes (the event was
+// eaten, the parked cursor never moved). Deliberately OUTSIDE INPUT_FIRST..INPUT_LAST (it is
+// not input and must not be flushed as such) and NUMBERED PAST the MSWindowsDesks block --
+// Desks derives DESKFLOW_HOOK_LAST_MSG+1..+13 (0x1b..0x27), so the next free id is 0x28.
+// DESKFLOW_HOOK_LAST_MSG must NOT move (the Desks ids would shift with it).
+#define DESKFLOW_MSG_TOUCH_ECHO WM_APP + 0x0028 // x; y
 
 #define DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY VK_CANCEL
 #define DESKFLOW_HOOK_FAKE_INPUT_SCANCODE 0

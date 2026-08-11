@@ -237,7 +237,8 @@ private: // HACK
   // dumped by onMouseMove whenever a relayed delta is implausibly large for one hardware motion.
   // Kinds: H = hardware motion processed, I = tagged-injection bookkeeping (DESKFLOW_MSG_INJECT_AT),
   // W = warpCursorNoFlush's PRE_WARP save, C = warpCursor's post-discard save, B = a delta the
-  // bogus-zone filter dropped. Fixed-size, member (never a shared static), written only on the
+  // bogus-zone filter dropped, T = a pen/touch-promoted mouse echo the hook ate while relaying
+  // (DESKFLOW_MSG_TOUCH_ECHO). Fixed-size, member (never a shared static), written only on the
   // screen thread.
   struct MtDiagEvent
   {
