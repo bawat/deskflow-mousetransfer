@@ -1211,3 +1211,35 @@ tick, so during every native title drag the lock read was a coin flip and a seam
 sampled a Windows-owned instant pinned the cursor at the edge. A clip matching a monitor's work
 area (±1px) is now treated as unconfined — the wrapper's deliberate cursor-lock is a full-monitor
 or smaller region, never work-area-shaped.
+
+## Relay-mode delta anchor is the park, not the event's own stamp (2026-08-12)
+
+`MSWindowsScreen::onMouseMove`, relay branch: after warping the parked cursor back to its rest
+point, the saved delta reference is now set to that rest point immediately, instead of being left
+at the just-processed event's stamped position until the queued `PRE_WARP` message restores it.
+
+The defect (the seam cross-bounce, measured live 2026-08-12 18:44): relay mode eats every
+hardware motion, so the physical cursor never moves from the park and every event is stamped at
+(park + its own delta). Correct deltas therefore require the anchor to be the PARK when each
+event is diffed — but the anchor was the previous event's stamp whenever two hardware events sat
+back-to-back in the message queue (the corrective `PRE_WARP` is posted BEHIND them), so a drained
+batch relayed velocity differences (d2−d1, d3−d2, …) that telescope to almost nothing. Under a
+high-rate mouse plus load (a WGC window export arming on the crossing), batching is the norm: a
+fast eastward push across the seam relayed as ~zero while slow corrective wobble relayed in full,
+so the server's tracked secondary cursor sat pinned at the entry edge (x=0, no inset) until the
+first −1 px hand jitter walked it back off — a switch oscillation at ~5/s, felt as "cursor stuck
+at the transition edge" and, when a crossing stuck, seen as the window "running away". This is
+the same defect class the 2026-08-09 injection-stream re-anchor fixed ("without a re-anchor
+successive deltas collapse to differences"); this entry is the warp path's half.
+
+With the anchor always the park: every event's delta is its own hand motion regardless of queue
+interleaving; a straggler stamped at the pre-warp position becomes a screen-scale delta the
+mis-stamp drop already removes (instead of seeding tiny corrupt pair-differences); and the
+`PRE_WARP` handler's later save of the same point is a harmless no-op.
+
+Diagnostics (`MT-switchdiag`): for 500 ms after every screen switch (enter or leave), onMouseMove
+logs each processed event — stamped position, the anchor it was diffed against, the delta, live
+`GetCursorPos` truth, and the mark-stale flag — capped at 32 lines per window, permanently on
+(the MT-jumpdiag precedent). Every downstream verdict (mis-stamp drop, bogus-zone, mark-ignore)
+is derivable offline from these fields, so post-switch stream corruption is readable
+event-by-event rather than inferred.

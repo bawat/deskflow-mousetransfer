@@ -261,6 +261,17 @@ private: // HACK
   int32_t m_mtLastInjectX = 0;
   int32_t m_mtLastInjectY = 0;
 
+  // Merged-fork: SWITCH DIAGNOSTICS (2026-08-12, the seam cross-bounce investigation). For a
+  // bounded window after every screen switch (enter OR leave), onMouseMove logs EVERY processed
+  // mouse event -- stamped position, the anchor it was diffed against, the delta, the live
+  // GetCursorPos truth, and whether the event was mark-stale -- so a post-switch corruption of
+  // the relayed stream is readable event-by-event from the log instead of inferred. Written only
+  // on the screen thread; the count cap bounds the burst, so it stays permanently on (the
+  // MT-jumpdiag precedent: cheap, and the decisive evidence is only ever captured by the
+  // instrument that was already running).
+  uint32_t m_mtSwitchTick = 0;
+  int m_mtSwitchCount = 0;
+
   // check if it is a modifier key repeating message
   bool isModifierRepeat(KeyModifierMask oldState, KeyModifierMask state, WPARAM wParam) const;
 

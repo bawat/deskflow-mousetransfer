@@ -265,6 +265,10 @@ void MSWindowsScreen::enter()
   // now on screen
   m_isOnScreen = true;
   setupMouseKeys();
+
+  // Merged-fork: open the post-switch diagnostic window (see MSWindowsScreen.h, m_mtSwitchTick).
+  m_mtSwitchTick = GetTickCount();
+  m_mtSwitchCount = 0;
 }
 
 bool MSWindowsScreen::canLeave()
@@ -339,6 +343,10 @@ void MSWindowsScreen::leave()
 
   // now off screen
   m_isOnScreen = false;
+
+  // Merged-fork: open the post-switch diagnostic window (see MSWindowsScreen.h, m_mtSwitchTick).
+  m_mtSwitchTick = GetTickCount();
+  m_mtSwitchCount = 0;
 }
 
 bool MSWindowsScreen::setClipboard(ClipboardID, const IClipboard *src)
@@ -1409,6 +1417,29 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     );
   }
 
+  // Merged-fork switch diagnostics: for the first kMtSwitchDiagMs after a screen switch, log
+  // every processed mouse event with the anchor it was diffed against, the live cursor truth
+  // and the stale flag, BEFORE any verdict is taken -- the drop/bogus/ignore outcomes are all
+  // derivable offline from these fields, so one log point covers every path. Bounded by
+  // kMtSwitchDiagMax lines per window (see MSWindowsScreen.h for why this is permanently on).
+  // The 500 ms window is the bounce period measured live 2026-08-12 (a switch every ~180-300 ms);
+  // the cap covers ~250 ms of a 125 Hz stream, comfortably past the first bounce-back.
+  static const uint32_t kMtSwitchDiagMs = 500;
+  static const int kMtSwitchDiagMax = 32;
+  if (m_mtSwitchTick != 0 && m_mtSwitchCount < kMtSwitchDiagMax) {
+    uint32_t sinceSwitch = GetTickCount() - m_mtSwitchTick;
+    if (sinceSwitch <= kMtSwitchDiagMs) {
+      ++m_mtSwitchCount;
+      POINT cp{0, 0};
+      getThisCursorPos(&cp);
+      LOG_INFO(
+          "MT-switchdiag +%ums #%d %s pt=%d,%d anchor=%d,%d d=%+d,%+d cur=%ld,%ld stale=%d", (unsigned)sinceSwitch,
+          m_mtSwitchCount, m_isOnScreen ? "watch" : "relay", mx, my, m_xCursor, m_yCursor, x, y, cp.x, cp.y,
+          ignore() ? 1 : 0
+      );
+    }
+  }
+
   // ignore if the mouse didn't move or if message posted prior
   // to last mark change.
   if (ignore() || (x == 0 && y == 0)) {
@@ -1452,6 +1483,24 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     if (!mtInjectionStream) {
       LOG_DEBUG2("centering cursor on motion: %+d,%+d", cx, cy);
       warpCursorNoFlush(cx, cy);
+      // Merged-fork (2026-08-12, the seam cross-bounce): anchor the next delta at the park NOW,
+      // not when the queued PRE_WARP is processed. The eaten hardware events never move the
+      // physical cursor, so every event in a backlogged batch is stamped at (park + its own
+      // delta) -- but saveMousePosition() above anchored at THIS event's stamped position, and
+      // the PRE_WARP that would restore the park anchor sits BEHIND the already-queued events.
+      // So back-to-back queued motions relayed d2-d1, d3-d2, ... (velocity DIFFERENCES): a whole
+      // drained batch telescoped to just its last event's delta, and a fast eastward push across
+      // the seam relayed as almost NOTHING while slow corrective wobble relayed in full. Measured
+      // live 2026-08-12 18:44 (cliplock2 log): the server oscillated switches ~5/s -- the tracked
+      // secondary cursor entered at x=0, never accumulated the hand's push (batches of 6+ events
+      // per tick in the jumpdiag ring), and the first -1 px hand jitter walked it back off the
+      // west edge -- felt as "cursor pinned at the transition edge". Same defect class 12g fixed
+      // for injection streams ("without a re-anchor successive deltas collapse to differences");
+      // this is the warp path's half. With the anchor always the park, every event's delta is
+      // (stamped - park) = its own hand motion regardless of queue interleaving, and a straggler
+      // stamped at the pre-warp position is a screen-scale delta the mis-stamp drop below
+      // removes. The PRE_WARP handler's later save of the same point becomes a harmless no-op.
+      saveMousePosition(cx, cy);
     } else {
       // Merged-fork: the RELAY-mode hook EATS every hardware motion (the physical cursor never
       // moves from hardware while relaying) -- each event's pt is just (current cursor + that
