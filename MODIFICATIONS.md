@@ -1192,3 +1192,13 @@ Diagnostics: each eaten echo posts a new screen-thread message, `DESKFLOW_MSG_TO
 `MSWindowsDesks` id block, which derives `DESKFLOW_HOOK_LAST_MSG+1..+13`), which records a `'T'`
 event in the `MT-jumpdiag` ring — so the suppression is visible to a later teleport investigation
 instead of silent.
+
+## Relay-mode mis-stamp drop widened to the warp-park race (2026-08-12)
+
+`MSWindowsScreen::onMouseMove`: the injection-stream-only mis-stamp drop (2026-08-09) now covers
+ALL relay-mode motion. A hardware event stamped at the PRE-warp-park position delivered AFTER the
+park's `saveMousePosition` relays the whole park displacement as one delta (+959 measured — the
+"window ran away east" runaway); the bogus-zone check only catches deltas within 10 px of the full
+centre-to-edge distance, so the 128..~950 px band sailed through. Any relay-mode delta beyond
+kMtJumpDiagPx (128) per axis is provably mis-stamped whatever wrote the anchor; drop + the
+existing re-anchor restores truth. Cost: one lost hand-motion event.
