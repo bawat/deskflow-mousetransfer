@@ -751,8 +751,31 @@ bool MSWindowsScreen::isCursorClippedToSubRegion() const
   const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
   const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
   const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-  return clip.left > vx + slack || clip.top > vy + slack || //
-         clip.right < vx + vw - slack || clip.bottom < vy + vh - slack;
+  bool sub = clip.left > vx + slack || clip.top > vy + slack || //
+             clip.right < vx + vw - slack || clip.bottom < vy + vh - slack;
+  if (!sub) {
+    return false;
+  }
+  // Merged-fork (2026-08-12, the intermittent "cursor locked at the transition edge"): Windows'
+  // own MODAL MOVE LOOP clips the cursor to a monitor WORK AREA (screen minus taskbar) and
+  // RE-APPLIES it on every mouse move, while the wrapper's counter-release runs on a 20 ms tick --
+  // so during every native title-bar drag this read is a COIN FLIP between the two writers, and a
+  // seam crossing that sampled a Windows-owned instant read "locked" and pinned the cursor at the
+  // edge (measured: the wrapper's clip-diag watchdog saw (0,0)-(1920,1040) and (0,0)-(1920,1080)
+  // alternating through one drag). A clip that MATCHES some monitor's work area is therefore
+  // Windows' drag clip, never the wrapper's deliberate cursor-lock (that one hugs a fullscreen
+  // window's monitor = the FULL monitor rect, or a smaller region): treat it as unconfined.
+  HMONITOR mon = MonitorFromRect(&clip, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi;
+  mi.cbSize = sizeof(mi);
+  if (mon != nullptr && GetMonitorInfo(mon, &mi)) {
+    auto near = [slack](LONG a, LONG b) { return a - b <= slack && b - a <= slack; };
+    if (near(clip.left, mi.rcWork.left) && near(clip.top, mi.rcWork.top) &&
+        near(clip.right, mi.rcWork.right) && near(clip.bottom, mi.rcWork.bottom)) {
+      return false; // the move loop's work-area clip: not a lock
+    }
+  }
+  return true;
 }
 
 void MSWindowsScreen::getCursorCenter(int32_t &x, int32_t &y) const

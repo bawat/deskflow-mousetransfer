@@ -1202,3 +1202,12 @@ park's `saveMousePosition` relays the whole park displacement as one delta (+959
 centre-to-edge distance, so the 128..~950 px band sailed through. Any relay-mode delta beyond
 kMtJumpDiagPx (128) per axis is provably mis-stamped whatever wrote the anchor; drop + the
 existing re-anchor restores truth. Cost: one lost hand-motion event.
+
+## Work-area clip is not a cursor lock (2026-08-12)
+
+`MSWindowsScreen::isCursorClippedToSubRegion`: Windows' modal move loop clips the cursor to the
+monitor WORK AREA and re-applies it per mouse move; the wrapper's counter-release runs per 20ms
+tick, so during every native title drag the lock read was a coin flip and a seam crossing that
+sampled a Windows-owned instant pinned the cursor at the edge. A clip matching a monitor's work
+area (±1px) is now treated as unconfined — the wrapper's deliberate cursor-lock is a full-monitor
+or smaller region, never work-area-shaped.
