@@ -1483,36 +1483,41 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     if (!mtInjectionStream) {
       LOG_DEBUG2("centering cursor on motion: %+d,%+d", cx, cy);
       warpCursorNoFlush(cx, cy);
-      // Merged-fork (2026-08-12, the seam cross-bounce): anchor the next delta at the park NOW,
-      // not when the queued PRE_WARP is processed. The eaten hardware events never move the
-      // physical cursor, so every event in a backlogged batch is stamped at (park + its own
-      // delta) -- but saveMousePosition() above anchored at THIS event's stamped position, and
-      // the PRE_WARP that would restore the park anchor sits BEHIND the already-queued events.
-      // So back-to-back queued motions relayed d2-d1, d3-d2, ... (velocity DIFFERENCES): a whole
-      // drained batch telescoped to just its last event's delta, and a fast eastward push across
-      // the seam relayed as almost NOTHING while slow corrective wobble relayed in full. Measured
-      // live 2026-08-12 18:44 (cliplock2 log): the server oscillated switches ~5/s -- the tracked
-      // secondary cursor entered at x=0, never accumulated the hand's push (batches of 6+ events
-      // per tick in the jumpdiag ring), and the first -1 px hand jitter walked it back off the
-      // west edge -- felt as "cursor pinned at the transition edge". Same defect class 12g fixed
-      // for injection streams ("without a re-anchor successive deltas collapse to differences");
-      // this is the warp path's half. With the anchor always the park, every event's delta is
-      // (stamped - park) = its own hand motion regardless of queue interleaving, and a straggler
-      // stamped at the pre-warp position is a screen-scale delta the mis-stamp drop below
-      // removes. The PRE_WARP handler's later save of the same point becomes a harmless no-op.
+    }
+    // Merged-fork (2026-08-12, the seam cross-bounce): anchor the next delta at where the cursor
+    // ACTUALLY RESTS -- GetCursorPos truth -- never at a position we merely intended. The eaten
+    // hardware events never move the physical cursor, so every event is stamped at (current
+    // cursor + its own delta); the delta is honest if and only if the anchor equals the cursor's
+    // real position when the event was stamped. Three measured ways the old intended-position
+    // anchors went wrong (all in scratchpad stuck2-12.log, 2026-08-12 19:22):
+    //   1. Anchoring at each event's OWN stamp (the original code, via saveMousePosition above +
+    //      a PRE_WARP queued BEHIND already-batched events): back-to-back queued motions relayed
+    //      velocity differences that telescope to ~nothing -- a fast eastward push across the
+    //      seam relayed as ~zero while slow corrective wobble relayed in full (the first fix
+    //      this day anchored at the park instead, which exposed 2 and 3).
+    //   2. Anchoring at the park while the park warp has NOT LANDED (SetCursorPos failed or
+    //      lagged under load): events stamp at the seam, diff at ~+960, and the mis-stamp gate
+    //      below drops the ENTIRE stream -- the cursor is dead until the warp lands ("pinned at
+    //      the transition edge", MT-switchdiag: 11+ consecutive drops with cur=1919,578).
+    //   3. Anchoring at the last injected point when the "injection stream" was ONE STRAY tagged
+    //      move (the wrapper's file-drag capture misfiring on a title drag): the anchor froze at
+    //      the stray's position for up to 5 s (button held), every parked-hardware event diffed
+    //      at ~-933, all dropped -- a dead cursor for seconds (MT-switchdiag: unbroken B-storm
+    //      vs anchor=1895,560 while cur=960,540).
+    // Anchoring at the live cursor makes every case honest: warp landed -> truth is the park;
+    // warp lagging -> truth is the seam and the hand's deltas relay THROUGH the lag (exactly one
+    // event is lost at the landing boundary, caught by the gate below); real injection stream ->
+    // truth is the injected point (the injection physically moved the cursor there; hook order
+    // bounds any disagreement by one injection step, which the gate tolerates); stray injection
+    // -> truth is wherever the cursor rests, not the stray's coordinates. GetCursorPos is a
+    // cheap userland read (the per-motion GetAsyncKeyState above set the precedent). On the rare
+    // GetCursorPos failure (desktop transition) fall back to the old intended positions.
+    POINT mtRest;
+    if (getThisCursorPos(&mtRest)) {
+      saveMousePosition(mtRest.x, mtRest.y);
+    } else if (!mtInjectionStream) {
       saveMousePosition(cx, cy);
     } else {
-      // Merged-fork: the RELAY-mode hook EATS every hardware motion (the physical cursor never
-      // moves from hardware while relaying) -- each event's pt is just (current cursor + that
-      // event's own delta). The warp used to re-sync the saved position to the cursor after every
-      // event, which is the ONLY reason successive deltas came out right; with the warp suppressed
-      // the first motion after an injection relayed d1 but saved advanced to (anchor + d1) while
-      // the cursor STAYED at the anchor, so the next motion relayed d2 - d1 and steady hand motion
-      // cancelled itself to a crawl (owner: "a lot of resistance"; measured ~77 px/s during a
-      // fast drag, 2026-08-09). Re-anchor the saved position to where the cursor actually IS --
-      // the last injected point -- so every hardware delta relays in full. Ordering stays exact:
-      // INJECT_AT and MOUSE_MOVE arrive in hook order, so the anchor here is always the injection
-      // the cursor sat at when this motion was stamped.
       saveMousePosition(m_mtLastInjectX, m_mtLastInjectY);
     }
 

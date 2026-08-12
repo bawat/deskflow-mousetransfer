@@ -1243,3 +1243,29 @@ logs each processed event — stamped position, the anchor it was diffed against
 (the MT-jumpdiag precedent). Every downstream verdict (mis-stamp drop, bogus-zone, mark-ignore)
 is derivable offline from these fields, so post-switch stream corruption is readable
 event-by-event rather than inferred.
+
+## Relay-mode delta anchor is the LIVE cursor, not any intended position (2026-08-12, follow-up)
+
+The owner reproduced the seam bounce with the park-anchor fix live, and MT-switchdiag captured
+two further ways an *intended*-position anchor kills the stream (scratchpad stuck2-12.log,
+19:22): (1) when the park warp fails or lags under load, events stamp at the seam and diff at
+~+960 against the park anchor — the mis-stamp gate drops the ENTIRE stream until the warp lands
+(11+ consecutive drops with `cur=1919,578` measured); (2) ONE stray tagged injection (the
+wrapper's file-drag capture misfiring during a title drag) armed the injection-stream latch for
+up to 5 s (button held) with the anchor frozen at the stray's position — every parked-hardware
+event diffed at ~−933 and was dropped, a dead cursor for seconds.
+
+Both are the same disease as the telescoping: the anchor described where the cursor was SUPPOSED
+to be. `onMouseMove`'s relay branch now anchors at `GetCursorPos` truth after the warp/suppress
+decision (falling back to the old intended positions only if the read fails). Warp landed →
+truth is the park (previous behaviour); warp lagging → truth is the seam and the hand's motion
+relays THROUGH the lag, losing exactly one event at the landing boundary; real injection stream
+→ truth is the injected point (the injection physically moved the cursor); stray injection →
+truth is the actual rest point, not the stray's coordinates.
+
+Context for the residual symptom (recorded here because the log evidence spans both repos): the
+felt "stuck at the seam" also has a wrapper-side feedback component — FANTASY's bring-up CSV
+shows its cursor applying the relayed stream one bounce-cycle late while `sysPct` pegs at 100%
+from per-crossing viewer prewarm/teardown churn, so the user sees no motion, yanks back west,
+and the (honest) yank bounces the cursor home, seeding the next cycle's churn. That half lives
+in the wrapper.
