@@ -769,9 +769,10 @@ bool MSWindowsScreen::isCursorClippedToSubRegion() const
   MONITORINFO mi;
   mi.cbSize = sizeof(mi);
   if (mon != nullptr && GetMonitorInfo(mon, &mi)) {
-    auto near = [slack](LONG a, LONG b) { return a - b <= slack && b - a <= slack; };
-    if (near(clip.left, mi.rcWork.left) && near(clip.top, mi.rcWork.top) &&
-        near(clip.right, mi.rcWork.right) && near(clip.bottom, mi.rcWork.bottom)) {
+    // (nearEq, not "near": windows.h still #defines the legacy near/far keywords away.)
+    auto nearEq = [slack](LONG a, LONG b) { return a - b <= slack && b - a <= slack; };
+    if (nearEq(clip.left, mi.rcWork.left) && nearEq(clip.top, mi.rcWork.top) &&
+        nearEq(clip.right, mi.rcWork.right) && nearEq(clip.bottom, mi.rcWork.bottom)) {
       return false; // the move loop's work-area clip: not a lock
     }
   }
