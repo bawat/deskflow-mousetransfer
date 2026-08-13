@@ -1269,3 +1269,30 @@ shows its cursor applying the relayed stream one bounce-cycle late while `sysPct
 from per-crossing viewer prewarm/teardown churn, so the user sees no motion, yanks back west,
 and the (honest) yank bounces the cursor home, seeding the next cycle's churn. That half lives
 in the wrapper.
+
+## Faster client reconnect for coordinated core restarts (2026-08-13)
+
+Shortened two client-side connect constants so the KVM mouse link comes back faster after every
+machine's core restarts together — the game-mode resume case (the wrapper stops the whole mesh's
+cores while a game is fullscreen, then restarts them on tab-out), but also any-machine role swaps
+and layout-change bounces.
+
+- `Client::setupTimer` (src/lib/client/Client.cpp): connect timeout **2.0s → 1.0s**. This one-shot
+  timer covers TCP connect + TLS handshake + the server's hello (it is cancelled in `handleHello`),
+  which on a LAN with a listening server completes in ~200ms. The stock 2.0s only ever prolonged the
+  wait when the server was NOT yet listening — exactly the coordinated-restart case, where a client
+  reliably dials a server that is still coming up.
+- `s_retryTime` (src/lib/deskflow/ClientApp.cpp): retry backoff **1.0s → 0.25s**, so after a failed
+  attempt the client re-dials quickly and lands one as soon as the server is listening.
+
+Why it was slow (measured on the fleet, client `.68` own log): on a game-mode resume the client core
+respawns almost instantly and dials the server ~1.3s before the server core finishes coming up. The
+SYN went unanswered (no listener yet — dropped, not refused), so the first attempt burned the full
+2.0s timeout, then waited 1.0s before retrying: ~3s before the mouse could cross. With 1.0s + 0.25s
+the cycle is ~1.25s and the client connects within one cycle of the server listening. This is a LAN
+KVM, so the shorter timeout keeps a comfortable margin over a real connect while removing the dead
+wait; a persistently-off peer is re-dialed every ~1.25s (one packet to one known server — trivial,
+unlike the deleted `/24` discovery sweep).
+
+The wrapper's connect-wedge watchdog derivation (cmd/corewatchdog.go, `coreConnectWedgeAfter`) was
+updated to match the new cycle while staying far above any legitimate connect.

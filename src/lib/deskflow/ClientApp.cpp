@@ -45,7 +45,14 @@
 
 #include <memory>
 
-constexpr static auto s_retryTime = 1.0;
+// MouseTransfer: retry a failed/refused/dropped connect after 0.25s, not the stock 1.0s. This is a
+// LAN KVM, so a reconnect either succeeds in well under 100ms or fails fast; the only thing the long
+// backoff bought was slower recovery. It matters most on a game-mode resume, where every machine's
+// core restarts at once and a client that dials a server still coming up must keep re-dialing until
+// it is listening — the mouse cannot cross to that client until then. Paired with the shortened
+// connect timeout in Client::setupTimer, the poll cycle is ~1.25s instead of ~3s. (Retrying an
+// off peer every ~1.25s is trivial traffic — one packet to one known server, not a broadcast sweep.)
+constexpr static auto s_retryTime = 0.25;
 
 ClientApp::ClientApp(IEventQueue *events, const QString &processName) : App(events, processName)
 {

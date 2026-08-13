@@ -557,7 +557,14 @@ void Client::setupScreen()
 void Client::setupTimer()
 {
   assert(m_timer == nullptr);
-  m_timer = m_events->newOneShotTimer(2.0, nullptr);
+  // MouseTransfer: 1.0s connect timeout, not the stock 2.0s. This timer covers TCP connect + TLS
+  // handshake + the server's hello (cancelled in handleHello), which on our LAN completes in ~200ms
+  // for a listening server — so 2.0s only ever prolonged the wait when the server was NOT there. On a
+  // game-mode resume every core restarts together, so a client routinely dials a server still coming
+  // up; the sooner that mistimed attempt is abandoned, the sooner the fast retry (s_retryTime) lands
+  // one after the server is listening and the mouse can cross. 1.0s keeps a comfortable margin over a
+  // real LAN connect while halving the dead wait.
+  m_timer = m_events->newOneShotTimer(1.0, nullptr);
   m_events->addHandler(EventTypes::Timer, m_timer, [this](const auto &) { handleConnectTimeout(); });
 }
 
