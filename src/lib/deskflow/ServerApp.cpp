@@ -49,9 +49,21 @@
 #include "platform/OSXScreen.h"
 #endif
 
+#include <chrono>
 #include <fstream>
 
 using namespace deskflow::server;
+
+// MouseTransfer: startup timing so the "core init" phase (spawn -> listening) can be attributed from
+// the log instead of guessed. s_mtStartupT0 is stamped at the top of start(); the markers below report
+// ms since then at app+settings init, at screen ready, and at "started server". Diagnostic only.
+static std::chrono::steady_clock::time_point s_mtStartupT0;
+static long mtStartupMs()
+{
+  return static_cast<long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - s_mtStartupT0).count()
+  );
+}
 
 //
 // ServerApp
@@ -373,16 +385,18 @@ bool ServerApp::startServer()
       return true;
     }
     assert(m_serverState == Initialized);
+    LOG_INFO("MT-startup: server screen ready %ldms", mtStartupMs());
   }
 
   ClientListener *listener = nullptr;
   try {
     listener = openClientListener(m_config->getDeskflowAddress());
+    LOG_INFO("MT-startup: client listener open %ldms", mtStartupMs());
     m_server = openServer(*m_config, m_primaryClient);
     listener->setServer(m_server);
     m_server->setListener(listener);
     m_listener = listener;
-    LOG_IPC("started server, waiting for clients");
+    LOG_IPC("started server, waiting for clients (startup %ldms)", mtStartupMs());
     m_serverState = Started;
     return true;
   } catch (SocketAddressInUseException &e) {
@@ -599,7 +613,9 @@ int ServerApp::runInner(StartupFunc startup)
 
 int ServerApp::start()
 {
+  s_mtStartupT0 = std::chrono::steady_clock::now();
   initApp();
+  LOG_INFO("MT-startup: app+settings init %ldms", mtStartupMs());
   return mainLoop();
 }
 

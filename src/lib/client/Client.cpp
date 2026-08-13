@@ -557,14 +557,16 @@ void Client::setupScreen()
 void Client::setupTimer()
 {
   assert(m_timer == nullptr);
-  // MouseTransfer: 1.0s connect timeout, not the stock 2.0s. This timer covers TCP connect + TLS
-  // handshake + the server's hello (cancelled in handleHello), which on our LAN completes in ~200ms
-  // for a listening server — so 2.0s only ever prolonged the wait when the server was NOT there. On a
-  // game-mode resume every core restarts together, so a client routinely dials a server still coming
-  // up; the sooner that mistimed attempt is abandoned, the sooner the fast retry (s_retryTime) lands
-  // one after the server is listening and the mouse can cross. 1.0s keeps a comfortable margin over a
-  // real LAN connect while halving the dead wait.
-  m_timer = m_events->newOneShotTimer(1.0, nullptr);
+  // MouseTransfer: 3.0s connect timeout (was stock 2.0s; briefly tried 1.0s). This timer bounds the
+  // WHOLE connect: TCP + TLS handshake + the server's hello (cancelled in handleHello). On our LAN a
+  // live server answers in ~200ms, but the handshake includes RSA-4096 work, so on SLOW hardware (the
+  // Win8 laptop, a Pi) a legitimate handshake could momentarily approach ~1s under load — 1.0s risked
+  // abandoning a real connect and, if a device were consistently over it, never connecting. 3.0s
+  // restores a wide margin for the handshake. It does NOT re-introduce the game-mode-resume dead wait:
+  // the server comes up ~1.3s after a client first dials, well inside a single 3s attempt, so the OS
+  // SYN retransmit lands once it is listening; and the fast retry (s_retryTime=0.25s) is what actually
+  // paces re-dials when a whole attempt is exhausted. The wedge watchdog derives from this value.
+  m_timer = m_events->newOneShotTimer(3.0, nullptr);
   m_events->addHandler(EventTypes::Timer, m_timer, [this](const auto &) { handleConnectTimeout(); });
 }
 
