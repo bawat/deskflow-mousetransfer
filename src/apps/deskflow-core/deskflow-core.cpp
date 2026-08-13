@@ -83,34 +83,20 @@ int main(int argc, char **argv)
 
   parser.parse();
 
-  // MouseTransfer warm-standby latch. When --start-gated <file> is given, the process is by now FULLY
-  // loaded (DLLs mapped, QCoreApplication constructed, args parsed — the ~0.7s cold-start is done) but
-  // must not touch input / screen / network yet. The managed launcher spawns us at game-mode ENTER so
-  // that cold-start is paid while the user is already gaming (off the resume critical path); on tab-out
-  // it DELETES the gate file and we fall straight through into the KVM engine in ~10ms. Held == file
-  // exists; deletion is the atomic release. A blocked poll here is silent (no hooks, no NIC). A generous
-  // cap prevents a forever-hang if the launcher dies — we exit so it can respawn a fresh core instead.
-  if (const QString gateFile = parser.gateFile(); !gateFile.isEmpty()) {
-    LOG_INFO("MT-gate: warm-standby loaded; waiting for release (%s)", qPrintable(gateFile));
-    const double gateStart = ARCH->time();
-    while (QFileInfo::exists(gateFile)) {
-      if (ARCH->time() - gateStart > 900.0) { // 15 min: the launcher is gone — exit rather than hang
-        LOG_WARN("MT-gate: never released in 15 min — exiting so the launcher can respawn");
-        return s_exitSuccess;
-      }
-      ARCH->sleep(0.05);
-    }
-    LOG_INFO("MT-gate: released after %.3fs — starting the KVM engine", ARCH->time() - gateStart);
-  }
-
   EventQueue events;
   const auto processName = QFileInfo(argv[0]).fileName();
 
+  // MouseTransfer warm-standby latch: pass --start-gated <file> through to the app. It blocks in
+  // startNode() — after the process is fully warm (DLLs, QCoreApplication, appUtil().run(), event loop)
+  // but before the KVM engine — until the launcher deletes <file>. That is what moves the ~0.8s
+  // process cold-start off the game-mode resume critical path. Empty = start immediately (default).
   if (parser.serverMode()) {
     ServerApp app(&events, processName);
+    app.setGateFile(parser.gateFile());
     return app.run();
   } else if (parser.clientMode()) {
     ClientApp app(&events, processName);
+    app.setGateFile(parser.gateFile());
     return app.run();
   }
 

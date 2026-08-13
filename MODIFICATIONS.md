@@ -1308,11 +1308,19 @@ cold-starting the Qt process (mapping the exe + Qt6/OpenSSL DLLs + `QCoreApplica
 Deskflow code runs. To take that off the resume critical path, `deskflow-core` now accepts
 `--start-gated <gateFile>` (`CoreArgs.h`/`CoreArgParser.*`, consumed in `deskflow-core.cpp` `main()`):
 
-- With the flag, the process loads fully (that ~700ms is paid), then — right after arg parsing and the
-  duplicate-instance check, BEFORE the `EventQueue`/`ServerApp`/`ClientApp` and thus before any input
-  hook, screen, or network — it BLOCKS, polling `<gateFile>` every 50ms. Existence == held; **deletion
-  is the atomic release.** A blocked warm-standby is silent (no hooks, no NIC; just the loaded process's
-  RAM). On release it falls straight through into the KVM engine (~10ms to listening/connecting).
+- With the flag, the process loads AND runs all of the app framework warm-up — `QCoreApplication`,
+  `appUtil().run()` (which creates the Windows event loop), the event queue — then BLOCKS in
+  `App::gateWaitForRelease()`, called from `ServerApp::startNode`/`ClientApp::startNode`, i.e. AFTER
+  everything above is warm but BEFORE `startServer`/`startClient` touch the screen, input hooks, or
+  network. It polls `<gateFile>` every 50ms; existence == held, **deletion is the atomic release**. A
+  blocked warm-standby is silent (no hooks, no NIC; just the loaded process's RAM). On release it falls
+  straight into the KVM engine (~10ms to listening/connecting). **Placement matters and was measured:**
+  the ~700–840ms cold-start is dominated by `appUtil().run()` (measured: only ~9ms remains from
+  `ServerApp::start()` to "started server"), so an earlier gate (in `main()` before `app.run()`) left
+  that ~840ms ON the resume path — the gate must sit at `startNode`, after the framework is warm. There
+  is deliberately NO timeout: a game can run for hours, and a stuck gate after a launcher death is
+  harmless (silent) and is swept by the next launcher spawn's stray-core sweep. The gate path is passed
+  to the app via `App::setGateFile` from `--start-gated`.
 - The managed launcher spawns a gated core at game-mode ENTER (in the real role) so the cold-start
   happens while the user is already gaming; on tab-out it deletes the gate file and the warm core goes
   live in ~10ms instead of ~700ms. A 15-minute safety cap makes the core exit (rather than hang) if the

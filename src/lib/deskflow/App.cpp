@@ -9,6 +9,8 @@
 
 #include "DisplayInvalidException.h"
 #include "arch/Arch.h"
+
+#include <QFileInfo>
 #include "base/Log.h"
 #include "base/LogOutputters.h"
 #include "common/ExitCodes.h"
@@ -99,6 +101,27 @@ int App::run()
   }
 
   return result;
+}
+
+void App::gateWaitForRelease()
+{
+  // MouseTransfer warm-standby latch. Called from startNode() — i.e. after ALL app/framework init is
+  // warm (QCoreApplication, appUtil().run(), the event loop) but BEFORE the KVM engine (screen, input
+  // hooks, network). With --start-gated <file>, block here until the launcher DELETES the file. A
+  // blocked warm-standby is silent (no hook, no NIC — just the loaded process's RAM). This is what
+  // moves the ~0.8s process-startup off the game-mode resume critical path: the launcher pre-spawns us
+  // at ENTER (we warm up and park here), then deletes the file on tab-out and we fall straight into the
+  // engine in ~10ms. No timeout on purpose — a game can run for hours; a stuck gate after a launcher
+  // death is harmless (silent) and is swept by the next launcher spawn's stray-core sweep.
+  if (m_gateFile.isEmpty()) {
+    return;
+  }
+  LOG_INFO("MT-gate: warm-standby ready; waiting for release (%s)", qPrintable(m_gateFile));
+  const double gateStart = ARCH->time();
+  while (QFileInfo::exists(m_gateFile)) {
+    ARCH->sleep(0.05);
+  }
+  LOG_INFO("MT-gate: released after %.3fs — starting the KVM engine", ARCH->time() - gateStart);
 }
 
 void App::setupFileLogging()

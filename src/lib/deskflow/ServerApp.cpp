@@ -628,6 +628,10 @@ const char *ServerApp::daemonName() const
 
 void ServerApp::startNode()
 {
+  // MouseTransfer warm-standby: block here (silently) until released, if --start-gated was given. This
+  // is AFTER all framework init is warm but BEFORE startServer touches the screen/hooks/network, so a
+  // managed launcher pays the process cold-start off the game-mode resume critical path.
+  gateWaitForRelease();
   // start the server.  if this return false then we've failed and
   // we shouldn't retry.
   LOG_DEBUG1("starting server");

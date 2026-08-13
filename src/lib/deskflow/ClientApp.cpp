@@ -398,6 +398,10 @@ void ClientApp::tryNextServer()
 
 void ClientApp::startNode()
 {
+  // MouseTransfer warm-standby: block here (silently) until released, if --start-gated was given —
+  // AFTER framework init is warm, BEFORE startClient touches the screen/hooks/network. Lets a managed
+  // launcher pay the process cold-start off the game-mode resume critical path.
+  gateWaitForRelease();
   // start the client.  if this return false then we've failed and
   // we shouldn't retry.
   LOG_DEBUG1("starting client");

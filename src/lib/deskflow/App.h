@@ -77,6 +77,13 @@ public:
   void loggingFilterWarning() const;
   void initApp() override;
 
+  /// @brief MouseTransfer warm-standby latch: path to a gate file to wait on before starting the KVM
+  /// engine (see gateWaitForRelease). Empty = start immediately. Set from the --start-gated arg.
+  void setGateFile(const QString &f)
+  {
+    m_gateFile = f;
+  }
+
   void setEvents(EventQueue &events)
   {
     m_events = &events;
@@ -106,8 +113,13 @@ public:
 
 protected:
   void runEventsLoop(const void *);
+  /// @brief MouseTransfer warm-standby: if a gate file was set, block (silently — no hook/screen/net)
+  /// until it is deleted. Called from startNode(), i.e. AFTER all app/framework init is warm but BEFORE
+  /// the KVM engine, so a managed launcher pays the process cold-start off the resume critical path.
+  void gateWaitForRelease();
 
 private:
+  QString m_gateFile;
   void (*m_bye)(int);
   IEventQueue *m_events = nullptr;
   static App *s_instance;
