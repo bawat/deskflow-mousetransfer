@@ -34,6 +34,8 @@ public:
   bool serverMode() const;
   bool clientMode() const;
   bool singleInstanceOnly() const;
+  /// @brief the --start-gated release-file path, or empty when not warm-standby
+  QString gateFile() const;
 
 private:
   [[noreturn]] void showHelpText() const;

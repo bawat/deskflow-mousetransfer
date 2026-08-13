@@ -1301,5 +1301,23 @@ Also added lightweight startup timing to `ServerApp.cpp` (diagnostic `MT-startup
 settings init, screen ready, client listener open, and total at "started server") so the core-init
 phase (spawn → listening) can be attributed from the log instead of guessed.
 
+## Warm-standby start latch: `--start-gated <gateFile>` (2026-08-13)
+
+The profiling above showed the core's OWN init is ~8ms — the ~700ms of a game-mode resume is the OS
+cold-starting the Qt process (mapping the exe + Qt6/OpenSSL DLLs + `QCoreApplication`) BEFORE any
+Deskflow code runs. To take that off the resume critical path, `deskflow-core` now accepts
+`--start-gated <gateFile>` (`CoreArgs.h`/`CoreArgParser.*`, consumed in `deskflow-core.cpp` `main()`):
+
+- With the flag, the process loads fully (that ~700ms is paid), then — right after arg parsing and the
+  duplicate-instance check, BEFORE the `EventQueue`/`ServerApp`/`ClientApp` and thus before any input
+  hook, screen, or network — it BLOCKS, polling `<gateFile>` every 50ms. Existence == held; **deletion
+  is the atomic release.** A blocked warm-standby is silent (no hooks, no NIC; just the loaded process's
+  RAM). On release it falls straight through into the KVM engine (~10ms to listening/connecting).
+- The managed launcher spawns a gated core at game-mode ENTER (in the real role) so the cold-start
+  happens while the user is already gaming; on tab-out it deletes the gate file and the warm core goes
+  live in ~10ms instead of ~700ms. A 15-minute safety cap makes the core exit (rather than hang) if the
+  launcher dies without releasing, so a fresh core can be spawned.
+- Backward compatible: without the flag the path is inert — the core starts exactly as before.
+
 The wrapper's connect-wedge watchdog + client-linger derivations (cmd/corewatchdog.go,
 cmd/coreclients.go) were updated to match the ~3.25s cycle while staying far above any legitimate connect.

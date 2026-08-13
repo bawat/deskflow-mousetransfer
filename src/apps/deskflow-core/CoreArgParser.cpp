@@ -102,3 +102,8 @@ bool CoreArgParser::singleInstanceOnly() const
 {
   return m_singleInstance;
 }
+
+QString CoreArgParser::gateFile() const
+{
+  return m_parser.isSet(CoreArgs::startGatedOption) ? m_parser.value(CoreArgs::startGatedOption) : QString();
+}
