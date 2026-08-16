@@ -1006,7 +1006,27 @@ void MSWindowsDesks::checkRdpFgHold()
     }
     m_fgHoldActive = true;
     // Only bother the desk thread when the hold is not already satisfied.
-    if (GetForegroundWindow() != active) {
+    //
+    // MouseTransfer (PDN menus, 2026-08-16): SAME-PROCESS foreground SATISFIES the hold. The
+    // GetLastActivePopup follow above only sees popups OWNED by the held window — but WinForms
+    // parks its menu drop-downs under invisible helper owners (Paint.NET's File/Edit menus and
+    // palette-toggle popups measure owner = a 16x16 invisible window, never the main form), so the
+    // follow could not see them, the 0.2s re-assert snatched activation back from the just-opened
+    // drop-down, and the app closed it on deactivation (owner: the menu "disappears in about .5 of
+    // a second"). If the application handed foreground to ANOTHER OF ITS OWN windows, that is the
+    // window the viewer's input is meant to reach — the same rationale the owned-dialog follow
+    // already encodes, minus the assumption that ownership links the two. A different process in
+    // the foreground is still stolen from, which is the hold doing its job.
+    HWND fgNow = GetForegroundWindow();
+    bool sameProcess = false;
+    if (fgNow != nullptr && fgNow != active) {
+      DWORD fgPid = 0;
+      DWORD wantPid = 0;
+      GetWindowThreadProcessId(fgNow, &fgPid);
+      GetWindowThreadProcessId(want, &wantPid);
+      sameProcess = (fgPid != 0 && fgPid == wantPid);
+    }
+    if (fgNow != active && !sameProcess) {
       sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
     }
   } else if (m_fgHoldActive) {

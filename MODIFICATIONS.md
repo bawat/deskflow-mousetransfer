@@ -1329,3 +1329,16 @@ Deskflow code runs. To take that off the resume critical path, `deskflow-core` n
 
 The wrapper's connect-wedge watchdog + client-linger derivations (cmd/corewatchdog.go,
 cmd/coreclients.go) were updated to match the ~3.25s cycle while staying far above any legitimate connect.
+
+## RDP fg-hold: same-process foreground satisfies the hold (2026-08-16)
+
+`MSWindowsDesks::checkRdpFgHold` re-asserts the held export window as foreground every 0.2s while
+the shared cursor is away. It already follows an active OWNED popup (`GetLastActivePopup` — the
+Save As rule), but WinForms parks its menu drop-downs under invisible helper owners (Paint.NET's
+File/Edit menus measure owner = a 16x16 invisible window, never the main form), so the follow could
+not see them: the re-assert snatched activation back from a just-opened drop-down and the
+application closed it on deactivation ("the menu disappears in about .5 of a second"). The hold is
+now also satisfied when the CURRENT foreground window belongs to the SAME PROCESS as the held
+window — the application handed foreground to another of its own windows, which is the window the
+viewer's input is meant to reach (the owned-dialog rationale minus the assumption that ownership
+links the two). A different process in the foreground is still stolen from, unchanged.
