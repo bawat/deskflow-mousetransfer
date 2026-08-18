@@ -1384,10 +1384,33 @@ injection's saved position honest so the next hardware delta is not corrupted �
 rect (`m_vs*`), **not** the shrunk seam. VDD windows live OUTSIDE the seam by design and a tagged
 injection legitimately targets them; the OS pins the real cursor at the edge of reality, so the saved
 "truth" must be the full-desktop clamp. Clamping an on-VDD injection to the real edge would re-create
-exactly the delta corruption that clamp exists to prevent. `isCursorClippedToSubRegion()` is untouched
-and still reads `SM_*VIRTUALSCREEN` directly (it must keep meaning "the full desktop"); no `ClipCursor`
-is added.
+exactly the delta corruption that clamp exists to prevent. (The `DESKFLOW_MSG_INJECT_AT` clamp stays on
+`SM_*VIRTUALSCREEN` / `m_vs*`; `isCursorClippedToSubRegion()` was left on it too at first — see the
+follow-up below, which corrects that.)
 
 **Stock Deskflow never reaches this.** With no `server-bounds` file (which only the wrapper writes),
 `readServerBounds()` returns false every read and `m_x/y/w/h` equal the full raw rect — byte-identical
 to upstream. Windows-only (`MSWindowsScreen`); non-Windows screens are untouched.
+
+### A clip that fills the REAL desktop is not a lock (RDP-VDD follow-up, 2026-08-19)
+
+**File:** `src/lib/platform/MSWindowsScreen.cpp` (`isCursorClippedToSubRegion`)
+
+The entry above left `isCursorClippedToSubRegion()` reading `SM_*VIRTUALSCREEN` — "the full desktop".
+With the RDP-VDD attached that full desktop is INFLATED by the invisible monitor, so an *ordinary*
+`ClipCursor` to the real desktop — a fullscreen video player pinning the cursor to its own monitor — now
+measures as a "sub-region" of that inflated rectangle and is misread as a deliberate lock. The server
+then refuses to switch, and the shared cursor **freezes on whichever screen it is on for the whole
+handoff** (owner-reported 2026-08-19: cursor frozen on the peer machine, streamed video still playing,
+keyboard still working, released only by closing the viewer). This is the fork-side reconciliation the
+RDP-VDD design (`internal/rdpexport/bordervdd.go`) said had to land before a clip could be trusted as a
+lock again.
+
+Fix: after the raw-desktop sub-region test passes, if the clip **fills the seam canvas** `m_x/y/w/h`
+(the raw desktop already INTERSECTED with the wrapper's `server-bounds` signal — i.e. the real desktop
+with the invisible VDD excluded) within the same 1 px slack, treat it as unconfined. A clip that fills
+the whole real desktop is never a deliberate cursor-lock. The wrapper's own fullscreen cursor-lock
+**insets** its clip by several px, so it never fills the canvas exactly and stays correctly detected;
+the Windows move-loop work-area exception below is likewise unaffected. Without a `server-bounds` signal
+(no VDD) `m_x/y/w/h` equal `m_vs*`, so the new test matches the same rect the raw sub-region test just
+cleared — a no-op, keeping stock/upstream behaviour byte-identical.

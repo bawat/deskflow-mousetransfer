@@ -785,6 +785,28 @@ bool MSWindowsScreen::isCursorClippedToSubRegion() const
   if (!sub) {
     return false;
   }
+  // Merged-fork (RDP-VDD, 2026-08-19, the "cursor frozen on the peer during a handoff" fault):
+  // the resident RDP-VDD is a real monitor to Windows, so it INFLATES the raw virtual desktop
+  // (m_vs*/SM_*VIRTUALSCREEN). A perfectly ordinary clip to the REAL desktop -- a fullscreen app such
+  // as a video player pinning the cursor to its own monitor -- then measures as a "sub-region" of that
+  // inflated rectangle above, tripping the lock and STOPPING seam-crossing for the whole handoff
+  // (owner-reported: cursor frozen in place on the destination machine, the streamed video still
+  // playing, the keyboard still working, released only by closing the viewer). The seam canvas
+  // m_x/y/w/h is the raw desktop INTERSECTED with the wrapper's server-bounds signal -- i.e. the real
+  // desktop with the invisible VDD excluded (applyServerCanvas). A clip that FILLS it is the whole
+  // real desktop, never a deliberate cursor-lock, so treat it as unconfined. This is the fork-side
+  // reconciliation the RDP-VDD design (internal/rdpexport/bordervdd.go) said had to land before a clip
+  // could be trusted as a lock again. Without a server-bounds signal (no VDD) m_x/y/w/h == m_vs*, so
+  // this matches the same rect the `!sub` test already cleared -- a no-op on machines with no VDD.
+  // The wrapper's OWN fullscreen cursor-lock insets its clip by several px (fullscreenlock_windows.go),
+  // so it never fills the canvas exactly and stays correctly detected here.
+  {
+    auto edgeEq = [slack](LONG a, int32_t b) { return a - b <= slack && b - a <= slack; };
+    if (edgeEq(clip.left, m_x) && edgeEq(clip.top, m_y) && //
+        edgeEq(clip.right, m_x + m_w) && edgeEq(clip.bottom, m_y + m_h)) {
+      return false; // the clip fills the real (VDD-excluded) desktop -- not a lock
+    }
+  }
   // Merged-fork (2026-08-12, the intermittent "cursor locked at the transition edge"): Windows'
   // own MODAL MOVE LOOP clips the cursor to a monitor WORK AREA (screen minus taskbar) and
   // RE-APPLIES it on every mouse move, while the wrapper's counter-release runs on a 20 ms tick --
