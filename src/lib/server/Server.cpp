@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <chrono>   // MouseTransfer (MT-swtrace): time the switchScreen phases to pin the handoff-commit freeze
 #include <fstream>  // MouseTransfer: switch-request file poll
 #include <iterator> // MouseTransfer: istreambuf_iterator
 
@@ -508,6 +509,13 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
       return;
     }
 
+    // MouseTransfer (MT-swtrace): time the phases AFTER leaving the screen. The relay-thread freeze at a
+    // handoff commit happens right here (coreout goes silent for ~16s the moment the cursor leaves to the
+    // viewer). Any of these can BLOCK the relay thread: the clipboard re-read (a hung clipboard owner),
+    // or m_active->enter()/setClipboard() (a NETWORK send to a client that is momentarily too busy to
+    // read — the viewer setting up the RDP stream). Whichever phase blocked shows as its own big number.
+    const auto mtSw0 = std::chrono::steady_clock::now();
+
     // update the primary client's clipboards if we're leaving the
     // primary screen.
     //
@@ -531,6 +539,7 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
         }
       }
     }
+    const auto mtSw1 = std::chrono::steady_clock::now(); // MT-swtrace: after the clipboard re-read
 
 #if defined(__APPLE__)
     if (dst != m_primaryClient) {
@@ -552,6 +561,7 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
 
     // enter new screen
     m_active->enter(x, y, m_seqNum, m_primaryClient->getToggleMask(), forScreensaver);
+    const auto mtSw2 = std::chrono::steady_clock::now(); // MT-swtrace: after enter() (network send to the client)
 
     if (m_enableClipboard) {
       // send the clipboard data to new active screen
@@ -579,6 +589,22 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
           continue;
         }
         m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
+      }
+    }
+    const auto mtSw3 = std::chrono::steady_clock::now(); // MT-swtrace: after the clipboard send to the new screen
+
+    // MT-swtrace: report any switchScreen that stalled the relay thread (>150ms in a phase is abnormal;
+    // the handoff-commit freeze is ~16s). Whichever phase carries the big number is the culprit:
+    // clipboard-reread (local, hung owner) vs enter (network send to a busy viewer) vs clipboard-send.
+    {
+      auto ms = [](const std::chrono::steady_clock::time_point &a, const std::chrono::steady_clock::time_point &b) {
+        return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
+      };
+      if (ms(mtSw0, mtSw3) > 150) {
+        LOG_NOTE(
+            "MT-swtrace: switchScreen SLOW total=%lldms  clipboard-reread=%lldms enter=%lldms clipboard-send=%lldms  -> %s",
+            ms(mtSw0, mtSw3), ms(mtSw0, mtSw1), ms(mtSw1, mtSw2), ms(mtSw2, mtSw3), getName(dst).c_str()
+        );
       }
     }
 
@@ -2152,7 +2178,16 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
     // warp cursor if it moved.
     if (m_x != xOld || m_y != yOld) {
       LOG_DEBUG2("move on %s to %d,%d", getName(m_active).c_str(), m_x, m_y);
+      // MT-swtrace: time the relay send. If the client (the viewer) is momentarily too busy to read its
+      // socket, this NETWORK send BLOCKS the relay thread — a candidate for the handoff-commit freeze.
+      // Normal is well under a ms; a slow one is logged (and its duration is how long the relay froze).
+      const auto mtRs = std::chrono::steady_clock::now();
       m_active->mouseMove(m_x, m_y);
+      const auto mtRms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtRs).count();
+      if (mtRms > 150) {
+        LOG_NOTE("MT-swtrace: relay mouseMove to %s BLOCKED %lldms", getName(m_active).c_str(), (long long)mtRms);
+      }
     }
   }
 }
