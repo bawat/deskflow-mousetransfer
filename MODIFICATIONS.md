@@ -1342,3 +1342,52 @@ now also satisfied when the CURRENT foreground window belongs to the SAME PROCES
 window — the application handed foreground to another of its own windows, which is the window the
 viewer's input is meant to reach (the owned-dialog rationale minus the assumption that ownership
 links the two). A different process in the foreground is still stolen from, unchanged.
+
+### Exclude a designated VDD monitor from the server canvas (2026-08-18)
+
+**Files:** `src/lib/platform/MSWindowsScreen.{h,cpp}`
+
+The MouseTransfer wrapper attaches an extra virtual-display monitor (an "RDP-VDD") adjacent to the
+real monitor to hide a screen-capture border. Deskflow's server treats the **whole Windows virtual
+desktop** as its seam canvas (`MSWindowsScreen::updateScreenShape` reads `SM_*VIRTUALSCREEN` into
+`m_x/y/w/h`, and the server reads `getShape()` live on every mouse move), so that adjacent VDD sits
+in the cursor's crossing path between machines — the shared cursor can be pushed into a monitor that
+exists only to hide a border. This change lets the wrapper tell the core a **server-bounds**
+rectangle (the bounding box of the REAL monitors) and shrinks the seam canvas to it, so the crossing
+edge stays at the real monitor while **absolute injection onto the VDD keeps working against the full
+desktop**.
+
+**Mechanism.** `updateScreenShape` now reads the raw virtual-desktop rect into new members
+`m_vsX/m_vsY/m_vsW/m_vsH` (the FULL desktop, every monitor incl. the VDD), then derives the seam
+canvas `m_x/y/w/h` via a new `applyServerCanvas()`: it **INTERSECTS** the raw rect with the
+wrapper's requested bounds (never blindly adopts them — the core must never advertise a canvas larger
+than reality), and falls back to the full raw rect if the intersection is empty/degenerate or no
+live bounds file exists. Because `getShape()`, the low-level hook's jump zone (`m_hook.setZone`) and
+`onMouseMove`'s bogus-delta filter all read `m_x/y/w/h`, shrinking those four fields relocates the
+seam everywhere with no server-side change.
+
+**The signal.** A wrapper-written file `server-bounds` (env override
+`MOUSETRANSFER_SERVERBOUNDSFILE`) in the same runtime dir the core reads `rdp-park`/`switchreq` from,
+containing `<x> <y> <w> <h> <pid>` — the desired canvas in SIGNED virtual-screen coordinates plus the
+writer's PID. Read by `readServerBounds()` with the **exact same liveness rule as `rdp-park`**
+(`OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject(...,0) == WAIT_TIMEOUT` ⇒ writer live); a stale
+writer, a parse failure, or `w<=0 || h<=0` all yield "no bounds" and the full rect. Applied on
+`WM_DISPLAYCHANGE` (which VDD attach/detach fires, via `onDisplayChange → updateScreenShape`) and
+**also polled on the existing 1 Hz `handleFixes` cadence** (same event-queue thread as
+`onDisplayChange`), so a file written slightly after the display change still takes effect; on a real
+canvas change the poll re-applies `setShape` + `setZone` (primary, on-screen) + `ScreenShapeChanged`,
+mirroring `onDisplayChange`'s post-update steps (it deliberately omits the away-cursor re-centre, as
+the raw desktop did not move).
+
+**The critical invariant.** The `DESKFLOW_MSG_INJECT_AT` clamp — which keeps a tagged absolute
+injection's saved position honest so the next hardware delta is not corrupted — now clamps to the RAW
+rect (`m_vs*`), **not** the shrunk seam. VDD windows live OUTSIDE the seam by design and a tagged
+injection legitimately targets them; the OS pins the real cursor at the edge of reality, so the saved
+"truth" must be the full-desktop clamp. Clamping an on-VDD injection to the real edge would re-create
+exactly the delta corruption that clamp exists to prevent. `isCursorClippedToSubRegion()` is untouched
+and still reads `SM_*VIRTUALSCREEN` directly (it must keep meaning "the full desktop"); no `ClipCursor`
+is added.
+
+**Stock Deskflow never reaches this.** With no `server-bounds` file (which only the wrapper writes),
+`readServerBounds()` returns false every read and `m_x/y/w/h` equal the full raw rect — byte-identical
+to upstream. Windows-only (`MSWindowsScreen`); non-Windows screens are untouched.

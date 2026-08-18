@@ -31,6 +31,8 @@
 #include <Shlobj.h>
 #include <algorithm>
 #include <comutil.h>
+#include <cstdlib> // MouseTransfer (VDD server-bounds): std::getenv for the signal-file override
+#include <fstream> // MouseTransfer (VDD server-bounds): std::ifstream to read the signal file
 #include <string.h>
 
 // suppress warning about GetVersionEx, which is used indirectly in this
@@ -106,6 +108,17 @@ MSWindowsScreen::MSWindowsScreen(bool isPrimary, bool useHooks, IEventQueue *eve
     m_keyState = new MSWindowsKeyState(
         m_desks, getEventTarget(), m_events, AppUtil::instance().getKeyboardLayoutList(), enableLangSync
     );
+
+    // MouseTransfer (VDD server-bounds): resolve the signal file BEFORE the first
+    // updateScreenShape() so the constructor's canvas already honours it. Same convention as the
+    // switchreq / rdp-park polls -- an env override, else a well-known name relative to the core's
+    // CWD (the launcher sets the CWD to the bundle dir, where the wrapper writes its core-facing
+    // files). Stock Deskflow never writes this file, so the canvas stays the full raw rect.
+    if (const char *env = std::getenv("MOUSETRANSFER_SERVERBOUNDSFILE"); env != nullptr && *env != '\0') {
+      m_serverBoundsFile = env;
+    } else {
+      m_serverBoundsFile = "server-bounds";
+    }
 
     updateScreenShape();
     m_class = createWindowClass();
@@ -1013,18 +1026,25 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
     // off-screen and the viewer aims at its off-screen pixels), but the OS pins the real cursor
     // at the edge. Saving the request instead of the truth made every following hardware delta
     // include the difference (measured 2026-08-09: injections aimed at x=2143 on a 1920 screen,
-    // -223 px teleports on the client). Same bounds the bogus filter reads (m_x/m_y/m_w/m_h).
+    // -223 px teleports on the client).
+    //
+    // MouseTransfer (VDD server-bounds) -- CRITICAL: clamp to the RAW virtual desktop (m_vs*), NOT
+    // the seam canvas (m_x/y/w/h). When the seam is shrunk to exclude an RDP-VDD monitor, VDD
+    // windows live OUTSIDE the canvas BY DESIGN, and a tagged injection legitimately targets them.
+    // The OS pins the real cursor at the edge of REALITY (the full desktop), so the "truth" we save
+    // must be the full-desktop clamp; clamping to the shrunk seam would push the saved position onto
+    // the real edge and re-introduce exactly the delta-corruption this clamp exists to prevent.
     int32_t ix = static_cast<int32_t>(wParam);
     int32_t iy = static_cast<int32_t>(lParam);
-    if (ix < m_x) {
-      ix = m_x;
-    } else if (ix > m_x + m_w - 1) {
-      ix = m_x + m_w - 1;
+    if (ix < m_vsX) {
+      ix = m_vsX;
+    } else if (ix > m_vsX + m_vsW - 1) {
+      ix = m_vsX + m_vsW - 1;
     }
-    if (iy < m_y) {
-      iy = m_y;
-    } else if (iy > m_y + m_h - 1) {
-      iy = m_y + m_h - 1;
+    if (iy < m_vsY) {
+      iy = m_vsY;
+    } else if (iy > m_vsY + m_vsH - 1) {
+      iy = m_vsY + m_vsH - 1;
     }
     mtDiagPush('I', ix, iy);
     saveMousePosition(ix, iy);
@@ -1728,19 +1748,103 @@ bool MSWindowsScreen::ignore() const
 
 void MSWindowsScreen::updateScreenShape()
 {
-  // get shape and center
-  m_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-  m_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-  m_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-  m_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  // MouseTransfer (VDD server-bounds): the RAW virtual-desktop rect. m_vs* always describe the
+  // FULL Windows virtual desktop (every monitor, an RDP-VDD included) -- they are what a tagged
+  // absolute injection clamps against (INJECT_AT). Stock code read these straight into m_x/y/w/h;
+  // we keep the raw values here and derive the (possibly shrunk) seam canvas below.
+  m_vsW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  m_vsH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  m_vsX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  m_vsY = GetSystemMetrics(SM_YVIRTUALSCREEN);
   m_xCenter = GetSystemMetrics(SM_CXSCREEN) >> 1;
   m_yCenter = GetSystemMetrics(SM_CYSCREEN) >> 1;
 
-  // check for multiple monitors
-  m_multimon = (m_w != GetSystemMetrics(SM_CXSCREEN) || m_h != GetSystemMetrics(SM_CYSCREEN));
+  // check for multiple monitors (unchanged: measured against the raw desktop, as upstream)
+  m_multimon = (m_vsW != GetSystemMetrics(SM_CXSCREEN) || m_vsH != GetSystemMetrics(SM_CYSCREEN));
+
+  // MouseTransfer (VDD server-bounds): set the seam canvas m_x/y/w/h = raw rect INTERSECTED with
+  // the wrapper's requested bounds (or the full raw rect when no live bounds file exists). This is
+  // what getShape/setZone/onMouseMove read, so it relocates the crossing edge everywhere at once.
+  applyServerCanvas();
 
   // tell the desks
   m_desks->setShape(m_x, m_y, m_w, m_h, m_xCenter, m_yCenter, m_multimon);
+}
+
+// MouseTransfer (VDD server-bounds): recompute the seam canvas from the raw rect (m_vs*) and the
+// wrapper-written bounds. INTERSECT, never blindly adopt -- the core must NEVER advertise a canvas
+// larger than the real desktop, so the request is clipped to the raw rect; the seam then hugs
+// whatever real monitors the wrapper's bounding box covers. A degenerate/empty intersection (or no
+// live bounds file) falls back to the full raw rect. Returns true iff m_x/y/w/h changed.
+bool MSWindowsScreen::applyServerCanvas()
+{
+  int32_t nx = m_vsX, ny = m_vsY, nw = m_vsW, nh = m_vsH;
+
+  int32_t bx = 0, by = 0, bw = 0, bh = 0;
+  if (readServerBounds(bx, by, bw, bh)) {
+    // Rectangle intersection with plain comparisons -- <Windows.h> here defines the min/max MACROS
+    // (no NOMINMAX in this TU), which would clobber std::min/std::max.
+    const int32_t rawR = m_vsX + m_vsW, rawB = m_vsY + m_vsH;
+    const int32_t reqR = bx + bw, reqB = by + bh;
+    const int32_t l = (m_vsX > bx) ? m_vsX : bx;
+    const int32_t t = (m_vsY > by) ? m_vsY : by;
+    const int32_t r = (rawR < reqR) ? rawR : reqR;
+    const int32_t b = (rawB < reqB) ? rawB : reqB;
+    if (r - l > 0 && b - t > 0) {
+      nx = l;
+      ny = t;
+      nw = r - l;
+      nh = b - t;
+    }
+    // else: empty/degenerate intersection -- keep the full raw rect (guard against a bad request).
+  }
+
+  const bool changed = (nx != m_x || ny != m_y || nw != m_w || nh != m_h);
+  m_x = nx;
+  m_y = ny;
+  m_w = nw;
+  m_h = nh;
+  return changed;
+}
+
+// MouseTransfer (VDD server-bounds): read + validate the wrapper's requested server canvas. The
+// file is "<x> <y> <w> <h> <pid>" (decimal; x/y signed virtual-screen coords; w/h positive; pid
+// the writer) -- the same shape and liveness rule as rdp-park (checkRdpPark), so the wrapper can
+// reuse its file-writing plumbing. Returns true (filling x/y/w/h) ONLY when the file exists,
+// parses, w>0 && h>0, and the writer PID is live (OpenProcess(SYNCHRONIZE) + WaitForSingleObject
+// == WAIT_TIMEOUT, i.e. NOT signalled). Any other outcome returns false so the caller uses the
+// full raw rect. Inert for stock Deskflow: no wrapper writes the file, so this returns false and
+// the canvas is byte-identical to today.
+bool MSWindowsScreen::readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32_t &h) const
+{
+  if (m_serverBoundsFile.empty()) {
+    return false;
+  }
+
+  std::ifstream in(m_serverBoundsFile);
+  long long bx = 0, by = 0, bw = 0, bh = 0;
+  unsigned long long pidVal = 0;
+  if (!(in && (in >> bx >> by >> bw >> bh >> pidVal)) || bw <= 0 || bh <= 0 || pidVal == 0) {
+    return false;
+  }
+
+  // Writer liveness, exactly as checkRdpPark: a SIGNALLED process object means the wrapper is gone
+  // and its bounds are stale -- fall back to the full rect. One OpenProcess per read, only while a
+  // parseable bounds file exists.
+  bool live = false;
+  if (HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pidVal))) {
+    live = (WaitForSingleObject(proc, 0) == WAIT_TIMEOUT);
+    CloseHandle(proc);
+  }
+  if (!live) {
+    return false;
+  }
+
+  x = static_cast<int32_t>(bx);
+  y = static_cast<int32_t>(by);
+  w = static_cast<int32_t>(bw);
+  h = static_cast<int32_t>(bh);
+  return true;
 }
 
 void MSWindowsScreen::handleFixes()
@@ -1751,6 +1855,28 @@ void MSWindowsScreen::handleFixes()
   // update keys if keyboard layouts have changed
   if (m_keyState->didGroupsChange()) {
     updateKeys();
+  }
+
+  // MouseTransfer (VDD server-bounds): poll the signal file on this existing 1 Hz cadence. VDD
+  // attach/detach fires WM_DISPLAYCHANGE (-> onDisplayChange -> updateScreenShape, which already
+  // honours the file), but the wrapper may WRITE/refresh/remove the file slightly AFTER that event
+  // -- so the poll catches the case where only the file changed (the raw desktop did not). This
+  // handler runs on the SAME event-queue thread as onDisplayChange (both delivered by
+  // MSWindowsEventQueueBuffer's GetMessage pump), so setShape/setZone/sendEvent are as safe here as
+  // there. applyServerCanvas re-reads only the file (m_vs* are untouched between display changes);
+  // on a real change, relocate the seam exactly as onDisplayChange's post-update steps do. The
+  // away-cursor re-centre onDisplayChange does on a RESOLUTION change is deliberately omitted: the
+  // raw rect did not move, so the physical cursor is still at a valid position and must not be
+  // disturbed (e.g. an RDP park). Inert without the file (applyServerCanvas returns false).
+  if (applyServerCanvas()) {
+    LOG_DEBUG(
+        "server-bounds: seam canvas -> %d,%d %dx%d (raw %d,%d %dx%d)", m_x, m_y, m_w, m_h, m_vsX, m_vsY, m_vsW, m_vsH
+    );
+    m_desks->setShape(m_x, m_y, m_w, m_h, m_xCenter, m_yCenter, m_multimon);
+    if (m_isPrimary && m_isOnScreen) {
+      m_hook.setZone(m_x, m_y, m_w, m_h, getJumpZoneSize());
+    }
+    sendEvent(EventTypes::ScreenShapeChanged);
   }
 }
 

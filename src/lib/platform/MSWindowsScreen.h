@@ -196,6 +196,21 @@ private: // HACK
   // update screen size cache
   void updateScreenShape();
 
+  // MouseTransfer (VDD server-bounds): recompute the SEAM CANVAS (m_x/y/w/h) from the raw
+  // virtual-desktop rect (m_vs*) INTERSECTED with the wrapper-written server-bounds rectangle,
+  // when that file is present and its writer is live; otherwise the canvas is the full raw rect.
+  // Returns true iff the canvas actually changed, so the 1 Hz poll can re-apply setShape/setZone/
+  // ScreenShapeChanged only on a real change. Split out of updateScreenShape so the poll can run
+  // it without re-reading SM_*VIRTUALSCREEN. See MODIFICATIONS.md.
+  bool applyServerCanvas();
+
+  // MouseTransfer (VDD server-bounds): read + validate the wrapper's requested server canvas from
+  // the signal file. Contract: "<x> <y> <w> <h> <pid>" (decimal; x/y signed virtual-screen coords;
+  // w/h positive; pid the writer, for liveness) -- same coordinate space and liveness rule as
+  // rdp-park. Fills x/y/w/h and returns true only when the file exists, parses, w>0 && h>0, and the
+  // writer PID is live; any other outcome returns false (=> caller uses the full raw rect).
+  bool readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32_t &h) const;
+
   // fix timer callback
   void handleFixes();
 
@@ -318,6 +333,25 @@ private:
   int32_t m_h = 0;
   int32_t m_xCenter = 0;
   int32_t m_yCenter = 0;
+
+  // MouseTransfer (VDD server-bounds): the RAW Windows virtual-desktop rect (SM_*VIRTUALSCREEN),
+  // kept SEPARATELY from the seam canvas above. m_x/y/w/h are the server's crossing canvas --
+  // normally the full desktop, but shrunk to the wrapper's server-bounds intersection so an
+  // adjacent RDP-VDD monitor stays OUT of the cursor's crossing path. m_vs* always describe the
+  // FULL desktop (every monitor, the VDD included) because a tagged absolute injection onto the
+  // VDD (DESKFLOW_MSG_INJECT_AT) must clamp to the real edge of REALITY, never to the shrunk seam
+  // -- clamping an on-VDD injection to the seam edge would corrupt the next hardware delta. See
+  // MODIFICATIONS.md.
+  int32_t m_vsX = 0;
+  int32_t m_vsY = 0;
+  int32_t m_vsW = 0;
+  int32_t m_vsH = 0;
+
+  // MouseTransfer (VDD server-bounds): resolved path of the wrapper-written signal file
+  // ($MOUSETRANSFER_SERVERBOUNDSFILE, else "server-bounds" relative to the core CWD -- the same
+  // dir the core reads rdp-park/switchreq from). Empty only if resolution has not run; when the
+  // file simply does not exist the feature is inert and the canvas equals the full raw rect.
+  std::string m_serverBoundsFile;
 
   // true if system appears to have multiple monitors
   bool m_multimon = false;
