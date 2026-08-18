@@ -1797,6 +1797,31 @@ bool MSWindowsScreen::applyServerCanvas()
       nh = b - t;
     }
     // else: empty/degenerate intersection -- keep the full raw rect (guard against a bad request).
+
+    // HOLD-THE-CLAMP bookkeeping: remember whether this is a proper shrink and the raw rect it was
+    // computed against, so a subsequent transient read failure can hold it instead of reverting (.h).
+    m_canvasClamped = (nx > m_vsX || ny > m_vsY || nw < m_vsW || nh < m_vsH);
+    m_clampRawX = m_vsX;
+    m_clampRawY = m_vsY;
+    m_clampRawW = m_vsW;
+    m_clampRawH = m_vsH;
+    m_clampX = nx;
+    m_clampY = ny;
+    m_clampW = nw;
+    m_clampH = nh;
+  } else if (m_canvasClamped && m_vsX == m_clampRawX && m_vsY == m_clampRawY && m_vsW == m_clampRawW &&
+             m_vsH == m_clampRawH) {
+    // Transient read failure while the RAW desktop is unchanged -> the RDP-VDD is still present; HOLD the
+    // last clamp rather than snapping the seam back to the full desktop (which re-opens the void for ~1s
+    // -- the froze-at-3837 fault, live-diagnosed 2026-08-18). See MSWindowsScreen.h.
+    nx = m_clampX;
+    ny = m_clampY;
+    nw = m_clampW;
+    nh = m_clampH;
+  } else {
+    // Read failed AND the raw rect changed (a real monitor add/remove) or we never clamped: the old
+    // clamp is meaningless now -- fall back to the raw desktop.
+    m_canvasClamped = false;
   }
 
   const bool changed = (nx != m_x || ny != m_y || nw != m_w || nh != m_h);

@@ -358,6 +358,19 @@ private:
   // not on every poll. Temporary instrumentation to find why the clamp does not apply on the fleet.
   mutable std::string m_sbLastDiag;
 
+  // MouseTransfer (VDD server-bounds) HOLD-THE-CLAMP: once we have shrunk the seam canvas to the real
+  // monitors, a LATER read that transiently fails (the wrapper's file momentarily absent during a
+  // restart, or caught mid-rewrite) must NOT snap the canvas back to the full raw desktop -- that
+  // re-exposes the invisible RDP-VDD for ~1s, long enough for a seam crossing to strand the cursor in
+  // it (live-diagnosed 2026-08-18: a crossing then landed at x=3837, inside the VDD, and froze). So we
+  // remember the last clamp AND the raw rect it was computed against, and on a failed read we KEEP the
+  // clamp as long as the raw desktop is unchanged (the VDD is still present); only a real change to the
+  // raw rect (a monitor genuinely added/removed) releases it. Fail-safe: a dead wrapper keeps the void
+  // shut, not open.
+  bool m_canvasClamped = false;
+  int32_t m_clampRawX = 0, m_clampRawY = 0, m_clampRawW = 0, m_clampRawH = 0;
+  int32_t m_clampX = 0, m_clampY = 0, m_clampW = 0, m_clampH = 0;
+
   // true if system appears to have multiple monitors
   bool m_multimon = false;
 
