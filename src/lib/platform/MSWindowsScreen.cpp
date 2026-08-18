@@ -1817,14 +1817,40 @@ bool MSWindowsScreen::applyServerCanvas()
 // the canvas is byte-identical to today.
 bool MSWindowsScreen::readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32_t &h) const
 {
+  // MouseTransfer (VDD server-bounds) DIAGNOSTIC: emit ONE LOG_NOTE whenever the read OUTCOME changes
+  // (visible at the default INFO level; the poll runs at 1 Hz so an unconditional log would spam). This
+  // is temporary instrumentation to find why the seam clamp is not applying on the fleet -- it reveals
+  // cannot-open (path/CWD wrong), parse-fail, bad-values, or pid-not-live with the OpenProcess error.
+  auto diag = [this](const std::string &s) {
+    if (s != m_sbLastDiag) {
+      LOG_NOTE("server-bounds DIAG: %s", s.c_str());
+      m_sbLastDiag = s;
+    }
+  };
+
   if (m_serverBoundsFile.empty()) {
+    diag("empty-path (resolution has not run)");
     return false;
   }
 
   std::ifstream in(m_serverBoundsFile);
+  if (!in.is_open()) {
+    char cwd[MAX_PATH] = {0};
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    diag(std::string("cannot-open file='") + m_serverBoundsFile + "' cwd='" + cwd + "'");
+    return false;
+  }
+
   long long bx = 0, by = 0, bw = 0, bh = 0;
   unsigned long long pidVal = 0;
-  if (!(in && (in >> bx >> by >> bw >> bh >> pidVal)) || bw <= 0 || bh <= 0 || pidVal == 0) {
+  if (!(in >> bx >> by >> bw >> bh >> pidVal)) {
+    diag("parse-fail (opened but could not read 5 integers)");
+    return false;
+  }
+  if (bw <= 0 || bh <= 0 || pidVal == 0) {
+    diag(
+        "bad-values bw=" + std::to_string(bw) + " bh=" + std::to_string(bh) + " pid=" + std::to_string(pidVal)
+    );
     return false;
   }
 
@@ -1832,11 +1858,15 @@ bool MSWindowsScreen::readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32
   // and its bounds are stale -- fall back to the full rect. One OpenProcess per read, only while a
   // parseable bounds file exists.
   bool live = false;
+  DWORD openErr = 0;
   if (HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pidVal))) {
     live = (WaitForSingleObject(proc, 0) == WAIT_TIMEOUT);
     CloseHandle(proc);
+  } else {
+    openErr = GetLastError();
   }
   if (!live) {
+    diag("pid-not-live pid=" + std::to_string(pidVal) + " openErr=" + std::to_string(openErr));
     return false;
   }
 
@@ -1844,6 +1874,10 @@ bool MSWindowsScreen::readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32
   y = static_cast<int32_t>(by);
   w = static_cast<int32_t>(bw);
   h = static_cast<int32_t>(bh);
+  diag(
+      "OK read " + std::to_string(bx) + "," + std::to_string(by) + " " + std::to_string(bw) + "x" +
+      std::to_string(bh) + " pid=" + std::to_string(pidVal)
+  );
   return true;
 }
 
@@ -1869,7 +1903,7 @@ void MSWindowsScreen::handleFixes()
   // raw rect did not move, so the physical cursor is still at a valid position and must not be
   // disturbed (e.g. an RDP park). Inert without the file (applyServerCanvas returns false).
   if (applyServerCanvas()) {
-    LOG_DEBUG(
+    LOG_NOTE( // MouseTransfer DIAGNOSTIC: temporarily NOTE (was DEBUG) so the fleet shows the clamp live
         "server-bounds: seam canvas -> %d,%d %dx%d (raw %d,%d %dx%d)", m_x, m_y, m_w, m_h, m_vsX, m_vsY, m_vsW, m_vsH
     );
     m_desks->setShape(m_x, m_y, m_w, m_h, m_xCenter, m_yCenter, m_multimon);

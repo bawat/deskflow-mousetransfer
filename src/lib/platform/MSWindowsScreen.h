@@ -353,6 +353,11 @@ private:
   // file simply does not exist the feature is inert and the canvas equals the full raw rect.
   std::string m_serverBoundsFile;
 
+  // MouseTransfer (VDD server-bounds) DIAGNOSTIC: last read-outcome string logged, so the 1 Hz
+  // readServerBounds() can LOG_NOTE (visible at the default INFO level) only when the outcome CHANGES,
+  // not on every poll. Temporary instrumentation to find why the clamp does not apply on the fleet.
+  mutable std::string m_sbLastDiag;
+
   // true if system appears to have multiple monitors
   bool m_multimon = false;
 
