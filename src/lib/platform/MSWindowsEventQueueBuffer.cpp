@@ -10,6 +10,7 @@
 
 #include "arch/win32/ArchDaemonWindows.h"
 #include "base/IEventQueue.h"
+#include "base/MTWatchdog.h" // TEMPORARY MouseTransfer diag: MT_BEAT for the main-thread stall watchdog
 
 //
 // MSWindowsEventQueueBuffer
@@ -58,6 +59,10 @@ void MSWindowsEventQueueBuffer::waitForEvent(double timeout)
 
 IEventQueueBuffer::Type MSWindowsEventQueueBuffer::getEvent(Event &event, uint32_t &dataID)
 {
+  // TEMPORARY MouseTransfer diag: MAIN event-queue thread heartbeat. This is the top of the core's
+  // main message-pump iteration; if the thread is stuck dispatching a handler it won't return here to
+  // beat again, so the watchdog trips with the last-recorded label naming where it went dark.
+  MT_BEAT("pump:getEvent");
   using enum IEventQueueBuffer::Type;
   // NOTE: QS_ALLINPUT was replaced with m_supportedMessages.
   //

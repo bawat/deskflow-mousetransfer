@@ -13,6 +13,7 @@
 #include "arch/win32/XArchWindows.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "base/MTWatchdog.h" // TEMPORARY MouseTransfer diag: main-thread stall watchdog + MT_BEAT
 #include "base/TMethodJob.h"
 #include "client/Client.h"
 #include "common/Constants.h"
@@ -149,6 +150,13 @@ MSWindowsScreen::MSWindowsScreen(bool isPrimary, bool useHooks, IEventQueue *eve
 
   // install the platform event queue
   m_events->adoptBuffer(new MSWindowsEventQueueBuffer(m_events));
+
+  // TEMPORARY MouseTransfer diag: start the main-thread stall watchdog once, on the SERVER core
+  // (the primary screen). Idempotent (std::call_once); catches the RDP-handoff-commit freeze
+  // wherever it blocks the main event-queue thread. Remove after diagnosis.
+  if (m_isPrimary) {
+    mtwd::mtStartWatchdog();
+  }
 }
 
 MSWindowsScreen::~MSWindowsScreen()
@@ -1654,6 +1662,12 @@ bool MSWindowsScreen::onDisplayChange()
 
 void MSWindowsScreen::onClipboardChange()
 {
+  // TEMPORARY MouseTransfer diag: this is the LIVE clipboard event on the main thread (dispatched
+  // from WM_CLIPBOARDUPDATE via onEvent). isOwnedByDeskflow()/sendClipboardEvent touch the Win32
+  // clipboard, which can block on a hung clipboard OWNER -- the real form of the "clipboard chain
+  // blocks the caller" suspicion in this fork (fixClipboardViewer being disabled). Time it.
+  const auto mtCc0 = std::chrono::steady_clock::now();
+
   // now notify client that somebody changed the clipboard (unless
   // we're the owner).
   if (!MSWindowsClipboard::isOwnedByDeskflow()) {
@@ -1676,6 +1690,14 @@ void MSWindowsScreen::onClipboardChange()
   } else if (!m_ownClipboard) {
     LOG_DEBUG("clipboard changed: %s owned", kAppId);
     m_ownClipboard = true;
+  }
+
+  // TEMPORARY MouseTransfer diag: report a slow clipboard-change handling (a candidate for the
+  // handoff-commit main-thread freeze if a viewer/owner window is hung with the clipboard).
+  const auto mtCcMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtCc0).count();
+  if (mtCcMs > 150) {
+    LOG_NOTE("MT-swtrace: onClipboardChange BLOCKED %lldms", (long long)mtCcMs);
   }
 }
 
@@ -1908,6 +1930,11 @@ bool MSWindowsScreen::readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32
 
 void MSWindowsScreen::handleFixes()
 {
+  // TEMPORARY MouseTransfer diag: MAIN-thread heartbeat. This handler runs off the 1.0s m_fixTimer
+  // on the event-queue thread, so it keeps the heartbeat beating at >= 1/s even when totally idle --
+  // which is exactly what makes a >2000ms watchdog gap mean a genuine main-thread stall, not idle.
+  MT_BEAT("main:handleFixes");
+
   // fix clipboard chain
   fixClipboardViewer();
 
@@ -1941,6 +1968,13 @@ void MSWindowsScreen::handleFixes()
 
 void MSWindowsScreen::fixClipboardViewer()
 {
+  // TEMPORARY MouseTransfer diag: time the clipboard-viewer re-insertion (suspect #1). NOTE: in this
+  // fork the body below is COMMENTED OUT (disabled upstream), so this is currently a no-op and this
+  // timer will always read ~0ms -- the clipboard-viewer chain SendMessage path this suspicion is about
+  // is NOT exercised here (the screen uses AddClipboardFormatListener instead, see the ctor). Left in
+  // as requested for faithfulness; the LIVE clipboard-on-main-thread path is timed in onClipboardChange.
+  const auto mtCv0 = std::chrono::steady_clock::now();
+
   // XXX -- disable this code for now.  somehow it can cause an infinite
   // recursion in the WM_DRAWCLIPBOARD handler.  either we're sending
   // the message to our own window or some window farther down the chain
@@ -1953,6 +1987,13 @@ void MSWindowsScreen::fixClipboardViewer()
       m_nextClipboardWindow = nullptr;
       m_nextClipboardWindow = SetClipboardViewer(m_window);
   */
+
+  // TEMPORARY MouseTransfer diag: report if the (currently disabled) re-insertion ever blocks.
+  const auto mtCvMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtCv0).count();
+  if (mtCvMs > 150) {
+    LOG_NOTE("MT-swtrace: fixClipboardViewer BLOCKED %lldms", (long long)mtCvMs);
+  }
 }
 
 void MSWindowsScreen::enableSpecialKeys(bool enable) const

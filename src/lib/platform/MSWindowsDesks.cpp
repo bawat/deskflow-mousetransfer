@@ -12,6 +12,7 @@
 #include "base/IEventQueue.h"
 #include "base/IJob.h"
 #include "base/Log.h"
+#include "base/MTWatchdog.h" // TEMPORARY MouseTransfer diag: MT_HOOKBEAT for the desk-thread pump
 #include "base/TMethodJob.h"
 #include "deskflow/IScreenSaver.h"
 #include "deskflow/ScreenException.h"
@@ -704,6 +705,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
   }
 
   while (GetMessage(&msg, nullptr, 0, 0)) {
+    // TEMPORARY MouseTransfer diag: DESK-thread heartbeat -- this loop pumps the desk window and
+    // services the LL hooks. Kept in the separate hook heartbeat (GetMessage legitimately blocks here
+    // while idle, so this must NOT feed the MAIN-thread stall watchdog).
+    MT_HOOKBEAT("desk:pump");
     switch (msg.message) {
     default:
       TranslateMessage(&msg);

@@ -10,6 +10,7 @@
 
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "base/MTWatchdog.h" // TEMPORARY MouseTransfer diag: MT_BEAT for the main-thread stall watchdog
 #include "deskflow/AppUtil.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/IPlatformScreen.h"
@@ -1916,6 +1917,7 @@ void Server::onMouseUp(ButtonID id)
 
 bool Server::onMouseMovePrimary(int32_t x, int32_t y)
 {
+  MT_BEAT("srv:onMouseMovePrimary"); // TEMPORARY MouseTransfer diag: main-thread heartbeat
   LOG_DEBUG2("onMouseMovePrimary %d,%d", x, y);
 
   // mouse move on primary (server's) screen
@@ -2013,6 +2015,7 @@ bool Server::onMouseMovePrimary(int32_t x, int32_t y)
 
 void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
 {
+  MT_BEAT("srv:onMouseMoveSecondary"); // TEMPORARY MouseTransfer diag: main-thread heartbeat
   LOG_DEBUG2("mouse move on secondary: %+d,%+d", dx, dy);
 
   // TODO: move this to client side and use a qt setting or cli arg instead of env var.
