@@ -154,9 +154,9 @@ MSWindowsScreen::MSWindowsScreen(bool isPrimary, bool useHooks, IEventQueue *eve
   // TEMPORARY MouseTransfer diag: start the main-thread stall watchdog once, on the SERVER core
   // (the primary screen). Idempotent (std::call_once); catches the RDP-handoff-commit freeze
   // wherever it blocks the main event-queue thread. Remove after diagnosis.
-  if (m_isPrimary) {
-    mtwd::mtStartWatchdog();
-  }
+  // MT-watchdog: start on BOTH roles — the RDP-handoff-commit freeze may be on the VIEWER (a CLIENT
+  // applying the relayed input), not the server, so the client's main thread must be watched too.
+  mtwd::mtStartWatchdog();
 }
 
 MSWindowsScreen::~MSWindowsScreen()
