@@ -1399,12 +1399,18 @@ to upstream. Windows-only (`MSWindowsScreen`); non-Windows screens are untouched
 The entry above left `isCursorClippedToSubRegion()` reading `SM_*VIRTUALSCREEN` — "the full desktop".
 With the RDP-VDD attached that full desktop is INFLATED by the invisible monitor, so an *ordinary*
 `ClipCursor` to the real desktop — a fullscreen video player pinning the cursor to its own monitor — now
-measures as a "sub-region" of that inflated rectangle and is misread as a deliberate lock. The server
-then refuses to switch, and the shared cursor **freezes on whichever screen it is on for the whole
-handoff** (owner-reported 2026-08-19: cursor frozen on the peer machine, streamed video still playing,
-keyboard still working, released only by closing the viewer). This is the fork-side reconciliation the
-RDP-VDD design (`internal/rdpexport/bordervdd.go`) said had to land before a clip could be trusted as a
-lock again.
+measures as a "sub-region" of that inflated rectangle and would be misread as a deliberate lock, at which
+point the server refuses to switch and the shared cursor is stuck.
+
+**Scope — this is a latent hazard, NOT the observed 2026-08-19 freeze.** The cursor freeze the owner
+reported that day (cursor frozen on the peer machine, streamed video still playing, keyboard still
+working, released only by closing the viewer) was a DIFFERENT cause: the RDP cursor-park was parking the
+shared cursor onto the invisible VDD, and the fix that actually resolved it is the WRAPPER's cursor-park
+change (`cmd/rdppark.go` `parkOffVDD`), not this clip test. What this fork-side change fixes is the
+separate, real, still-latent way the same symptom could arise — a fullscreen app's genuine real-desktop
+`ClipCursor` being spuriously read as a KVM lock once the VDD inflates `SM_*VIRTUALSCREEN`. It is the
+fork-side reconciliation the RDP-VDD design (`internal/rdpexport/bordervdd.go`) said had to land before a
+clip could be trusted as a lock again; it is a defensible defensive fix on its own terms.
 
 Fix: after the raw-desktop sub-region test passes, if the clip **fills the seam canvas** `m_x/y/w/h`
 (the raw desktop already INTERSECTED with the wrapper's `server-bounds` signal — i.e. the real desktop
