@@ -601,7 +601,7 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
       auto ms = [](const std::chrono::steady_clock::time_point &a, const std::chrono::steady_clock::time_point &b) {
         return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
       };
-      if (ms(mtSw0, mtSw3) > 150) {
+      if (mtwd::mtCoreDiagOn() && ms(mtSw0, mtSw3) > 150) {
         LOG_NOTE(
             "MT-swtrace: switchScreen SLOW total=%lldms  clipboard-reread=%lldms enter=%lldms clipboard-send=%lldms  -> %s",
             ms(mtSw0, mtSw3), ms(mtSw0, mtSw1), ms(mtSw1, mtSw2), ms(mtSw2, mtSw3), getName(dst).c_str()
@@ -2188,7 +2188,7 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
       m_active->mouseMove(m_x, m_y);
       const auto mtRms =
           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtRs).count();
-      if (mtRms > 150) {
+      if (mtwd::mtCoreDiagOn() && mtRms > 150) {
         LOG_NOTE("MT-swtrace: relay mouseMove to %s BLOCKED %lldms", getName(m_active).c_str(), (long long)mtRms);
       }
     }

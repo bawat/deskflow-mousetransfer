@@ -1718,7 +1718,7 @@ void MSWindowsScreen::onClipboardChange()
   // handoff-commit main-thread freeze if a viewer/owner window is hung with the clipboard).
   const auto mtCcMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtCc0).count();
-  if (mtCcMs > 150) {
+  if (mtwd::mtCoreDiagOn() && mtCcMs > 150) {
     LOG_NOTE("MT-swtrace: onClipboardChange BLOCKED %lldms", (long long)mtCcMs);
   }
 }
@@ -1891,7 +1891,7 @@ bool MSWindowsScreen::readServerBounds(int32_t &x, int32_t &y, int32_t &w, int32
   // is temporary instrumentation to find why the seam clamp is not applying on the fleet -- it reveals
   // cannot-open (path/CWD wrong), parse-fail, bad-values, or pid-not-live with the OpenProcess error.
   auto diag = [this](const std::string &s) {
-    if (s != m_sbLastDiag) {
+    if (mtwd::mtCoreDiagOn() && s != m_sbLastDiag) {
       LOG_NOTE("server-bounds DIAG: %s", s.c_str());
       m_sbLastDiag = s;
     }
@@ -1977,9 +1977,17 @@ void MSWindowsScreen::handleFixes()
   // raw rect did not move, so the physical cursor is still at a valid position and must not be
   // disturbed (e.g. an RDP park). Inert without the file (applyServerCanvas returns false).
   if (applyServerCanvas()) {
-    LOG_NOTE( // MouseTransfer DIAGNOSTIC: temporarily NOTE (was DEBUG) so the fleet shows the clamp live
-        "server-bounds: seam canvas -> %d,%d %dx%d (raw %d,%d %dx%d)", m_x, m_y, m_w, m_h, m_vsX, m_vsY, m_vsW, m_vsH
-    );
+    // MouseTransfer DIAGNOSTIC (gated): NOTE when core-diag is on so the fleet shows the clamp live,
+    // otherwise the original DEBUG level — so OFF restores upstream behaviour and emits no INFO line.
+    if (mtwd::mtCoreDiagOn()) {
+      LOG_NOTE(
+          "server-bounds: seam canvas -> %d,%d %dx%d (raw %d,%d %dx%d)", m_x, m_y, m_w, m_h, m_vsX, m_vsY, m_vsW, m_vsH
+      );
+    } else {
+      LOG_DEBUG(
+          "server-bounds: seam canvas -> %d,%d %dx%d (raw %d,%d %dx%d)", m_x, m_y, m_w, m_h, m_vsX, m_vsY, m_vsW, m_vsH
+      );
+    }
     m_desks->setShape(m_x, m_y, m_w, m_h, m_xCenter, m_yCenter, m_multimon);
     if (m_isPrimary && m_isOnScreen) {
       m_hook.setZone(m_x, m_y, m_w, m_h, getJumpZoneSize());
@@ -2013,7 +2021,7 @@ void MSWindowsScreen::fixClipboardViewer()
   // TEMPORARY MouseTransfer diag: report if the (currently disabled) re-insertion ever blocks.
   const auto mtCvMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtCv0).count();
-  if (mtCvMs > 150) {
+  if (mtwd::mtCoreDiagOn() && mtCvMs > 150) {
     LOG_NOTE("MT-swtrace: fixClipboardViewer BLOCKED %lldms", (long long)mtCvMs);
   }
 }

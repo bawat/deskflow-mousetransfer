@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  *
  * ============================================================================
- * TEMPORARY MouseTransfer DIAGNOSTIC -- main-thread stall watchdog.
+ * MouseTransfer DIAGNOSTIC -- main-thread stall watchdog (OFF BY DEFAULT).
  * ============================================================================
  * Added to pin a ~12-16s freeze of the SERVER core's main thread that occurs
  * the instant the cursor crosses to the RDP viewer at a window-handoff COMMIT
@@ -13,7 +13,10 @@
  *
  * This header is a self-contained, header-only (C++17 inline vars) heartbeat +
  * background watchdog. It changes NO behaviour; it only emits LOG_NOTE lines.
- * REMOVE after diagnosis.
+ * KEPT for future diagnosis but GATED behind mtCoreDiagOn() (the whole branch's
+ * temporary diagnostics share it): OFF means the 250ms poll thread never starts
+ * and nothing logs. Flip it live with MOUSETRANSFER_CORE_DIAG=1 in the core's
+ * environment.
  *
  * IMPORTANT threading note (verified in this fork): the Windows core runs the
  * low-level input hooks (mouseLLHook/keyboardLLHook) and their message pump on
@@ -35,12 +38,28 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 
 #include "base/Log.h"
 
 namespace mtwd {
+
+// mtCoreDiagOn is the ONE runtime gate for every temporary MouseTransfer core diagnostic on this
+// branch (the MT-watchdog thread, the MT-swtrace phase/relay/clipboard/local-inject timing LOG_NOTEs,
+// and the server-bounds DIAG lines). OFF is the default: OFF means no watchdog thread and no diagnostic
+// log output. It reads MOUSETRANSFER_CORE_DIAG==1 ONCE and caches it (the env cannot change under a
+// running core), so the steady-state check is a single relaxed bool load. Named to match the wrapper's
+// MOUSETRANSFER_* env convention.
+inline bool mtCoreDiagOn()
+{
+  static const bool on = [] {
+    const char *v = std::getenv("MOUSETRANSFER_CORE_DIAG");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
 
 // MAIN-thread heartbeat (nanoseconds since steady_clock epoch) + last label.
 // Labels are ALWAYS static string literals (never a temporary) so the atomic
@@ -78,6 +97,10 @@ inline void mtHookBeat(const char *label)
 // >2000ms, LOG_NOTEs ONCE per stall episode (and once more when it resumes).
 inline void mtStartWatchdog()
 {
+  // Gate the THREAD START, not just its logging: OFF means the 250ms poll thread never runs at all.
+  if (!mtCoreDiagOn()) {
+    return;
+  }
   static std::once_flag once;
   std::call_once(once, [] {
     mtBeat("(watchdog-start)");

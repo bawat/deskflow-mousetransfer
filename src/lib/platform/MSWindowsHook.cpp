@@ -526,20 +526,24 @@ static LRESULT CALLBACK keyboardLLHook(int code, WPARAM wParam, LPARAM lParam)
     // therefore the ONE working bypass, uniformly, for both hooks and both roles. Left in place
     // untouched because removing upstream code earns nothing here.
     if (injected && info->dwExtraInfo == kDeskflowLocalInjectSignature) {
-      // TEMPORARY MouseTransfer diag: time the LOCAL delivery of a tagged keystroke (PiP / paired-
-      // keyboard passthrough types onto this machine this way; the RDP handoff also injects). A block
-      // in CallNextHookEx here is a desk-thread freeze candidate at the exact handoff instant.
-      const auto mtLi0 = std::chrono::steady_clock::now();
-      LRESULT mtRes = CallNextHookEx(g_keyboardLL, code, wParam, lParam);
-      const auto mtLiMs =
-          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtLi0).count();
-      if (mtLiMs > 150) {
-        LOG_NOTE(
-            "MT-swtrace: local-inject delivery BLOCKED %lldms kind=keyboard vk=0x%02x", (long long)mtLiMs,
-            (unsigned)info->vkCode
-        );
+      // MouseTransfer diag (gated): when core-diag is on, time the LOCAL delivery of a tagged keystroke
+      // (PiP / paired-keyboard passthrough types onto this machine this way; the RDP handoff also
+      // injects) and LOG_NOTE a >150ms block — a desk-thread freeze candidate at the handoff instant.
+      // OFF is a plain passthrough with NO timing (this is the per-keystroke hot path).
+      if (mtwd::mtCoreDiagOn()) {
+        const auto mtLi0 = std::chrono::steady_clock::now();
+        LRESULT mtRes = CallNextHookEx(g_keyboardLL, code, wParam, lParam);
+        const auto mtLiMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtLi0).count();
+        if (mtLiMs > 150) {
+          LOG_NOTE(
+              "MT-swtrace: local-inject delivery BLOCKED %lldms kind=keyboard vk=0x%02x", (long long)mtLiMs,
+              (unsigned)info->vkCode
+          );
+        }
+        return mtRes;
       }
-      return mtRes;
+      return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
     }
     if (!g_isPrimary && injected) {
       return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
@@ -702,20 +706,24 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
       if (wParam == WM_MOUSEMOVE) {
         PostThreadMessage(g_threadID, DESKFLOW_MSG_INJECT_AT, info->pt.x, info->pt.y);
       }
-      // TEMPORARY MouseTransfer diag: time the LOCAL delivery of a tagged mouse event (the RDP window
-      // handoff ends the SOURCE drag this way). A block in CallNextHookEx here is a desk-thread freeze
-      // candidate at the exact handoff-commit instant.
-      const auto mtLi0 = std::chrono::steady_clock::now();
-      LRESULT mtRes = CallNextHookEx(g_mouseLL, code, wParam, lParam);
-      const auto mtLiMs =
-          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtLi0).count();
-      if (mtLiMs > 150) {
-        LOG_NOTE(
-            "MT-swtrace: local-inject delivery BLOCKED %lldms kind=mouse wParam=0x%04x", (long long)mtLiMs,
-            (unsigned)wParam
-        );
+      // MouseTransfer diag (gated): when core-diag is on, time the LOCAL delivery of a tagged mouse
+      // event (the RDP window handoff ends the SOURCE drag this way) and LOG_NOTE a >150ms block — a
+      // desk-thread freeze candidate at the handoff-commit instant. OFF is a plain passthrough with NO
+      // timing (per-event hot path).
+      if (mtwd::mtCoreDiagOn()) {
+        const auto mtLi0 = std::chrono::steady_clock::now();
+        LRESULT mtRes = CallNextHookEx(g_mouseLL, code, wParam, lParam);
+        const auto mtLiMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mtLi0).count();
+        if (mtLiMs > 150) {
+          LOG_NOTE(
+              "MT-swtrace: local-inject delivery BLOCKED %lldms kind=mouse wParam=0x%04x", (long long)mtLiMs,
+              (unsigned)wParam
+          );
+        }
+        return mtRes;
       }
-      return mtRes;
+      return CallNextHookEx(g_mouseLL, code, wParam, lParam);
     }
     // Merged-fork: a mouse event PROMOTED from pen/touch (Windows stamps MI_WP_SIGNATURE into
     // dwExtraInfo -- see the constant above) is the OS's own echo of pointer input, never
