@@ -1420,3 +1420,43 @@ the whole real desktop is never a deliberate cursor-lock. The wrapper's own full
 the Windows move-loop work-area exception below is likewise unaffected. Without a `server-bounds` signal
 (no VDD) `m_x/y/w/h` equal `m_vs*`, so the new test matches the same rect the raw sub-region test just
 cleared — a no-op, keeping stock/upstream behaviour byte-identical.
+
+## RDP fg-hold: never block the event loop on a busy target (2026-08-21)
+
+`MSWindowsDesks::checkRdpFgHold` runs on the **main event-queue thread**, and its enforcement is
+`sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, ...)` — which is `PostThreadMessage` plus `waitForDesk()`,
+whose `CondVar::wait(-1)` is **unbounded**. The desk thread then runs `AttachThreadInput` +
+`SetForegroundWindow` against the held window, and both serialise against **that window's** input
+queue. So a busy or modal target does not merely delay the foreground steal: it blocks the desk
+thread, which blocks the main thread inside `waitForDesk`, which stops the event loop.
+
+That is not cosmetic. The main thread services `ClientProxy`'s keepalives, and the protocol declares
+a peer dead after `kKeepAliveRate` (3.0 s) × `kKeepAlivesUntilDeath` (3.0) = **9 s** of silence.
+Measured live on `.12` (2026-08-21): roughly one second after the wrapper pointed the hold at a busy
+VLC window during an RDP stage swap, this core went silent for **~7 seconds** and the peer machine
+declared *"server is dead"*.
+
+Fix: probe the target with `SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 50 ms)` before
+committing to the blocking path, in **both** places that can attach to a foreign input queue — the
+hold's `sendMessage` in `checkRdpFgHold`, and the release path's hider-restore in `deskRdpFgHold`,
+which runs on the desk thread while the main thread waits on it and fires exactly when a handoff is
+ending (i.e. when the app may be busy tearing down).
+
+`WM_NULL` is the right probe: it carries **no pointer**, so UIPI permits it across integrity levels
+(a bare `WM_NULL` crosses where a buffer-carrying message does not), and the target does no work to
+answer it — the reply proves only that its message loop is running, which is precisely the
+precondition `AttachThreadInput`/`SetForegroundWindow` need. `SMTO_ABORTIFHUNG` makes Windows answer
+immediately for an already-hung window instead of waiting the timeout out.
+
+The 50 ms is **sourced from the hold's own cadence**, not picked: the hold re-asserts every 0.2 s, so
+a skipped tick costs nothing and the next one retries 200 ms later; 50 ms bounds the worst case at a
+quarter of one re-assert interval. A negative probe skips one re-assert and **never abandons the
+hold** — `m_fgHoldActive` stays set so the release path still runs. The failure mode this converts is
+"the whole mesh loses its server for seven seconds" into "the foreground steal is 200 ms late".
+
+`waitForDesk`/`m_deskReady` are deliberately **untouched**: `m_deskReady` is a plain bool, so posting
+without waiting would desync the handshake for the *next* `sendMessage`. The bound belongs on what we
+send *into*, not on the handshake.
+
+Healthy behaviour is unchanged — a pumping window answers `WM_NULL` in microseconds and takes the
+identical path it did before.

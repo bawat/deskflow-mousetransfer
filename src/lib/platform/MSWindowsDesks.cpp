@@ -955,6 +955,47 @@ void MSWindowsDesks::handleCheckDesk()
   checkRdpPark();
 }
 
+// MouseTransfer: how long a window gets to answer a liveness ping before the fg-hold gives up on it
+// for this tick.
+//
+// SOURCED FROM THE HOLD'S OWN CADENCE, not picked: checkRdpFgHold re-asserts every 0.2s, so a
+// SKIPPED tick costs nothing — the next one tries again 200ms later. 50ms therefore bounds the worst
+// case at a quarter of one re-assert interval while being an age for a healthy window to answer a
+// WM_NULL (which does no work at all; it only has to reach the front of a pumping message queue).
+static const UINT kRdpFgHoldProbeMs = 50;
+
+// MouseTransfer: is this window's thread PUMPING MESSAGES right now?
+//
+// 🔴 WHY THIS EXISTS — the 2026-08-21 `.12` incident. The fg-hold's enforcement is a
+// sendMessage(DESKFLOW_MSG_RDP_FG_HOLD) from the MAIN EVENT-QUEUE THREAD, and sendMessage is
+// PostThreadMessage + waitForDesk(), whose CondVar::wait(-1) is UNBOUNDED. The desk thread then runs
+// AttachThreadInput + SetForegroundWindow against the target — both of which serialise against the
+// TARGET's input queue. So a busy or modal target does not merely delay the hold: it blocks the desk
+// thread, which blocks the main thread inside waitForDesk, which stops the event loop.
+//
+// That is not a cosmetic stall. The main thread is where ClientProxy's keepalives are serviced, and
+// the protocol declares a peer dead after kKeepAliveRate (3.0s) x kKeepAlivesUntilDeath (3.0) = 9s
+// of silence. Measured live: ~1s after the wrapper pointed the hold at a busy VLC window during a
+// stage swap, this core went silent for ~7 SECONDS and the peer machine declared "server is dead".
+//
+// WM_NULL is the right probe: it carries NO POINTER, so UIPI permits it across integrity levels
+// (a bare WM_NULL crosses where a buffer-carrying message does not), and the target does no work to
+// answer it — the reply proves only that its message loop is running, which is exactly the
+// precondition the AttachThreadInput/SetForegroundWindow pair needs. SMTO_ABORTIFHUNG makes Windows
+// answer immediately for a window already known to be hung instead of waiting out the timeout.
+//
+// A false answer SKIPS one re-assert. It never abandons the hold: m_fgHoldActive stays set, so the
+// release path still runs, and the next tick re-tries. The failure mode this converts is
+// "the whole mesh loses its server for 7 seconds" into "the foreground steal is 200ms late".
+static bool rdpFgHoldWindowResponsive(HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow(hwnd)) {
+    return false;
+  }
+  DWORD_PTR result = 0;
+  return SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, kRdpFgHoldProbeMs, &result) != 0;
+}
+
 // MouseTransfer (RDP window handoff foreground hold), the event-thread half.
 //
 // WHY: the wrapper exports a window over RDP and delivers the viewer's typing as tagged
@@ -1032,7 +1073,18 @@ void MSWindowsDesks::checkRdpFgHold()
       sameProcess = (fgPid != 0 && fgPid == wantPid);
     }
     if (fgNow != active && !sameProcess) {
-      sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
+      // 🔴 DO NOT SEND INTO A WINDOW THAT IS NOT PUMPING. sendMessage blocks this — the MAIN
+      // EVENT-QUEUE — thread on an unbounded waitForDesk while the desk thread serialises against
+      // the target's input queue, so a modal or busy target stalls the whole core and the mesh
+      // declares this server dead after 9s. See rdpFgHoldWindowResponsive for the incident.
+      // Skipping costs one 0.2s re-assert; the hold stays armed and the next tick retries.
+      if (rdpFgHoldWindowResponsive(active)) {
+        sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
+      } else {
+        LOG_DEBUG("rdp fg-hold: window 0x%08x is not pumping messages — skipping this re-assert "
+                  "rather than blocking the event loop on it",
+                  active);
+      }
     }
   } else if (m_fgHoldActive) {
     m_fgHoldActive = false;
@@ -1127,11 +1179,19 @@ void MSWindowsDesks::deskRdpFgHold(Desk *desk, HWND hwnd)
       HWND fg = GetForegroundWindow();
       DWORD thisThread = GetWindowThreadProcessId(desk->m_window, nullptr);
       DWORD thatThread = (fg != nullptr) ? GetWindowThreadProcessId(fg, nullptr) : 0;
-      if (thatThread != 0 && thatThread != thisThread) {
+      // 🔴 THE SAME HAZARD ON THE WAY OUT. This runs on the desk thread, but the MAIN thread is
+      // sitting in waitForDesk waiting for it, so an AttachThreadInput against a HUNG foreground
+      // window stalls the event loop exactly as the hold path does — and the release is the tick
+      // that runs when a handoff ends, i.e. precisely when the app may be busy tearing something
+      // down. If the current foreground is not pumping, restore the hider WITHOUT attaching:
+      // SetActiveWindow above has already done the part that does not need the target's queue, and
+      // deskEnter still restores the user's own pre-leave foreground.
+      const bool attach = thatThread != 0 && thatThread != thisThread && rdpFgHoldWindowResponsive(fg);
+      if (attach) {
         AttachThreadInput(thatThread, thisThread, TRUE);
       }
       SetForegroundWindow(desk->m_window);
-      if (thatThread != 0 && thatThread != thisThread) {
+      if (attach) {
         AttachThreadInput(thatThread, thisThread, FALSE);
       }
     }
