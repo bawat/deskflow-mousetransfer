@@ -227,6 +227,7 @@ private:
   // where deskLeave's own proven AttachThreadInput recipe lives. See deskRdpFgHold for why only
   // this process can do it at all.
   void checkRdpFgHold();
+  void checkRdpFgHoldFast();
   void deskRdpFgHold(Desk *desk, HWND hwnd);
 
   // MouseTransfer (RDP window handoff — ADAPTIVE CURSOR PARK): poll the wrapper's rdp-park file and
@@ -325,6 +326,15 @@ private:
   std::string m_fgHoldFile;
   bool m_fgHoldActive = false;
   HWND m_fgHoldHwnd = nullptr;
+  // MouseTransfer (History context-menu fix, 2026-08-21): the window the hold currently names, cached
+  // by checkRdpFgHold (event thread) so the FAST fg-hold timer can re-assert it below the ~125ms menu
+  // cancel without re-reading the file. nullptr when no hold is in force. See checkRdpFgHoldFast.
+  HWND m_fgHoldWant = nullptr;
+  // The faster (sub-125ms) fg-hold re-assert timer. It ONLY acts in the one case checkRdpFgHold's 0.2s
+  // cadence is too slow for: the held export has an OWNED popup up (a context menu) whose foreground a
+  // SAME-PROCESS non-popup window (the app's main form) has stolen — the History failure. A cheap
+  // no-op in every other state, so working palettes never touch it. See checkRdpFgHoldFast.
+  EventQueueTimer *m_fgHoldFastTimer = nullptr;
 
   // MouseTransfer (RDP adaptive cursor park) — see checkRdpPark/getRdpPark. m_rdpParkFile is the
   // signal file's path (resolved once in enable(), beside m_fgHoldFile); m_rdpPark is the published

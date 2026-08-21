@@ -23,6 +23,7 @@
 #include "platform/MSWindowsScreen.h"
 
 #include <cstdlib>
+#include <cwchar> // MouseTransfer: wcscmp for the fg-hold popup-class check (History fix)
 #include <fstream>
 #include <malloc.h>
 
@@ -160,6 +161,15 @@ void MSWindowsDesks::enable()
   m_timer = m_events->newTimer(0.2, nullptr);
   m_events->addHandler(EventTypes::Timer, m_timer, [this](const auto &) { handleCheckDesk(); });
 
+  // MouseTransfer (History context-menu fix, 2026-08-21): a SECOND, faster timer that only re-asserts
+  // the fg-hold in the one case the 0.2s cadence above is too slow for — a held export's context menu
+  // being stolen foreground by its own main form, which the app cancels in ~125ms. 40ms gives three
+  // re-asserts inside that window. checkRdpFgHoldFast is a cheap no-op in every other state (an
+  // in-memory hwnd check), so this costs ~nothing while no such steal is happening. See it for why it
+  // cannot regress the working palettes.
+  m_fgHoldFastTimer = m_events->newTimer(0.04, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_fgHoldFastTimer, [this](const auto &) { checkRdpFgHoldFast(); });
+
   // MouseTransfer (RDP window handoff foreground hold): resolve the signal file the wrapper
   // writes. Same convention as the server's switchreq poll — an env override, else a well-known
   // name relative to the CWD (the launcher sets the core's CWD to its bundle dir, where the
@@ -226,6 +236,13 @@ void MSWindowsDesks::disable()
     m_events->removeHandler(EventTypes::Timer, m_timer);
     m_events->deleteTimer(m_timer);
     m_timer = nullptr;
+  }
+
+  // MouseTransfer: the fast fg-hold timer (History fix).
+  if (m_fgHoldFastTimer != nullptr) {
+    m_events->removeHandler(EventTypes::Timer, m_fgHoldFastTimer);
+    m_events->deleteTimer(m_fgHoldFastTimer);
+    m_fgHoldFastTimer = nullptr;
   }
 
   // destroy desks
@@ -996,6 +1013,53 @@ static bool rdpFgHoldWindowResponsive(HWND hwnd)
   return SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, kRdpFgHoldProbeMs, &result) != 0;
 }
 
+// MouseTransfer (History context-menu fix, 2026-08-21): is this window a TRANSIENT POPUP — a context
+// menu, a drop-down, a flyout — as opposed to a persistent top-level app window (the application's
+// main form)?
+//
+// This is the ONE bit that separates the History failure from the palettes that already work. When a
+// palette's context menu opens and correctly HOLDS foreground, GetForegroundWindow() IS the menu — a
+// transient popup. When HISTORY's context menu opens, the app's MAIN FORM (a captioned, overlapped
+// window) steals foreground from it, and the menu is cancelled ~125ms later. So the fg-hold must keep
+// asserting the menu ONLY when the same-process foreground is NOT itself a popup — i.e. a real window
+// grabbed it. A #32768 menu is a popup by class; every other borderless WS_POPUP (WinForms
+// ToolStripDropDown, custom flyout) is one by style; a WS_CAPTION overlapped window (the main form) is
+// not.
+static bool rdpFgHoldIsTransientPopup(HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow(hwnd)) {
+    return false;
+  }
+  constexpr int kClsLen = 64;
+  wchar_t cls[kClsLen] = {0};
+  if (GetClassNameW(hwnd, cls, kClsLen) > 0 && wcscmp(cls, L"#32768") == 0) {
+    return true; // the standard context-menu class
+  }
+  const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+  return (style & static_cast<LONG_PTR>(WS_POPUP)) != 0 && (style & static_cast<LONG_PTR>(WS_CAPTION)) != WS_CAPTION;
+}
+
+// MouseTransfer (History context-menu fix): the pure gate deciding whether the fg-hold must RE-ASSERT
+// the held export even though a SAME-PROCESS window currently holds foreground.
+//
+// This mirrors, byte-for-byte, the Go executable specification + unit test in the wrapper
+// (cmd/rdpfghold.go rdpFgHoldAssertOverSameProcess / rdpfghold_test.go) — kept in Go so the decision
+// is unit-tested; kept identical here because this is where the foreground state actually lives.
+//
+//   - ownedPopupUp: the held export has an OWNED popup up right now (GetLastActivePopup(want) != want
+//     — a context menu / dialog it raised). This is TRUE for History's #32768 menu (owned by History),
+//     the case that must be rescued.
+//   - fgIsTransientPopup: the same-process window holding foreground is itself a menu/popup.
+//
+// Assert ONLY when a menu is up AND a NON-popup same-process window stole its foreground — the History
+// failure and nothing else. When the foreground IS the popup (a palette's menu holding focus) or no
+// owned popup is up (a WinForms invisible-owner menu — active == want), leave it: identical to the
+// existing same-process back-off. That is the whole regression guard.
+static bool rdpFgHoldAssertOverSameProcess(bool ownedPopupUp, bool fgIsTransientPopup)
+{
+  return ownedPopupUp && !fgIsTransientPopup;
+}
+
 // MouseTransfer (RDP window handoff foreground hold), the event-thread half.
 //
 // WHY: the wrapper exports a window over RDP and delivers the viewer's typing as tagged
@@ -1047,10 +1111,13 @@ void MSWindowsDesks::checkRdpFgHold()
     // GetLastActivePopup returns the dialog when one is up, else the window itself, so the hold
     // tracks whichever window the viewer's input is actually meant to reach.
     HWND active = want;
+    bool ownedPopupUp = false;
     if (HWND pop = GetLastActivePopup(want); pop != nullptr && pop != want && IsWindow(pop)) {
       active = pop;
+      ownedPopupUp = true; // a context menu / dialog the held export raised — see the History fix below
     }
     m_fgHoldActive = true;
+    m_fgHoldWant = want; // publish for the fast timer (History fix)
     // Only bother the desk thread when the hold is not already satisfied.
     //
     // MouseTransfer (PDN menus, 2026-08-16): SAME-PROCESS foreground SATISFIES the hold. The
@@ -1072,7 +1139,16 @@ void MSWindowsDesks::checkRdpFgHold()
       GetWindowThreadProcessId(want, &wantPid);
       sameProcess = (fgPid != 0 && fgPid == wantPid);
     }
-    if (fgNow != active && !sameProcess) {
+    // MouseTransfer (History context-menu fix, 2026-08-21): the same-process back-off above is RIGHT
+    // when the app handed foreground to its own MENU (a palette's context menu holding focus), and
+    // WRONG when the app's MAIN FORM stole foreground from a menu that should have it (History — its
+    // #32768 menu is owned by History, so ownedPopupUp is true, yet the main form grabs foreground and
+    // the app cancels the menu ~125ms later). rdpFgHoldAssertOverSameProcess isolates exactly that:
+    // assert over the same-process foreground ONLY when a menu is up AND the stealer is not itself a
+    // popup. A palette whose menu holds foreground has fgNow == active (satisfied, never reaches here);
+    // a WinForms invisible-owner menu has ownedPopupUp == false — both keep the identical old path.
+    const bool assertOverSame = rdpFgHoldAssertOverSameProcess(ownedPopupUp, rdpFgHoldIsTransientPopup(fgNow));
+    if (fgNow != active && (!sameProcess || assertOverSame)) {
       // 🔴 DO NOT SEND INTO A WINDOW THAT IS NOT PUMPING. sendMessage blocks this — the MAIN
       // EVENT-QUEUE — thread on an unbounded waitForDesk while the desk thread serialises against
       // the target's input queue, so a modal or busy target stalls the whole core and the mesh
@@ -1088,7 +1164,61 @@ void MSWindowsDesks::checkRdpFgHold()
     }
   } else if (m_fgHoldActive) {
     m_fgHoldActive = false;
+    m_fgHoldWant = nullptr; // the hold ended — the fast timer goes idle (History fix)
     sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, 0, 0);
+  }
+}
+
+// MouseTransfer (History context-menu fix, 2026-08-21): the sub-125ms fg-hold re-assert.
+//
+// WHY A SECOND TIMER. checkRdpFgHold re-asserts every 0.2s. Paint.NET cancels History's just-opened
+// context menu ~125ms after History loses foreground, so a 0.2s cadence can miss it entirely (the menu
+// is gone before the next tick). The number is SOURCED from the failure: the menu dies in ~125ms, so
+// three re-asserts inside that window (40ms) makes History's re-activation land while the menu's modal
+// loop is still running, which keeps the menu up.
+//
+// WHY IT CANNOT REGRESS THE WORKING PALETTES. It does work in exactly ONE state — the same one
+// rdpFgHoldAssertOverSameProcess names in checkRdpFgHold: the held export has an OWNED popup up (a
+// context menu) whose foreground a SAME-PROCESS NON-POPUP window (the main form) has stolen. In every
+// other state it returns after a couple of in-memory reads: no hold (m_fgHoldWant null), no owned
+// popup up, the popup still holds foreground (fgNow == active), or the foreground is itself a popup. A
+// palette whose menu holds focus has fgNow == active and never gets past that guard.
+//
+// COMPOSES WITH THE ANTI-FREEZE PROBE. Like the 0.2s path it will not sendMessage into a window that
+// is not pumping — rdpFgHoldWindowResponsive gates every re-assert, so a faster cadence cannot
+// reintroduce the e487043ff unbounded-wait mesh freeze. A hung target simply skips (bounded at the
+// 50ms probe), and the next tick retries.
+void MSWindowsDesks::checkRdpFgHoldFast()
+{
+  HWND want = m_fgHoldWant;
+  if (want == nullptr || !IsWindow(want)) {
+    return; // no hold in force (the 0.2s tick publishes/clears this)
+  }
+  // An owned popup up on the held export? (History's #32768 menu is owned by History.) Only then can
+  // this be the menu-steal we rescue; a hold with no popup is the 0.2s path's business.
+  HWND active = GetLastActivePopup(want);
+  if (active == nullptr || active == want || !IsWindow(active)) {
+    return;
+  }
+  HWND fgNow = GetForegroundWindow();
+  if (fgNow == active || fgNow == nullptr) {
+    return; // the menu already holds foreground — nothing to rescue
+  }
+  DWORD fgPid = 0;
+  DWORD wantPid = 0;
+  GetWindowThreadProcessId(fgNow, &fgPid);
+  GetWindowThreadProcessId(want, &wantPid);
+  const bool sameProcess = (fgPid != 0 && fgPid == wantPid);
+  if (!sameProcess) {
+    return; // a different process has it — the 0.2s path already steals from that, no rush
+  }
+  if (!rdpFgHoldAssertOverSameProcess(true /*ownedPopupUp*/, rdpFgHoldIsTransientPopup(fgNow))) {
+    return; // the same-process foreground IS a popup (a palette's menu) — leave it, identical to 0.2s
+  }
+  // History: a menu is up but the main form has its foreground. Re-assert — probe-gated, exactly as
+  // the 0.2s path, so a non-pumping target skips instead of stalling the event loop.
+  if (rdpFgHoldWindowResponsive(active)) {
+    sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
   }
 }
 

@@ -1343,6 +1343,35 @@ window — the application handed foreground to another of its own windows, whic
 viewer's input is meant to reach (the owned-dialog rationale minus the assumption that ownership
 links the two). A different process in the foreground is still stolen from, unchanged.
 
+## RDP fg-hold: rescue a context menu the app's own main form steals foreground from (2026-08-21)
+
+The same-process back-off above is right when the app handed foreground to its own MENU, and wrong
+when the app's MAIN FORM steals foreground from a menu that should have it. Paint.NET's **History**
+palette is the failing case: its `#32768` context menu is OWNED by History (so
+`GetLastActivePopup(want) != want`), yet the main Paint.NET window grabs foreground from the menu and
+the app cancels it ~125 ms later. The blanket same-process back-off read the main form's foreground as
+"leave it", so the core never re-activated History and its menu instant-closed (owner-reported five
+times). Colors / Layers / Tools do **not** fail — when their menus open the menu itself holds
+foreground.
+
+Two narrow additions, both gated so a palette that already works takes the identical path:
+
+- **`checkRdpFgHold` no longer backs off unconditionally on same-process foreground.**
+  `rdpFgHoldAssertOverSameProcess(ownedPopupUp, fgIsTransientPopup)` re-asserts over a same-process
+  foreground **only** when a menu the held export raised is up (`ownedPopupUp`) **and** the stealer is
+  **not** itself a transient popup (`rdpFgHoldIsTransientPopup` — a `#32768` menu by class, any
+  borderless `WS_POPUP` by style; the main form is neither). A palette whose menu holds foreground has
+  `fgNow == active` (satisfied, never reaches the gate); a WinForms invisible-owner menu has
+  `ownedPopupUp == false`. Both keep the pre-existing back-off. The gate is the executable
+  specification `cmd/rdpfghold.go` in the wrapper, unit-tested there and mirrored byte-for-byte here.
+
+- **A second, 0.04 s timer (`checkRdpFgHoldFast`).** The 0.2 s cadence can miss the ~125 ms menu
+  cancel entirely; 40 ms gives three re-asserts inside that window. It acts in exactly the one state
+  above — an in-memory `HWND` check makes it a no-op in every other — so it never touches a working
+  palette. It **composes with the anti-freeze probe**: like the 0.2 s path it will not `sendMessage`
+  into a window that fails the 50 ms `SMTO_ABORTIFHUNG` liveness ping, so a faster cadence cannot
+  reintroduce the unbounded-wait mesh freeze the probe was added (`e487043ff`) to prevent.
+
 ### Exclude a designated VDD monitor from the server canvas (2026-08-18)
 
 **Files:** `src/lib/platform/MSWindowsScreen.{h,cpp}`
