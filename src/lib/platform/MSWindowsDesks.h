@@ -335,6 +335,13 @@ private:
   // SAME-PROCESS non-popup window (the app's main form) has stolen — the History failure. A cheap
   // no-op in every other state, so working palettes never touch it. See checkRdpFgHoldFast.
   EventQueueTimer *m_fgHoldFastTimer = nullptr;
+  // MouseTransfer (History insta-close INSTRUMENTATION, 2026-08-21): the last DIAG line each fg-hold
+  // path logged, so the change-gated LOG_INFO in checkRdpFgHold/checkRdpFgHoldFast emits only on a
+  // STATE TRANSITION rather than at the 5/s (slow) and 25/s (fast) timer rates — one line per real
+  // change while a hold is in force, nothing at all when none is. Diagnostic only; no behaviour rides
+  // on these. Cleared to "" when the hold ends so the next episode logs fresh.
+  std::string m_fgHoldDbgSlow;
+  std::string m_fgHoldDbgFast;
 
   // MouseTransfer (RDP adaptive cursor park) — see checkRdpPark/getRdpPark. m_rdpParkFile is the
   // signal file's path (resolved once in enable(), beside m_fgHoldFile); m_rdpPark is the published

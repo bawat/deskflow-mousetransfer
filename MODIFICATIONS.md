@@ -1372,6 +1372,24 @@ Two narrow additions, both gated so a palette that already works takes the ident
   into a window that fails the 50 ms `SMTO_ABORTIFHUNG` liveness ping, so a faster cadence cannot
   reintroduce the unbounded-wait mesh freeze the probe was added (`e487043ff`) to prevent.
 
+### RDP fg-hold: INSTRUMENTATION for the History insta-close (2026-08-21)
+
+The fix above deployed but did not help — its gate does not match History's runtime foreground shape,
+and the two prior attempts were reasoned rather than measured. This is a **diagnostics-only** change
+(no behaviour altered) so the next fix is built from the actual foreground state at the moment History's
+menu insta-closes. Both `checkRdpFgHold` (0.2 s) and `checkRdpFgHoldFast` (0.04 s) now emit a
+**change-gated** `LOG_INFO` line — one per real state change while a hold is in force, nothing at all
+when none is (so it cannot spam at the 5/s and 25/s timer rates, and is silent when the machine is not
+mid-RDP-episode). The line reports, for the held target: `want` (held hwnd), `active`
+(`GetLastActivePopup(want)` — the owned popup if any), `ownedPopup`, `fg` + `fgClass` (what actually
+holds foreground and its window class), `fgIsPopup`, `sameProc`, `assertOverSame`, and the `action`
+taken (slow) / `outcome` reached (fast: `no-owned-popup` | `menu-has-fg` | `diff-process` |
+`fg-is-popup-leave` | `reassert` | `skip-not-pumping`). The two last-logged lines are held in
+`m_fgHoldDbgSlow` / `m_fgHoldDbgFast` and cleared when the hold ends. Nothing in the control flow
+depends on any of it; the `sendMessage` / return structure is byte-identical to the fix above. Collected
+from the core's `coreout.log`; the wrapper half (which hwnd it wrote to `rdp-fg-hold`, and its
+menu-target early-return) is already traced under the wrapper's `rdpwindow-trace`.
+
 ### Exclude a designated VDD monitor from the server canvas (2026-08-18)
 
 **Files:** `src/lib/platform/MSWindowsScreen.{h,cpp}`

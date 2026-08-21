@@ -22,6 +22,7 @@
 #include "platform/MSWindowsHook.h"
 #include "platform/MSWindowsScreen.h"
 
+#include <cstdio> // MouseTransfer: snprintf for the fg-hold instrumentation (History insta-close)
 #include <cstdlib>
 #include <cwchar> // MouseTransfer: wcscmp for the fg-hold popup-class check (History fix)
 #include <fstream>
@@ -1147,7 +1148,9 @@ void MSWindowsDesks::checkRdpFgHold()
     // assert over the same-process foreground ONLY when a menu is up AND the stealer is not itself a
     // popup. A palette whose menu holds foreground has fgNow == active (satisfied, never reaches here);
     // a WinForms invisible-owner menu has ownedPopupUp == false — both keep the identical old path.
-    const bool assertOverSame = rdpFgHoldAssertOverSameProcess(ownedPopupUp, rdpFgHoldIsTransientPopup(fgNow));
+    const bool fgIsPopup = rdpFgHoldIsTransientPopup(fgNow);
+    const bool assertOverSame = rdpFgHoldAssertOverSameProcess(ownedPopupUp, fgIsPopup);
+    const char *action = (fgNow == active) ? "satisfied" : "backoff-sameproc";
     if (fgNow != active && (!sameProcess || assertOverSame)) {
       // 🔴 DO NOT SEND INTO A WINDOW THAT IS NOT PUMPING. sendMessage blocks this — the MAIN
       // EVENT-QUEUE — thread on an unbounded waitForDesk while the desk thread serialises against
@@ -1155,16 +1158,42 @@ void MSWindowsDesks::checkRdpFgHold()
       // declares this server dead after 9s. See rdpFgHoldWindowResponsive for the incident.
       // Skipping costs one 0.2s re-assert; the hold stays armed and the next tick retries.
       if (rdpFgHoldWindowResponsive(active)) {
+        action = "reassert";
         sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
       } else {
+        action = "skip-not-pumping";
         LOG_DEBUG("rdp fg-hold: window 0x%08x is not pumping messages — skipping this re-assert "
                   "rather than blocking the event loop on it",
                   active);
       }
     }
+    // INSTRUMENTATION (History insta-close, 2026-08-21) — change-gated so this 0.2s path logs one line
+    // per real state change while a hold is in force, not 5/s. Reveals: is a hold set (want), what is
+    // foreground (fg + its class), is an owned popup up (ownedPopup — History's #32768 menu should show
+    // 1), and whether the gate re-asserted or backed off. Diagnostic only; no behaviour rides on it.
+    {
+      char fgCls[64] = {0};
+      if (fgNow != nullptr) {
+        GetClassNameA(fgNow, fgCls, sizeof(fgCls));
+      }
+      char buf[320];
+      snprintf(buf, sizeof(buf),
+               "rdp fg-hold DIAG want=0x%08llx active=0x%08llx ownedPopup=%d fg=0x%08llx fgClass=%s "
+               "fgIsPopup=%d sameProc=%d assertOverSame=%d action=%s",
+               static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(want)),
+               static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(active)), ownedPopupUp ? 1 : 0,
+               static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(fgNow)), fgCls, fgIsPopup ? 1 : 0,
+               sameProcess ? 1 : 0, assertOverSame ? 1 : 0, action);
+      if (m_fgHoldDbgSlow != buf) {
+        m_fgHoldDbgSlow = buf;
+        LOG_INFO("%s", buf);
+      }
+    }
   } else if (m_fgHoldActive) {
     m_fgHoldActive = false;
     m_fgHoldWant = nullptr; // the hold ended — the fast timer goes idle (History fix)
+    m_fgHoldDbgSlow.clear(); // next episode logs fresh (INSTRUMENTATION)
+    m_fgHoldDbgFast.clear();
     sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, 0, 0);
   }
 }
@@ -1191,17 +1220,41 @@ void MSWindowsDesks::checkRdpFgHold()
 void MSWindowsDesks::checkRdpFgHoldFast()
 {
   HWND want = m_fgHoldWant;
+  // INSTRUMENTATION (History insta-close, 2026-08-21) — change-gated outcome log at each exit, so this
+  // 25/s timer emits one line per real state change (not 25/s) and NOTHING while no hold is in force.
+  // It reveals whether the fast rescue even reaches History's menu state, and where it bails if not.
+  // Diagnostic only; the control flow below is byte-identical to before this round.
+  auto diag = [&](HWND active, HWND fgNow, bool sameProc, bool assertOver, const char *outcome) {
+    char fgCls[64] = {0};
+    if (fgNow != nullptr) {
+      GetClassNameA(fgNow, fgCls, sizeof(fgCls));
+    }
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "rdp fg-hold FAST want=0x%08llx active=0x%08llx fg=0x%08llx fgClass=%s sameProc=%d "
+             "assertOverSame=%d outcome=%s",
+             static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(want)),
+             static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(active)),
+             static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(fgNow)), fgCls, sameProc ? 1 : 0,
+             assertOver ? 1 : 0, outcome);
+    if (m_fgHoldDbgFast != buf) {
+      m_fgHoldDbgFast = buf;
+      LOG_INFO("%s", buf);
+    }
+  };
   if (want == nullptr || !IsWindow(want)) {
-    return; // no hold in force (the 0.2s tick publishes/clears this)
+    return; // no hold in force (the 0.2s tick publishes/clears this) — stay silent when idle
   }
   // An owned popup up on the held export? (History's #32768 menu is owned by History.) Only then can
   // this be the menu-steal we rescue; a hold with no popup is the 0.2s path's business.
   HWND active = GetLastActivePopup(want);
   if (active == nullptr || active == want || !IsWindow(active)) {
+    diag(active, nullptr, false, false, "no-owned-popup");
     return;
   }
   HWND fgNow = GetForegroundWindow();
   if (fgNow == active || fgNow == nullptr) {
+    diag(active, fgNow, false, false, "menu-has-fg");
     return; // the menu already holds foreground — nothing to rescue
   }
   DWORD fgPid = 0;
@@ -1210,15 +1263,20 @@ void MSWindowsDesks::checkRdpFgHoldFast()
   GetWindowThreadProcessId(want, &wantPid);
   const bool sameProcess = (fgPid != 0 && fgPid == wantPid);
   if (!sameProcess) {
+    diag(active, fgNow, false, false, "diff-process");
     return; // a different process has it — the 0.2s path already steals from that, no rush
   }
   if (!rdpFgHoldAssertOverSameProcess(true /*ownedPopupUp*/, rdpFgHoldIsTransientPopup(fgNow))) {
+    diag(active, fgNow, true, false, "fg-is-popup-leave");
     return; // the same-process foreground IS a popup (a palette's menu) — leave it, identical to 0.2s
   }
   // History: a menu is up but the main form has its foreground. Re-assert — probe-gated, exactly as
   // the 0.2s path, so a non-pumping target skips instead of stalling the event loop.
   if (rdpFgHoldWindowResponsive(active)) {
+    diag(active, fgNow, true, true, "reassert");
     sendMessage(DESKFLOW_MSG_RDP_FG_HOLD, reinterpret_cast<WPARAM>(active), 0);
+  } else {
+    diag(active, fgNow, true, true, "skip-not-pumping");
   }
 }
 
