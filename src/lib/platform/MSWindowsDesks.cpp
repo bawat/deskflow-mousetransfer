@@ -1061,6 +1061,39 @@ static bool rdpFgHoldAssertOverSameProcess(bool ownedPopupUp, bool fgIsTransient
   return ownedPopupUp && !fgIsTransientPopup;
 }
 
+// MouseTransfer (History OWNERLESS-menu insta-close, race-free fix, 2026-08-22): is the held export's
+// UI thread currently in MENU MODE — i.e. is a menu open in that app?
+//
+// This is the OWNER-INDEPENDENT menu signal every prior fix lacked. Paint.NET's History context menu is
+// an OWNERLESS #32768 (owner == 0), so NOTHING in the owner chain — not GetLastActivePopup on any window,
+// not the wrapper's owner/parent-keyed menuSets — ever sees it, and the fg-hold kept re-asserting `want`
+// (a sibling that CAN hold foreground) the instant the menu opened, stealing foreground and killing the
+// menu in ~4ms. The wrapper's reactive stand-down (remove the signal file on the menu-open WinEvent)
+// cannot win that race: the core re-asserts on its own timer, a beat ahead of the file removal.
+//
+// GUITHREADINFO.flags carries GUI_INMENUMODE / GUI_POPUPMENUMODE for the *thread*, regardless of who
+// owns the menu window. `want` and the menu share the app's single UI thread (Paint.NET is STA), so this
+// is TRUE exactly while a menu (owned OR ownerless) is up in the held app — and it is read HERE, at the
+// re-assert decision, so it cannot be raced. Skipping the re-assert lets the app keep the foreground its
+// menu needs; the next 0.2s tick re-asserts normally the moment the menu closes and menu-mode clears.
+static bool rdpFgHoldAppInMenuMode(HWND want)
+{
+  if (want == nullptr) {
+    return false;
+  }
+  DWORD tid = GetWindowThreadProcessId(want, nullptr);
+  if (tid == 0) {
+    return false;
+  }
+  GUITHREADINFO gti = {};
+  gti.cbSize = sizeof(gti);
+  if (!GetGUIThreadInfo(tid, &gti)) {
+    return false;
+  }
+  // GUI_INMENUMODE (0x00000004) | GUI_POPUPMENUMODE (0x00000010) — winuser.h.
+  return (gti.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0;
+}
+
 // MouseTransfer (RDP window handoff foreground hold), the event-thread half.
 //
 // WHY: the wrapper exports a window over RDP and delivers the viewer's typing as tagged
@@ -1150,8 +1183,16 @@ void MSWindowsDesks::checkRdpFgHold()
     // a WinForms invisible-owner menu has ownedPopupUp == false — both keep the identical old path.
     const bool fgIsPopup = rdpFgHoldIsTransientPopup(fgNow);
     const bool assertOverSame = rdpFgHoldAssertOverSameProcess(ownedPopupUp, fgIsPopup);
+    // RACE-FREE MENU-MODE STAND-DOWN (History ownerless-menu insta-close, 2026-08-22). If the held app's
+    // UI thread is in menu mode, a menu is open in it (owned OR ownerless) — re-asserting `want`'s
+    // foreground would steal it from the menu and kill an ownerless #32768 the instant foreground moves.
+    // Owner-independent and checked at the re-assert moment, so the wrapper's reactive file-removal race
+    // is moot. Skip; the next tick re-asserts once the menu closes. See rdpFgHoldAppInMenuMode.
+    const bool appInMenuMode = rdpFgHoldAppInMenuMode(want);
     const char *action = (fgNow == active) ? "satisfied" : "backoff-sameproc";
-    if (fgNow != active && (!sameProcess || assertOverSame)) {
+    if (appInMenuMode) {
+      action = "menu-mode-standdown";
+    } else if (fgNow != active && (!sameProcess || assertOverSame)) {
       // 🔴 DO NOT SEND INTO A WINDOW THAT IS NOT PUMPING. sendMessage blocks this — the MAIN
       // EVENT-QUEUE — thread on an unbounded waitForDesk while the desk thread serialises against
       // the target's input queue, so a modal or busy target stalls the whole core and the mesh

@@ -1390,6 +1390,26 @@ depends on any of it; the `sendMessage` / return structure is byte-identical to 
 from the core's `coreout.log`; the wrapper half (which hwnd it wrote to `rdp-fg-hold`, and its
 menu-target early-return) is already traced under the wrapper's `rdpwindow-trace`.
 
+### RDP fg-hold: race-free MENU-MODE stand-down — the DEFINITIVE History ownerless-menu fix (2026-08-22)
+
+The instrumentation paid off. Paint.NET's History context menu is an **OWNERLESS** `#32768`
+(`owner == 0`): nothing in the owner chain — not `GetLastActivePopup` on any window, not the wrapper's
+owner/parent-keyed menu trackers — ever sees it, so the fg-hold kept re-asserting `want` (a sibling that
+CAN hold foreground) the instant the menu opened, stealing foreground and killing the menu in ~4 ms. The
+wrapper's reactive stand-down (remove the signal file on the menu-open WinEvent) could not win: the core
+re-asserts on its own 0.2 s / 0.04 s timers, a beat ahead of the file removal.
+
+The race-free fix is here, at the re-assert decision. `checkRdpFgHold` now skips the re-assert while the
+held app's UI thread is in **menu mode** — `rdpFgHoldAppInMenuMode(want)` reads
+`GUITHREADINFO.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)` for `want`'s thread. That flag is set for
+the THREAD regardless of who owns the menu window, and `want` shares the app's single UI thread (STA), so
+it is true exactly while a menu — owned OR ownerless — is up in the held app. Because it is read at the
+moment of the re-assert, no reactive wrapper signal can be raced. Skipping lets the app keep the
+foreground its menu needs; the next tick re-asserts normally once the menu closes (`action` logs
+`menu-mode-standdown` in the DIAG, so the retest is self-verifying). Only `checkRdpFgHold` needs it: the
+0.04 s `checkRdpFgHoldFast` already returns early for an ownerless menu (`active == want`, no owned
+popup). The 50 ms `SMTO_ABORTIFHUNG` anti-freeze probe and the DIAG are untouched.
+
 ### Exclude a designated VDD monitor from the server canvas (2026-08-18)
 
 **Files:** `src/lib/platform/MSWindowsScreen.{h,cpp}`
