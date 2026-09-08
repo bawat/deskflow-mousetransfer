@@ -5,6 +5,7 @@
 
 # temp dirs created during build
 /build
+/build-x86
 /dist
 /deps
 /tmp
