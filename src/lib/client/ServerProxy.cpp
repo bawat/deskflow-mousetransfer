@@ -462,7 +462,20 @@ void ServerProxy::flushCompressedMouse()
 void ServerProxy::sendInfo(const ClientInfo &info, uint32_t resyncId)
 {
   LOG_DEBUG1("sending info shape=%d,%d %dx%d", info.m_x, info.m_y, info.m_w, info.m_h);
-  m_pendingInfo.push_back(resyncId);
+  // The ONE way a server can leave a well-formed DINF unanswered: ClientProxy1_0::recvInfo returns
+  // false -- no CIAK -- when the (int16 on the wire) width or height is not positive. That rule is
+  // deterministic in what we send, so mirror it here and never queue an entry the server will not
+  // answer: a stale entry at the head of m_pendingInfo would shift every later ack onto the wrong
+  // DINF. A genuine info that the server will reject is still sent (stock behaviour, including stock's
+  // m_ignoreMouse staying set); a resync is simply not sent (the tracker's ack timeout abandons it).
+  const bool serverWillAck = static_cast<int16_t>(info.m_w) > 0 && static_cast<int16_t>(info.m_h) > 0;
+  if (resyncId != 0 && !serverWillAck) {
+    LOG_DEBUG1("not sending warp-grab resync %u: shape %dx%d would be rejected", resyncId, info.m_w, info.m_h);
+    return;
+  }
+  if (serverWillAck) {
+    m_pendingInfo.push_back(resyncId);
+  }
   ProtocolUtil::writef(m_stream, kMsgDInfo, info.m_x, info.m_y, info.m_w, info.m_h, 0, info.m_mx, info.m_my);
 }
 

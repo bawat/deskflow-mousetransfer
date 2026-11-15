@@ -286,6 +286,8 @@ const char *warpGrabEndName(WarpGrabTracker::EndReason r)
     return "grab released";
   case WarpTimeout:
     return "warp timeout";
+  case AckTimeout:
+    return "resync never acknowledged - ABANDONED to stock";
   }
   return "?";
 }
@@ -824,11 +826,17 @@ void MSWindowsDesks::warpGrabLogDecision(
   if (d.resync != WarpGrabTracker::ResyncKind::None) {
     ++m_wgSessionResyncs;
   }
-  if (d.ended != WarpGrabTracker::EndReason::None && m_wgSessionLogged) {
+  // An ack timeout is logged even when the session's start line was rate-limited away: it means a
+  // CIAK went missing, which should never happen, and that line is the only trace it leaves.
+  if (d.ended != WarpGrabTracker::EndReason::None &&
+      (m_wgSessionLogged || d.ended == WarpGrabTracker::EndReason::AckTimeout)) {
     LOG_INFO(
         "warp-grab: session end (%s) after %llu ms, %u resyncs; cursor=%d,%d", warpGrabEndName(d.ended),
         static_cast<unsigned long long>(now - m_wgSessionStartMs), m_wgSessionResyncs, d.inject.x, d.inject.y
     );
+    if (d.ended == WarpGrabTracker::EndReason::AckTimeout) {
+      m_wgSessionLogged = false;
+    }
   }
 
   if (warpGrabTraceOn() && (d.tracked || d.token != WarpGrabTracker::kNoToken || d.entered)) {

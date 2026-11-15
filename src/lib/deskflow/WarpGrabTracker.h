@@ -75,7 +75,11 @@ public:
     //! Positions within this many pixels are "the same point" -- the round-trip error of the
     //! platform's absolute-injection coordinate normalisation. Used for warp liveness in Active.
     int32_t roundingPx = 0;
-    //! Active ends once no warp has been observed for this long.
+    //! Active ends once no warp has been observed for this long. ALSO the bound on how long a resync
+    //! may stay unacknowledged before the session is abandoned (see onServerMove): both are "how long
+    //! may the server's virtual cursor stay off-position", the same policy question. The ack itself is
+    //! written synchronously inside the server's recvInfo, so a healthy one arrives within a network
+    //! round trip -- orders of magnitude inside this bound -- and a separate value would buy nothing.
     int64_t warpTimeoutMs = 0;
   };
 
@@ -90,7 +94,8 @@ public:
   {
     None,
     TokenChanged, //!< the grab owner went away or changed
-    WarpTimeout   //!< the owner stopped warping
+    WarpTimeout,  //!< the owner stopped warping
+    AckTimeout    //!< a resync was never acknowledged: session ABANDONED to stock (something is wrong)
   };
 
   enum class ResyncKind
@@ -166,7 +171,7 @@ private:
   bool differsFromBoth(Point cursor, int32_t minDx, int32_t minDy) const;
   Point chooseBase(Point cursor) const;
   Point chainDelta(Point server, Decision &d);
-  void issueResync(Point pos, ResyncKind kind, Decision &d);
+  void issueResync(Point pos, ResyncKind kind, Decision &d, int64_t nowMs);
   void commit(Point target);
   void goIdle();
   static Point clampTo(Point p, const Shape &shape);
@@ -193,6 +198,7 @@ private:
   uint32_t m_pendingId = 0;  // requested, awaiting ack (0 = none)
   bool m_requestReady = false; // requested, not yet taken by the sender
   Point m_pendingPos;
+  int64_t m_pendingIssuedMs = 0; // when m_pendingId was issued (ack-timeout clock)
   ResyncKind m_inflightKind = ResyncKind::None;
   bool m_dual = false; // acked; both chains live
   Point m_newAnchor;   // last position on the new chain (starts at the reported position)

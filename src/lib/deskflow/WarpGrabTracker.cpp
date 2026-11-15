@@ -102,8 +102,9 @@ WarpGrabTracker::Point WarpGrabTracker::chainDelta(Point server, Decision &d)
   return delta;
 }
 
-void WarpGrabTracker::issueResync(Point pos, ResyncKind kind, Decision &d)
+void WarpGrabTracker::issueResync(Point pos, ResyncKind kind, Decision &d, int64_t nowMs)
 {
+  m_pendingIssuedMs = nowMs;
   m_pendingId = m_nextId++;
   if (m_nextId == 0) {
     m_nextId = 1; // 0 means "none"
@@ -181,10 +182,26 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
     d.delta = chainDelta(server, d);
     const Point target = clampTo({cursor.x + d.delta.x, cursor.y + d.delta.y}, shape);
     if (m_pendingId == 0 && !m_dual && nearEdge(server, shape)) {
-      issueResync({shape.x + shape.w / 2, shape.y + shape.h / 2}, ResyncKind::Recentre, d);
+      issueResync({shape.x + shape.w / 2, shape.y + shape.h / 2}, ResyncKind::Recentre, d, nowMs);
     }
     commit(target);
     d.inject = target;
+    return d;
+  }
+
+  // A resync that is never acknowledged would strand us: Active could never recentre again, Ending
+  // could never complete, and the server's virtual cursor would stay off-position until a leave. A
+  // lost CIAK should be impossible (the server answers every valid DINF with exactly one, written
+  // synchronously in recvInfo), so this is a "something is wrong" exit, not a normal one: ABANDON to
+  // stock -- full reset, inject the server position on this very move (one snap), and let the id check
+  // in onResyncAcknowledged discard the ack if it turns up late after all.
+  if (m_pendingId != 0 && nowMs - m_pendingIssuedMs > m_config.warpTimeoutMs) {
+    reset();
+    m_prevS = server;
+    commit(server);
+    d.ended = EndReason::AckTimeout;
+    d.returnedToIdle = true;
+    d.inject = server;
     return d;
   }
 
@@ -204,7 +221,7 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
         // The recentre that was in flight when the session ended has settled; NOW re-seat the
         // server on the true cursor.
         m_endWanted = false;
-        issueResync(target, ResyncKind::End, d);
+        issueResync(target, ResyncKind::End, d, nowMs);
       } else {
         // The end resync has settled: the server's chain now tracks the true cursor.
         goIdle();
@@ -236,10 +253,10 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
       d.returnedToIdle = true;
     } else {
       m_mode = Mode::Ending;
-      issueResync(target, ResyncKind::End, d);
+      issueResync(target, ResyncKind::End, d, nowMs);
     }
   } else if (m_pendingId == 0 && !m_dual && nearEdge(server, shape)) {
-    issueResync({shape.x + shape.w / 2, shape.y + shape.h / 2}, ResyncKind::Recentre, d);
+    issueResync({shape.x + shape.w / 2, shape.y + shape.h / 2}, ResyncKind::Recentre, d, nowMs);
   }
 
   commit(target);

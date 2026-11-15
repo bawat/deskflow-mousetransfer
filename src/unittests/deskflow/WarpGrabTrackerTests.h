@@ -28,4 +28,7 @@ private Q_SLOTS:
   void staleLandedReadDoesNotEatADelta();
   void resetOnLeaveEnterOrShapeChange();
   void staleAckAfterResetIsIgnored();
+  void ackTimeoutAbandonsActive();
+  void ackTimeoutAbandonsEnding();
+  void lateAckAfterAbandonIsIgnored();
 };

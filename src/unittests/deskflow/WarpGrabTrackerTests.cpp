@@ -456,4 +456,100 @@ void WarpGrabTrackerTests::staleAckAfterResetIsIgnored()
   QCOMPARE(s.tr.mode(), Mode::Idle);
 }
 
+void WarpGrabTrackerTests::ackTimeoutAbandonsActive()
+{
+  Sim s;
+  QVERIFY(s.enterSession(960, 540, 200, kGrab));
+  s.move(479, 540); // recentre requested...
+  Point r;
+  uint32_t id = 0;
+  QVERIFY(s.takeResync(r, id));
+  // ...and its CIAK never comes. The app keeps warping, so only the ack bound can end this.
+  const int64_t step = 100;
+  int32_t x = 479;
+  WarpGrabTracker::Decision d;
+  for (int64_t elapsed = step; elapsed <= kTestTimeoutMs; elapsed += step) {
+    s.cursor.x += 50; // a warp on every move keeps the warp timeout from firing first
+    d = s.move(--x, 540, step);
+    QCOMPARE(d.ended, EndReason::None);
+    QCOMPARE(s.tr.mode(), Mode::Active);
+    QVERIFY(s.tr.resyncAwaitingAck());
+  }
+  s.cursor.x += 50;
+  d = s.move(--x, 540, step);
+  QCOMPARE(d.ended, EndReason::AckTimeout);
+  QVERIFY(d.returnedToIdle);
+  QVERIFY(!d.tracked);
+  COMPARE_POINT(d.inject, x, 540); // stock: the server position, one snap
+  QCOMPARE(s.tr.mode(), Mode::Idle);
+  QVERIFY(!s.tr.resyncAwaitingAck());
+  Point p;
+  uint32_t id2 = 0;
+  QVERIFY(!s.takeResync(p, id2));
+}
+
+void WarpGrabTrackerTests::ackTimeoutAbandonsEnding()
+{
+  Sim s;
+  QVERIFY(s.enterSession(960, 540, 200, kGrab));
+  s.token = WarpGrabTracker::kNoToken;
+  auto d = s.move(965, 540); // grab released: end resync requested
+  QCOMPARE(d.resync, ResyncKind::End);
+  QCOMPARE(s.tr.mode(), Mode::Ending);
+  Point r;
+  uint32_t id = 0;
+  QVERIFY(s.takeResync(r, id));
+  const int64_t step = 100;
+  int32_t x = 965;
+  for (int64_t elapsed = step; elapsed <= kTestTimeoutMs; elapsed += step) {
+    d = s.move(++x, 540, step);
+    QVERIFY(d.tracked); // still delta mode, waiting
+    QCOMPARE(s.tr.mode(), Mode::Ending);
+  }
+  d = s.move(++x, 540, step);
+  QCOMPARE(d.ended, EndReason::AckTimeout);
+  QVERIFY(!d.tracked);
+  COMPARE_POINT(d.inject, x, 540);
+  QCOMPARE(s.tr.mode(), Mode::Idle);
+}
+
+void WarpGrabTrackerTests::lateAckAfterAbandonIsIgnored()
+{
+  Sim s;
+  QVERIFY(s.enterSession(960, 540, 200, kGrab));
+  s.token = WarpGrabTracker::kNoToken;
+  s.move(965, 540);
+  Point r;
+  uint32_t lateId = 0;
+  QVERIFY(s.takeResync(r, lateId));
+  auto d = s.move(966, 540, kTestTimeoutMs + 1);
+  QCOMPARE(d.ended, EndReason::AckTimeout);
+
+  // The CIAK turns up after all: it must not resurrect the abandoned chain.
+  s.tr.onResyncAcknowledged(lateId);
+  QVERIFY(!s.tr.dualChain());
+  QCOMPARE(s.tr.mode(), Mode::Idle);
+  d = s.move(970, 541);
+  QVERIFY(!d.tracked);
+  COMPARE_POINT(d.inject, 970, 541);
+
+  // And a fresh session afterwards gets fresh ids and settles normally.
+  s.cursor.x += 200;
+  s.token = kGrab;
+  d = s.move(971, 541);
+  QVERIFY(d.entered);
+  d = s.move(470, 541); // near the edge: recentre
+  QCOMPARE(d.resync, ResyncKind::Recentre);
+  uint32_t id = 0;
+  QVERIFY(s.takeResync(r, id));
+  QVERIFY(id != lateId);
+  s.tr.onResyncAcknowledged(lateId); // a duplicate of the stale one: still ignored
+  QVERIFY(!s.tr.dualChain());
+  s.tr.onResyncAcknowledged(id);
+  QVERIFY(s.tr.dualChain());
+  d = s.move(r.x + 3, r.y);
+  QVERIFY(d.newChainWon);
+  QCOMPARE(s.tr.mode(), Mode::Active);
+}
+
 QTEST_MAIN(WarpGrabTrackerTests)
