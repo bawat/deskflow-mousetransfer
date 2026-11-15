@@ -1574,3 +1574,63 @@ whenever the foreground is higher-integrity (the hider while away; an elevated c
 `GetAsyncKeyState` says down, inject a tagged (`kDeskflowLocalInjectSignature`) button-up — delivered
 locally, never relayed. One `MT-stalebutton` log line when it fires. Skipped when the buttons are
 swapped (`SM_SWAPBUTTON`), since the async state is physical and the up flag logical.
+
+## Follow application cursor warps on a client instead of snapping them back (2026-11-15)
+
+**Files:** `src/lib/deskflow/WarpGrabTracker.{h,cpp}` (new, pure state machine),
+`src/lib/deskflow/IPlatformScreen.h` + `Screen.{h,cpp}` (three inert pass-through hooks),
+`src/lib/client/Client.{h,cpp}`, `src/lib/client/ServerProxy.{h,cpp}`,
+`src/lib/platform/MSWindowsDesks.{h,cpp}` + `MSWindowsScreen.{h,cpp}`; tests
+`src/unittests/deskflow/WarpGrabTrackerTests.{h,cpp}` (20 cases). **Client-side only. No protocol
+change, no server change** -- it works against any server version.
+
+**Symptom:** Blender (continuous grab, value scrubbing, viewport wrap) on a CLIENT goes haywire --
+values "skyrocket". Any application that warps the cursor with SetCursorPos does the same.
+
+**Cause:** the server keeps a VIRTUAL cursor for the active client (`Server::onMouseMoveSecondary`,
+`m_x += dx`) and sends absolute positions (DMMV), which the client injects absolutely
+(`MSWindowsDesks::deskMouseMove`). Nobody tells the server about the application's warp, so the next
+absolute move snaps the cursor back; the app reads the whole snap-back as travel and warps again.
+
+**Fix:** the `DESKFLOW_MSG_FAKE_MOVE` handler (desk thread) reads the true cursor before injecting
+and asks `WarpGrabTracker`:
+
+- **Idle** (stock): inject the server position. Only if the cursor is more than the entry threshold
+  (2x the system drag rectangle, either axis) away from BOTH where we last asked for and where we last
+  read it back -- i.e. something else moved it -- is the grab token evaluated. Token != 0 => **Active**
+  without injecting the server position at all (zero snap-back): inject true cursor + server delta.
+- **Active**: every server move becomes a delta against the previous server position, injected at
+  the true cursor (absolute injection, not `deskMouseRelativeMove`, which toggles acceleration per
+  event). When the server's virtual cursor is within a quarter screen of an edge, the client sends a
+  **resync** reporting the screen centre so it never clamps (losing deltas) or crosses a seam mid-grab.
+  The session ends when the token changes or no warp has been seen for 1 s; it then resyncs the
+  server to the TRUE cursor and stays in delta mode until that settles.
+- **Resync = an ordinary DINF** (`ServerProxy::sendWarpGrabResync`): `ClientProxy1_0::recvInfo` stores
+  the position and replies CIAK, and the queued ScreenShapeChanged makes `Server::handleShapeChanged`
+  set `m_x,m_y` for the active client. Because the CIAK precedes that queued event, moves just after
+  it can still be old-chain: after the ack the tracker keeps both anchors and attributes each move to
+  the chain with the smaller delta until the new chain first wins. Unlike `onInfoChanged`, a resync
+  does NOT set `m_ignoreMouse`; a FIFO of pending DINF kinds routes each (payload-less) CIAK, so only a
+  genuine info's ack clears `m_ignoreMouse`.
+- **Reset to Idle (no resync)** on enter (before the enter move, which then seeds the tracker), leave,
+  genuine shape change, disconnect and any relative (DMRM) move. Move compression in
+  `ServerProxy::mouseMove` is untouched (diff-of-absolutes is coalescing-proof).
+
+**Grab token (Windows):** `GetGUIThreadInfo(0)` capture window, unless the capturing process's image
+lies under the MouseTransfer bundle root (the directory holding `mousetransfer.exe`, found from the
+core's own `runtime\deskflow\` or flat `deskflow\` location; without a wrapper, the core's directory)
+-- that excludes crossdrag-helper's synthetic OLE drag, the RDP viewers, PiP/ghost/tray windows and
+this core's own hider. A move/size loop or menu (`GUI_INMOVESIZE|GUI_INMENUMODE|GUI_POPUPMENUMODE`)
+never counts, and ClipCursor is not evidence at all (Explorer's move loop clips to the work area).
+Else an application-hidden cursor (`GetCursorInfo` flags == 0, foreground not ours) gives a distinct
+constant. An unreadable image path counts as NOT ours. Other platforms: the `IPlatformScreen` hooks
+default to inert, so X11/macOS/Ei are byte-identical.
+
+**Toggles:** default ON. Kill switch `MOUSETRANSFER_WARPGRAB=0` or a `warpgrab-off` file in the core's
+working directory; trace `MOUSETRANSFER_WARPGRAB_TRACE=1` or `warpgrab-trace` (one `MT-warpgrab` INFO
+line per tracked move). Both read once at start-up. At default level the only new output is
+`warp-grab: session start/end` INFO lines, at most one start per 30 s (suppressed sessions counted).
+
+**Not verified on hardware yet:** whether `GetCursorPos` immediately after `SendInput` reflects the
+injection (the tracker is built not to depend on it), and Blender's own capture/hide behaviour during
+its grabs. See the wrapper repo's `testing/designs/warp-grab-test-design.md`.
