@@ -77,6 +77,7 @@ add_library(${lib_name} STATIC ${PLATFORM_CODE}
   ScreenException.h
   ServerApp.cpp
   ServerApp.h
+  SecureDeskPolicy.h
   StreamChunker.cpp
   StreamChunker.h
   WarpGrabTracker.cpp

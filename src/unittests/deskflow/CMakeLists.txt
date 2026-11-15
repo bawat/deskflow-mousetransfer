@@ -62,3 +62,11 @@ create_test(
   SOURCE WarpGrabTrackerTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
 )
+
+create_test(
+  NAME SecureDeskPolicyTests
+  DEPENDS app
+  LIBS arch base ${extra_libs}
+  SOURCE SecureDeskPolicyTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
+)
