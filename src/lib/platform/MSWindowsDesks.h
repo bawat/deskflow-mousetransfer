@@ -10,12 +10,14 @@
 
 #include "deskflow/MouseTypes.h"
 #include "deskflow/OptionTypes.h"
+#include "deskflow/WarpGrabTracker.h"
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
 
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 
 #define WIN32_LEAN_AND_MEAN
@@ -151,6 +153,16 @@ public:
   */
   void getCursorPos(int32_t &x, int32_t &y) const;
 
+  //! @name warp-grab tracking (MouseTransfer fork; see deskflow/WarpGrabTracker.h)
+  //@{
+  //! Forget any session, no resync. Main thread.
+  void warpGrabReset();
+  //! Fetch a pending resync request for the sender. Main thread.
+  bool takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id);
+  //! The server acknowledged resync \p id. Main thread.
+  void warpGrabResyncAcknowledged(uint32_t id);
+  //@}
+
   //! Fake key press/release
   /*!
   Synthesize a press or release of key \c button.
@@ -209,6 +221,16 @@ private:
   // message handlers
   void deskMouseMove(int32_t x, int32_t y) const;
   void deskMouseRelativeMove(int32_t dx, int32_t dy) const;
+
+  // MouseTransfer warp-grab, desk thread: the DESKFLOW_MSG_FAKE_MOVE handler. Reads the true cursor,
+  // lets the tracker decide, injects, reads back. deskMouseMove stays the plain primitive (deskLeave
+  // uses it to centre the cursor, which must never be tracked).
+  void deskTrackedMouseMove(int32_t x, int32_t y);
+  // Who has grabbed the cursor (0 = nobody / one of ours / unknown). Desk thread, m_warpGrabMutex held.
+  deskflow::WarpGrabTracker::Token warpGrabToken();
+  // True iff hwnd belongs to a process whose image lives under the MouseTransfer bundle root.
+  bool isOwnBundleWindow(HWND hwnd);
+  void warpGrabLogDecision(const deskflow::WarpGrabTracker::Decision &d, int32_t sx, int32_t sy, POINT c, uint64_t now);
   void deskEnter(Desk *desk);
   void deskLeave(Desk *desk, HKL keyLayout);
   void deskThread(const void *vdesk);
@@ -350,6 +372,28 @@ private:
   // sentinel. Written only by checkRdpPark (event thread), read only by getRdpPark (hook thread).
   std::string m_rdpParkFile;
   std::atomic<uint64_t> m_rdpPark{UINT64_MAX};
+
+  // MouseTransfer warp-grab (see deskflow/WarpGrabTracker.h and deskTrackedMouseMove). The tracker is
+  // driven by the desk thread (every server move) and by the main thread (reset on enter/leave/shape
+  // change/disconnect, resync take, resync ack), so every access holds m_warpGrabMutex. Everything
+  // below the tracker is desk-thread bookkeeping, also only touched under the lock.
+  std::mutex m_warpGrabMutex;
+  deskflow::WarpGrabTracker m_warpGrab;
+  // Directory under which a process image counts as OURS (crossdrag-helper's synthetic OLE drag, the
+  // RDP viewers, PiP/ghost/tray windows, this core). Resolved once in the constructor.
+  std::wstring m_warpGrabOwnRoot;
+  // One-entry cache for isOwnBundleWindow: (window, pid) -> verdict + image path for logging.
+  HWND m_wgCacheHwnd = nullptr;
+  DWORD m_wgCachePid = 0;
+  bool m_wgCacheOurs = false;
+  std::wstring m_wgCacheImage;
+  // Session log rate limit (see kWarpGrabSessionLogIntervalMs).
+  bool m_wgEverLogged = false;
+  uint64_t m_wgLastLogMs = 0;
+  uint32_t m_wgSuppressed = 0;
+  bool m_wgSessionLogged = false;
+  uint64_t m_wgSessionStartMs = 0;
+  uint32_t m_wgSessionResyncs = 0;
 
   IEventQueue *m_events;
 };

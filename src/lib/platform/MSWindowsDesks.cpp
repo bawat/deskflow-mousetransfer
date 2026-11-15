@@ -27,6 +27,7 @@
 #include <cwchar> // MouseTransfer: wcscmp for the fg-hold popup-class check (History fix)
 #include <fstream>
 #include <malloc.h>
+#include <mutex>
 
 // these are only defined when WINVER >= 0x0500
 #if !defined(SPI_GETMOUSESPEED)
@@ -114,6 +115,198 @@ static void send_mouse_input(DWORD dwFlags, DWORD dx, DWORD dy, DWORD dwData)
 }
 
 //
+// MouseTransfer warp-grab: toggles, policy constants and the bundle-root rule. See
+// deskflow/WarpGrabTracker.h for the model and MSWindowsDesks::deskTrackedMouseMove for the plumbing.
+//
+
+namespace {
+
+using WarpGrabTracker = deskflow::WarpGrabTracker;
+
+//! Kill switch. ON by default; MOUSETRANSFER_WARPGRAB=0 in the core's environment, or a `warpgrab-off`
+//! file in its working directory (beside the other core-facing signal files: switchreq, coremode,
+//! clipdiag), restores stock injection byte for byte. Read once and cached, like mtDiagEnabled():
+//! the environment cannot change under a running core, and a sentinel takes effect at the next core
+//! (re)start -- which the wrapper's coremode nonce bump provides without UAC.
+bool warpGrabDisabled()
+{
+  static const bool off = [] {
+    if (const char *env = std::getenv("MOUSETRANSFER_WARPGRAB"); env != nullptr && env[0] == '0' && env[1] == '\0') {
+      return true;
+    }
+    return static_cast<bool>(std::ifstream("warpgrab-off"));
+  }();
+  return off;
+}
+
+//! Per-move trace. OFF by default; MOUSETRANSFER_WARPGRAB_TRACE=1 or a `warpgrab-trace` file. One INFO
+//! line per TRACKED move and per Idle move whose token had to be evaluated -- never for a plain Idle
+//! move, so even with the trace on an ordinary session logs nothing until something warps.
+bool warpGrabTraceOn()
+{
+  static const bool on = [] {
+    if (const char *env = std::getenv("MOUSETRANSFER_WARPGRAB_TRACE"); env != nullptr && env[0] == '1' &&
+                                                                        env[1] == '\0') {
+      return true;
+    }
+    return static_cast<bool>(std::ifstream("warpgrab-trace"));
+  }();
+  return on;
+}
+
+//! Entry threshold = the system drag rectangle (SM_CXDRAG/SM_CYDRAG, "how far the pointer must move
+//! before Windows calls it a drag", 4 px by default) times this factor. POLICY, not a measurement: its
+//! job is to make our OWN small displacements invisible -- crossdrag_helper's 1-2 px relative nudges
+//! (crossdrag_helper.cpp, the drag-start nudge) plus the 1 px normalisation round trip
+//! (kWarpGrabRoundingPx) -- while staying far below any real application warp (a Blender wrap or a
+//! re-centre moves the cursor by a large fraction of the window). x2 keeps that margin even if a user
+//! has shrunk the drag rectangle; and a nudge is ALSO rejected independently because the process
+//! holding capture during our drags is one of ours (token 0).
+constexpr int kWarpGrabDragRectFactor = 2;
+
+//! Positions this close are "the same point". deskMouseMove normalises x to 0..65535 over the
+//! primary width (SendInput MOUSEEVENTF_ABSOLUTE), i.e. one normalised step is w/65535 < 1 px, so the
+//! rounding in our conversion plus the OS's conversion back can be off by at most 1 px per axis.
+constexpr int32_t kWarpGrabRoundingPx = 1;
+
+//! A session ends once the grabbing app has not warped for this long. POLICY: it bounds how long a
+//! stale session (an app that grabbed, warped and then simply stopped, without releasing capture)
+//! can keep the server's virtual cursor parked off the true position -- and so keep the user from
+//! crossing a seam. Ending and re-entering is seamless (the next warp re-enters with zero snap-back),
+//! so a short value is cheap; 1 s outlasts any gap between warps of an app that is actively wrapping.
+constexpr int64_t kWarpGrabTimeoutMs = 1000;
+
+//! Session start/end lines are always logged (INFO), but at most one start per this interval, with a
+//! count of the suppressed ones on the next. Same reasoning and value as ServerProxy's
+//! kNoLaneWarningInterval: the first line carries the news, and an app that grabs on every click
+//! would otherwise produce a pair of lines per click.
+constexpr uint64_t kWarpGrabSessionLogIntervalMs = 30000;
+
+//! Token for "an application has hidden the cursor" (GetCursorInfo flags == 0, i.e. neither SHOWING
+//! nor SUPPRESSED). Must never equal a window token: window handles are 32-bit significant even on
+//! 64-bit Windows ("Interprocess Communication Between 32-bit and 64-bit Applications", MS docs), so a
+//! value with bit 32 set cannot be an HWND.
+constexpr WarpGrabTracker::Token kWarpGrabHiddenCursorToken = WarpGrabTracker::Token{1} << 32;
+
+WarpGrabTracker::Config warpGrabConfig()
+{
+  WarpGrabTracker::Config c;
+  // GetSystemMetrics fails as 0; a 0 rectangle would make every 1 px wobble an "entry" candidate, so
+  // fall back to the shipped default of the setting behind SM_CXDRAG/SM_CYDRAG (the DragWidth /
+  // DragHeight values under HKCU "Control Panel\Desktop", 4 on a fresh profile) rather than to
+  // nothing.
+  int dragX = GetSystemMetrics(SM_CXDRAG);
+  int dragY = GetSystemMetrics(SM_CYDRAG);
+  constexpr int kDocumentedDefaultDragPx = 4;
+  if (dragX <= 0) {
+    dragX = kDocumentedDefaultDragPx;
+  }
+  if (dragY <= 0) {
+    dragY = kDocumentedDefaultDragPx;
+  }
+  c.entryMinDx = dragX * kWarpGrabDragRectFactor;
+  c.entryMinDy = dragY * kWarpGrabDragRectFactor;
+  c.roundingPx = kWarpGrabRoundingPx;
+  c.warpTimeoutMs = kWarpGrabTimeoutMs;
+  return c;
+}
+
+std::wstring parentDir(const std::wstring &path)
+{
+  const size_t slash = path.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+}
+
+std::wstring leafName(const std::wstring &path)
+{
+  const size_t slash = path.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+bool fileExistsW(const std::wstring &path)
+{
+  const DWORD attrs = GetFileAttributesW(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+//! The directory under which a process image is "ours". The packaged layout is
+//! <root>\mousetransfer.exe + <root>\runtime\*.exe (crossdrag/screen/audio/rdpview helpers) +
+//! <root>\runtime\deskflow\deskflow-core.exe + <root>\runtime\rdp\ (package.ps1); the older flat dev
+//! layout is <root>\mousetransfer.exe + <root>\deskflow\deskflow-core.exe (internal/platform
+//! DefaultDeskflowDir). The candidate root is accepted ONLY if a mousetransfer.exe actually sits in it:
+//! a stock Deskflow install (C:\Program Files\Deskflow) would otherwise make its parent -- all of
+//! Program Files, Blender included -- "ours" and switch the feature off. Without a wrapper the core's
+//! own directory is the root.
+std::wstring computeWarpGrabOwnRoot()
+{
+  std::wstring exe(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD n = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (n == 0) {
+      return std::wstring();
+    }
+    if (n < exe.size()) {
+      exe.resize(n);
+      break;
+    }
+    exe.resize(exe.size() * 2);
+  }
+  const std::wstring coreDir = parentDir(exe);
+  std::wstring candidate = parentDir(coreDir);
+  if (_wcsicmp(leafName(candidate).c_str(), L"runtime") == 0) {
+    candidate = parentDir(candidate);
+  }
+  if (!candidate.empty() && fileExistsW(candidate + L"\\mousetransfer.exe")) {
+    return candidate;
+  }
+  return coreDir;
+}
+
+const char *warpGrabModeName(WarpGrabTracker::Mode m)
+{
+  switch (m) {
+    using enum WarpGrabTracker::Mode;
+  case Idle:
+    return "idle";
+  case Active:
+    return "active";
+  case Ending:
+    return "ending";
+  }
+  return "?";
+}
+
+const char *warpGrabEndName(WarpGrabTracker::EndReason r)
+{
+  switch (r) {
+    using enum WarpGrabTracker::EndReason;
+  case None:
+    return "none";
+  case TokenChanged:
+    return "grab released";
+  case WarpTimeout:
+    return "warp timeout";
+  }
+  return "?";
+}
+
+const char *warpGrabResyncName(WarpGrabTracker::ResyncKind k)
+{
+  switch (k) {
+    using enum WarpGrabTracker::ResyncKind;
+  case None:
+    return "-";
+  case Recentre:
+    return "recentre";
+  case End:
+    return "end";
+  }
+  return "?";
+}
+
+} // namespace
+
+//
 // MSWindowsDesks
 //
 
@@ -131,8 +324,16 @@ MSWindowsDesks::MSWindowsDesks(
       m_screensaver(screensaver),
       m_deskReady(&m_mutex, false),
       m_updateKeys(updateKeys),
+      m_warpGrab(warpGrabConfig()),
       m_events(events)
 {
+  // MouseTransfer warp-grab: resolve once which process images count as ours (see
+  // computeWarpGrabOwnRoot). Logged at DEBUG so a mis-resolved root is diagnosable.
+  m_warpGrabOwnRoot = computeWarpGrabOwnRoot();
+  LOG_DEBUG(
+      "warp-grab: %s, own-process root %ls, entry %dx%d px", warpGrabDisabled() ? "DISABLED" : "enabled",
+      m_warpGrabOwnRoot.c_str(), m_warpGrab.config().entryMinDx, m_warpGrab.config().entryMinDy
+  );
 
   m_cursor = createBlankCursor();
   m_deskClass = createDeskWindowClass(m_isPrimary);
@@ -541,6 +742,230 @@ void MSWindowsDesks::deskMouseRelativeMove(int32_t dx, int32_t dy) const
   }
 }
 
+// MouseTransfer warp-grab, the DESKFLOW_MSG_FAKE_MOVE handler (desk thread). Everything that touches
+// the cursor happens HERE, on the thread attached to the input desktop: the elevated core is
+// LocalSystem, and GetCursorPos / GetGUIThreadInfo / GetCursorInfo answer about the calling thread's
+// desktop, which for the main thread is not necessarily the one the user is looking at. Any read that
+// fails (secure desktop, desk switch in progress) fails CLOSED: stock injection, session forgotten.
+void MSWindowsDesks::deskTrackedMouseMove(int32_t x, int32_t y)
+{
+  if (m_isPrimary || warpGrabDisabled()) {
+    deskMouseMove(x, y);
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(m_warpGrabMutex);
+
+  POINT c{0, 0};
+  if (!GetCursorPos(&c)) {
+    if (m_warpGrab.mode() != WarpGrabTracker::Mode::Idle && m_wgSessionLogged) {
+      LOG_INFO("warp-grab: session abandoned (cursor unreadable, err=%lu)", GetLastError());
+      m_wgSessionLogged = false;
+    }
+    m_warpGrab.reset();
+    deskMouseMove(x, y);
+    return;
+  }
+
+  const uint64_t now = GetTickCount64();
+  const WarpGrabTracker::Shape shape{m_x, m_y, m_w, m_h};
+  const auto d = m_warpGrab.onServerMove({x, y}, {c.x, c.y}, [this] { return warpGrabToken(); },
+                                         static_cast<int64_t>(now), shape);
+  deskMouseMove(d.inject.x, d.inject.y);
+
+  // The read-back. Whether SendInput's absolute move is already reflected here is NOT something the
+  // design relies on: the tracker compares against both the request and this read, and treats a
+  // read that still shows the old point as "not landed yet" (WarpGrabTracker::chooseBase).
+  if (POINT landed; GetCursorPos(&landed)) {
+    m_warpGrab.noteLanded({landed.x, landed.y});
+  }
+
+  warpGrabLogDecision(d, x, y, c, now);
+}
+
+void MSWindowsDesks::warpGrabLogDecision(const WarpGrabTracker::Decision &d, int32_t sx, int32_t sy, POINT c, uint64_t now)
+{
+  if (d.entered) {
+    m_wgSessionStartMs = now;
+    m_wgSessionResyncs = 0;
+    // Rate limit: the first start always logs; later ones at most once per interval.
+    if (!m_wgEverLogged || now - m_wgLastLogMs >= kWarpGrabSessionLogIntervalMs) {
+      std::string image;
+      if (!m_wgCacheImage.empty()) {
+        const std::wstring leaf = leafName(m_wgCacheImage);
+        image.assign(leaf.begin(), leaf.end()); // log only; non-ASCII degrades to '?'-ish bytes
+        for (auto &ch : image) {
+          if (static_cast<unsigned char>(ch) > 0x7e) {
+            ch = '?';
+          }
+        }
+      }
+      const std::string suppressed =
+          m_wgSuppressed != 0 ? " [+" + std::to_string(m_wgSuppressed) + " sessions not logged]" : std::string();
+      LOG_INFO(
+          "warp-grab: session start token=%llx (%s) server=%d,%d cursor=%d,%d inject=%d,%d%s",
+          static_cast<unsigned long long>(d.token),
+          d.token == kWarpGrabHiddenCursorToken ? "hidden cursor" : (image.empty() ? "?" : image.c_str()), sx, sy,
+          c.x, c.y, d.inject.x, d.inject.y, suppressed.c_str()
+      );
+      m_wgEverLogged = true;
+      m_wgLastLogMs = now;
+      m_wgSuppressed = 0;
+      m_wgSessionLogged = true;
+    } else {
+      ++m_wgSuppressed;
+      m_wgSessionLogged = false;
+    }
+  }
+  if (d.resync != WarpGrabTracker::ResyncKind::None) {
+    ++m_wgSessionResyncs;
+  }
+  if (d.ended != WarpGrabTracker::EndReason::None && m_wgSessionLogged) {
+    LOG_INFO(
+        "warp-grab: session end (%s) after %llu ms, %u resyncs; cursor=%d,%d", warpGrabEndName(d.ended),
+        static_cast<unsigned long long>(now - m_wgSessionStartMs), m_wgSessionResyncs, d.inject.x, d.inject.y
+    );
+  }
+
+  if (warpGrabTraceOn() && (d.tracked || d.token != WarpGrabTracker::kNoToken || d.entered)) {
+    LOG_INFO(
+        "MT-warpgrab: S=%d,%d C=%d,%d -> %d,%d mode=%s base=%d,%d delta=%+d,%+d tok=%llx warp=%d chain=%s%s "
+        "resync=%s idle=%d",
+        sx, sy, c.x, c.y, d.inject.x, d.inject.y, warpGrabModeName(m_warpGrab.mode()), d.base.x, d.base.y, d.delta.x,
+        d.delta.y, static_cast<unsigned long long>(d.token), d.warpObserved ? 1 : 0,
+        m_warpGrab.dualChain() ? "dual" : "single",
+        d.newChainWon ? "(new won)" : (d.oldChainStraggler ? "(old straggler)" : ""), warpGrabResyncName(d.resync),
+        d.returnedToIdle ? 1 : 0
+    );
+  }
+}
+
+// Who has grabbed the cursor, as a token (0 = nobody, or one of ours, or cannot tell). Evaluated only
+// when the tracker asks: in Idle after a real discrepancy, in Active once per server move. Per-move in
+// Active is deliberate rather than rate-limited: it is two win32k queries (no IPC, no WMI, no file)
+// plus a cached verdict, at most once per relayed motion, and it is what ends a session on the very
+// move after the app releases its grab instead of a timer tick later.
+WarpGrabTracker::Token MSWindowsDesks::warpGrabToken()
+{
+  GUITHREADINFO gti{};
+  gti.cbSize = sizeof(gti);
+  if (GetGUIThreadInfo(0, &gti) && gti.hwndCapture != nullptr) {
+    // A modal move/size loop or a menu also holds capture. Neither warps the cursor in a way we must
+    // follow, and Explorer's window move loop in particular must never start a session (the same
+    // reason ClipCursor -- which that loop sets to the work area -- is not used as evidence at all).
+    if ((gti.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0) {
+      return WarpGrabTracker::kNoToken;
+    }
+    if (isOwnBundleWindow(gti.hwndCapture)) {
+      return WarpGrabTracker::kNoToken; // crossdrag-helper's OLE drag, an RDP viewer, our own hider...
+    }
+    return static_cast<WarpGrabTracker::Token>(reinterpret_cast<uintptr_t>(gti.hwndCapture));
+  }
+
+  // No capture, but the cursor is hidden by an application (ShowCursor counter below zero: neither
+  // CURSOR_SHOWING nor CURSOR_SUPPRESSED -- the latter is Windows hiding it for pen/touch, not an app).
+  CURSORINFO ci{};
+  ci.cbSize = sizeof(ci);
+  if (GetCursorInfo(&ci) && ci.flags == 0) {
+    HWND fg = GetForegroundWindow();
+    if (fg != nullptr && !isOwnBundleWindow(fg)) {
+      return kWarpGrabHiddenCursorToken;
+    }
+  }
+  return WarpGrabTracker::kNoToken;
+}
+
+// Is hwnd's process image under m_warpGrabOwnRoot? Cached on (hwnd, pid): a reused pid would come with
+// different windows, and a reused handle value with a different pid.
+//
+// If the image path cannot be read the window is treated as NOT ours. Every process of ours is an
+// ordinary unprotected process running as the user or LocalSystem, which this core (LocalSystem, or
+// the same user when run without UAC control) can always open with PROCESS_QUERY_LIMITED_INFORMATION;
+// what cannot be opened is a protected process, which is not one of ours. And treating an unknown as
+// ours would make such an app's warps permanently snap back -- the very bug this exists to fix.
+bool MSWindowsDesks::isOwnBundleWindow(HWND hwnd)
+{
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == 0) {
+    return false;
+  }
+  if (pid == GetCurrentProcessId()) {
+    return true;
+  }
+  if (hwnd == m_wgCacheHwnd && pid == m_wgCachePid) {
+    return m_wgCacheOurs;
+  }
+
+  std::wstring image;
+  if (HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid); proc != nullptr) {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (int attempt = 0; attempt < 4; ++attempt) { // MAX_PATH .. 16x: long-path images, bounded
+      DWORD n = static_cast<DWORD>(buf.size());
+      if (QueryFullProcessImageNameW(proc, 0, buf.data(), &n)) {
+        image.assign(buf.data(), n);
+        break;
+      }
+      if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        break;
+      }
+      buf.resize(buf.size() * 2);
+    }
+    CloseHandle(proc);
+  }
+
+  bool ours = false;
+  if (!image.empty() && !m_warpGrabOwnRoot.empty()) {
+    const std::wstring prefix = m_warpGrabOwnRoot + L"\\";
+    ours = image.size() > prefix.size() && _wcsnicmp(image.c_str(), prefix.c_str(), prefix.size()) == 0;
+  }
+  if (warpGrabTraceOn()) {
+    LOG_INFO(
+        "MT-warpgrab: window %p pid %lu image %ls -> %s", static_cast<void *>(hwnd), pid,
+        image.empty() ? L"(unreadable)" : image.c_str(), ours ? "ours" : "not ours"
+    );
+  }
+  m_wgCacheHwnd = hwnd;
+  m_wgCachePid = pid;
+  m_wgCacheOurs = ours;
+  m_wgCacheImage = image;
+  return ours;
+}
+
+void MSWindowsDesks::warpGrabReset()
+{
+  std::lock_guard<std::mutex> lock(m_warpGrabMutex);
+  if (m_warpGrab.mode() != WarpGrabTracker::Mode::Idle && m_wgSessionLogged) {
+    LOG_INFO("warp-grab: session reset (screen enter/leave, shape change, disconnect or relative move)");
+    m_wgSessionLogged = false;
+  }
+  m_warpGrab.reset();
+}
+
+bool MSWindowsDesks::takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id)
+{
+  std::lock_guard<std::mutex> lock(m_warpGrabMutex);
+  WarpGrabTracker::Point p;
+  if (!m_warpGrab.takeResyncRequest(p, id)) {
+    return false;
+  }
+  x = p.x;
+  y = p.y;
+  if (warpGrabTraceOn()) {
+    LOG_INFO("MT-warpgrab: resync %u -> server at %d,%d", id, x, y);
+  }
+  return true;
+}
+
+void MSWindowsDesks::warpGrabResyncAcknowledged(uint32_t id)
+{
+  std::lock_guard<std::mutex> lock(m_warpGrabMutex);
+  if (warpGrabTraceOn()) {
+    LOG_INFO("MT-warpgrab: resync %u acknowledged (awaiting=%d)", id, m_warpGrab.resyncAwaitingAck() ? 1 : 0);
+  }
+  m_warpGrab.onResyncAcknowledged(id);
+}
+
 /*!
  * Wraps the `ShowCursor` function and calls it repeatedly until the cursor visibility is at
  * the desired state. Windows maintains an internal counter for cursor visibility, and only
@@ -870,7 +1295,9 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       break;
 
     case DESKFLOW_MSG_FAKE_MOVE:
-      deskMouseMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
+      // MouseTransfer warp-grab: stock deskMouseMove unless an application is warping a grabbed cursor
+      // (or the feature is switched off, or this is the primary). See deskTrackedMouseMove.
+      deskTrackedMouseMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
       break;
 
     case DESKFLOW_MSG_FAKE_REL_MOVE:

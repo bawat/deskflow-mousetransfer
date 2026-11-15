@@ -92,6 +92,11 @@ public:
   bool isAnyMouseButtonDown(uint32_t &buttonID) const override;
   bool isCursorClippedToSubRegion() const override;
   bool isClipboardOwnedByUs() const override;
+  // MouseTransfer warp-grab (see deskflow/WarpGrabTracker.h): forwarded to MSWindowsDesks, which owns
+  // the tracker because the cursor reads and the injection live on its desk thread.
+  void warpGrabReset() override;
+  bool takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id) override;
+  void warpGrabResyncAcknowledged(uint32_t id) override;
   void getCursorCenter(int32_t &x, int32_t &y) const override;
 
   // ISecondaryScreen overrides

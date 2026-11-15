@@ -821,6 +821,21 @@ bool MSWindowsScreen::isClipboardOwnedByUs() const
   return MSWindowsClipboard::isOwnedByDeskflow();
 }
 
+void MSWindowsScreen::warpGrabReset()
+{
+  m_desks->warpGrabReset();
+}
+
+bool MSWindowsScreen::takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id)
+{
+  return m_desks->takeWarpGrabResync(x, y, id);
+}
+
+void MSWindowsScreen::warpGrabResyncAcknowledged(uint32_t id)
+{
+  m_desks->warpGrabResyncAcknowledged(id);
+}
+
 bool MSWindowsScreen::isCursorClippedToSubRegion() const
 {
   // Merged-fork: report whether the OS cursor is confined (ClipCursor) to a PROPER sub-region of
