@@ -251,6 +251,15 @@ public:
   */
   bool isClipboardOwnedByUs() const;
 
+  //! Warp-grab tracking pass-throughs (MouseTransfer fork; see IPlatformScreen)
+  /*!
+  Logically manipulators, but grouped with the other fork pass-throughs. All inert unless the
+  platform screen implements warp-grab tracking (Windows only today).
+  */
+  void warpGrabReset();
+  bool takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id);
+  void warpGrabResyncAcknowledged(uint32_t id);
+
   //! Get jump zone size
   /*!
   Return the jump zone size, the size of the regions on the edges of

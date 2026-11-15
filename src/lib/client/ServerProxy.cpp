@@ -459,10 +459,21 @@ void ServerProxy::flushCompressedMouse()
   }
 }
 
-void ServerProxy::sendInfo(const ClientInfo &info)
+void ServerProxy::sendInfo(const ClientInfo &info, uint32_t resyncId)
 {
   LOG_DEBUG1("sending info shape=%d,%d %dx%d", info.m_x, info.m_y, info.m_w, info.m_h);
+  m_pendingInfo.push_back(resyncId);
   ProtocolUtil::writef(m_stream, kMsgDInfo, info.m_x, info.m_y, info.m_w, info.m_h, 0, info.m_mx, info.m_my);
+}
+
+void ServerProxy::sendWarpGrabResync(int32_t x, int32_t y, uint32_t id)
+{
+  ClientInfo info;
+  m_client->getShape(info.m_x, info.m_y, info.m_w, info.m_h);
+  info.m_mx = x;
+  info.m_my = y;
+  LOG_DEBUG1("sending warp-grab resync %u at %d,%d", id, x, y);
+  sendInfo(info, id);
 }
 
 KeyID ServerProxy::translateKey(KeyID id) const
@@ -928,6 +939,17 @@ void ServerProxy::queryInfo()
 void ServerProxy::infoAcknowledgment()
 {
   LOG_DEBUG1("recv info acknowledgment");
+  // An empty FIFO cannot happen with a conforming server (it only ever sends CIAK in answer to our
+  // DINF); treat it as genuine, which is exactly stock behaviour.
+  uint32_t resyncId = 0;
+  if (!m_pendingInfo.empty()) {
+    resyncId = m_pendingInfo.front();
+    m_pendingInfo.pop_front();
+  }
+  if (resyncId != 0) {
+    m_client->warpGrabResyncAcknowledged(resyncId);
+    return;
+  }
   m_ignoreMouse = false;
 }
 

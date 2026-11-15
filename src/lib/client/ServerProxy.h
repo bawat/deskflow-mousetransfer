@@ -13,6 +13,7 @@
 #include "deskflow/KeyTypes.h"
 #include "deskflow/languages/LanguageManager.h"
 
+#include <deque>
 #include <memory>
 #include <string>
 
@@ -70,6 +71,17 @@ public:
   */
   void applyLaneClipboard(ClipboardID id, uint32_t seqNum, const std::string &data);
 
+  //! Re-seat the server's virtual cursor for the warp-grab tracker (MouseTransfer fork)
+  /*!
+  Writes an ordinary DINF carrying the REAL screen shape and (\p x,\p y) as the cursor position;
+  every Deskflow server applies that to its virtual cursor for the active client
+  (ClientProxy1_0::recvInfo + Server::handleShapeChanged). Unlike onInfoChanged() it does NOT set
+  m_ignoreMouse: the tracker keeps consuming moves on both coordinate chains while the server
+  catches up, and dropping them would lose the user's motion. Its CIAK is routed back to the
+  client tagged \p id instead of clearing m_ignoreMouse -- see m_pendingInfo.
+  */
+  void sendWarpGrabResync(int32_t x, int32_t y, uint32_t id);
+
   //@}
 
 protected:
@@ -86,7 +98,8 @@ private:
   // if compressing mouse motion then send the last motion now
   void flushCompressedMouse();
 
-  void sendInfo(const ClientInfo &);
+  // Every DINF goes through here; \p resyncId != 0 marks a warp-grab resync (see m_pendingInfo).
+  void sendInfo(const ClientInfo &, uint32_t resyncId = 0);
 
   void resetKeepAliveAlarm();
   void setKeepAliveRate(double);
@@ -139,6 +152,14 @@ private:
   int32_t m_dyMouse = 0;
 
   bool m_ignoreMouse = false;
+
+  // MouseTransfer warp-grab: one entry per DINF sent and not yet acknowledged, oldest first. CIAKs
+  // carry no payload, so they are indistinguishable on the wire; the server answers DINFs strictly
+  // in order (recvInfo writes the CIAK synchronously), so this FIFO tells infoAcknowledgment which
+  // kind each one answers. 0 = a GENUINE info (handshake / QINF reply / shape change) whose ack ends
+  // the m_ignoreMouse window; non-zero = the id of a warp-grab resync, whose ack goes to the tracker
+  // and must NOT touch m_ignoreMouse (a genuine change may still be awaiting its own ack behind it).
+  std::deque<uint32_t> m_pendingInfo;
 
   KeyModifierID m_modifierTranslationTable[kKeyModifierIDLast];
 

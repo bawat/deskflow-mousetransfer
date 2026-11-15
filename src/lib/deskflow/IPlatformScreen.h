@@ -177,6 +177,35 @@ public:
   }
 
   //@}
+  //! @name warp-grab tracking (MouseTransfer fork)
+  //@{
+
+  // An application on a CLIENT that warps the cursor itself (Blender continuous grab, value
+  // scrubbing) is otherwise snapped back by the server's next absolute move every time, which the
+  // application reads as huge mouse travel. A platform that can observe such a grab converts server
+  // moves to deltas while it lasts and asks the server to re-seat its virtual cursor through an
+  // ordinary DINF (see deskflow/WarpGrabTracker.h and MODIFICATIONS.md). The defaults are INERT, so a
+  // platform that does not override these keeps stock behaviour exactly.
+
+  //! Forget any warp-grab session (no resync): enter, leave, shape change, disconnect, DMRM.
+  virtual void warpGrabReset()
+  {
+    // inert by default
+  }
+
+  //! Fetch a pending resync: report (x,y) to the server as the cursor position, tagged \p id.
+  virtual bool takeWarpGrabResync(int32_t &, int32_t &, uint32_t &)
+  {
+    return false;
+  }
+
+  //! The server acknowledged resync \p id.
+  virtual void warpGrabResyncAcknowledged(uint32_t)
+  {
+    // inert by default
+  }
+
+  //@}
   // IKeyState overrides
   void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) override = 0;
   bool

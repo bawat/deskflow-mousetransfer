@@ -214,6 +214,9 @@ void Client::getCursorPos(int32_t &x, int32_t &y) const
 void Client::enter(int32_t xAbs, int32_t yAbs, uint32_t, KeyModifierMask mask, bool)
 {
   m_active = true;
+  // MouseTransfer warp-grab: a new visit starts a new coordinate chain. Reset BEFORE the enter move
+  // so that move is injected stock and seeds the tracker (WarpGrabTracker: first move after reset).
+  m_screen->warpGrabReset();
   m_screen->mouseMove(xAbs, yAbs);
   m_screen->enter(mask);
 
@@ -229,6 +232,10 @@ void Client::enter(int32_t xAbs, int32_t yAbs, uint32_t, KeyModifierMask mask, b
 bool Client::leave()
 {
   m_active = false;
+
+  // MouseTransfer warp-grab: the server stops sending us moves; any session (and any resync still
+  // in flight -- its ack will be ignored as stale) ends here.
+  m_screen->warpGrabReset();
 
   m_screen->leave();
 
@@ -291,11 +298,30 @@ void Client::mouseUp(ButtonID id)
 void Client::mouseMove(int32_t x, int32_t y)
 {
   m_screen->mouseMove(x, y);
+
+  // MouseTransfer warp-grab: the injection just decided (on the desk thread, synchronously inside
+  // the call above) may have asked the server to re-seat its virtual cursor. Send it now, from the
+  // thread that owns the stream. Inert unless the platform tracks warp grabs.
+  int32_t rx = 0;
+  int32_t ry = 0;
+  uint32_t id = 0;
+  if (m_server != nullptr && m_screen->takeWarpGrabResync(rx, ry, id)) {
+    m_server->sendWarpGrabResync(rx, ry, id);
+  }
 }
 
 void Client::mouseRelativeMove(int32_t dx, int32_t dy)
 {
+  // MouseTransfer warp-grab: a relative (DMRM) move means the server has stopped tracking an
+  // absolute position for us at all (relativeMouseMoves + scroll lock), so there is no chain to
+  // keep in step. Back to stock.
+  m_screen->warpGrabReset();
   m_screen->mouseRelativeMove(dx, dy);
+}
+
+void Client::warpGrabResyncAcknowledged(uint32_t id)
+{
+  m_screen->warpGrabResyncAcknowledged(id);
 }
 
 void Client::mouseWheel(int32_t xDelta, int32_t yDelta)
@@ -615,6 +641,8 @@ void Client::cleanupScreen()
     }
     m_events->removeHandler(EventTypes::ScreenShapeChanged, getEventTarget());
     m_events->removeHandler(EventTypes::ClipboardGrabbed, getEventTarget());
+    // MouseTransfer warp-grab: the connection (and its pending-DINF FIFO) is going; so is any session.
+    m_screen->warpGrabReset();
     delete m_server;
     m_server = nullptr;
   }
@@ -692,6 +720,9 @@ void Client::handleDisconnected()
 void Client::handleShapeChanged()
 {
   LOG_DEBUG("resolution changed");
+  // MouseTransfer warp-grab: a genuine shape change re-reports the true cursor to the server anyway
+  // (onInfoChanged -> queryInfo), and old-shape coordinates mean nothing now.
+  m_screen->warpGrabReset();
   m_server->onInfoChanged();
 }
 

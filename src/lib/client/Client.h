@@ -109,6 +109,13 @@ public:
   */
   void onClipboardLaneAdvert(int16_t laneVersion, std::string token);
 
+  //! The server acknowledged a warp-grab resync DINF (MouseTransfer fork)
+  /*!
+  ServerProxy routes each CIAK by the kind of DINF it answers; this is the route for the DINFs
+  sent on behalf of the screen's warp-grab tracker. See deskflow/WarpGrabTracker.h.
+  */
+  void warpGrabResyncAcknowledged(uint32_t id);
+
   //! Hand a marshalled clipboard to the lane for the server (MouseTransfer fork)
   /*!
   The transport half of ServerProxy::onClipboardChanged. Every DECISION about whether to send stays

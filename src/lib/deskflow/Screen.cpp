@@ -328,6 +328,21 @@ bool Screen::isClipboardOwnedByUs() const
   return m_screen->isClipboardOwnedByUs();
 }
 
+void Screen::warpGrabReset()
+{
+  m_screen->warpGrabReset();
+}
+
+bool Screen::takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id)
+{
+  return m_screen->takeWarpGrabResync(x, y, id);
+}
+
+void Screen::warpGrabResyncAcknowledged(uint32_t id)
+{
+  m_screen->warpGrabResyncAcknowledged(id);
+}
+
 int32_t Screen::getJumpZoneSize() const
 {
   if (!m_isPrimary) {
