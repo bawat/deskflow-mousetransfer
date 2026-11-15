@@ -1496,11 +1496,8 @@ void MSWindowsScreen::mtDiagPush(char kind, int32_t x, int32_t y)
   m_mtDiagNext = (m_mtDiagNext + 1) % 8;
 }
 
-// Merged-fork: a single relayed hardware motion larger than this (either axis, px) is beyond any
-// per-event mouse report (even a violent flick at low polling rates stays under ~100 px/event)
-// and almost certainly means the delta reference was WRONG -- exactly the class the owner sees as
-// the viewer's cursor "teleporting". Diagnostic only: the delta is still relayed unchanged.
-static const int32_t kMtJumpDiagPx = 128;
+// Merged-fork: kMtJumpDiagPx (the "this is a teleport, not a motion" threshold) now lives in
+// MSWindowsScreen.h so the client-side MT-warpgrab-snap diagnostic in MSWindowsDesks.cpp shares it.
 
 bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
 {

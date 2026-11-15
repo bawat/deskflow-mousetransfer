@@ -230,6 +230,7 @@ private:
   deskflow::WarpGrabTracker::Token warpGrabToken();
   // True iff hwnd belongs to a process whose image lives under the MouseTransfer bundle root.
   bool isOwnBundleWindow(HWND hwnd);
+  std::string windowImageLeaf(HWND hwnd) const;
   // landed = the post-injection read, or INT32_MIN,INT32_MIN when it failed. The trace shows it so a
   // machine's answer to "does GetCursorPos see a SendInput move immediately?" is on record.
   void warpGrabLogDecision(
@@ -398,6 +399,8 @@ private:
   bool m_wgSessionLogged = false;
   uint64_t m_wgSessionStartMs = 0;
   uint32_t m_wgSessionResyncs = 0;
+  // MT-warpgrab-snap lines logged this visit (capped; reset by warpGrabReset).
+  int m_wgSnapCount = 0;
 
   IEventQueue *m_events;
 };

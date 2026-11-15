@@ -22,6 +22,13 @@ class EventQueueTimer;
 class MSWindowsDesks;
 class MSWindowsKeyState;
 class MSWindowsScreenSaver;
+
+// Merged-fork: a single cursor motion larger than this (either axis, px) is beyond any per-event
+// mouse report (even a violent flick at low polling rates stays under ~100 px/event) and almost
+// certainly means a position reference was WRONG -- exactly the class the owner sees as the cursor
+// "teleporting". Used by MT-jumpdiag (server: a relayed hardware delta) and MT-warpgrab-snap (client:
+// a stock injection that moved the cursor this far from where it really was). Diagnostic only.
+inline constexpr int32_t kMtJumpDiagPx = 128;
 class Thread;
 class MSWindowsDropTarget;
 

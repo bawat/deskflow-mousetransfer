@@ -182,6 +182,11 @@ constexpr int64_t kWarpGrabTimeoutMs = 1000;
 //! would otherwise produce a pair of lines per click.
 constexpr uint64_t kWarpGrabSessionLogIntervalMs = 30000;
 
+//! MT-warpgrab-snap line cap per screen visit (reset at every enter/leave). The same 32 as
+//! MSWindowsScreen's kMtSwitchDiagMax: enough to see a pattern repeat, bounded so a pathological
+//! visit cannot flood coreout.log.
+constexpr int kWarpGrabSnapDiagMax = 32;
+
 //! Token for "an application has hidden the cursor" (GetCursorInfo flags == 0, i.e. neither SHOWING
 //! nor SUPPRESSED). Must never equal a window token: window handles are 32-bit significant even on
 //! 64-bit Windows ("Interprocess Communication Between 32-bit and 64-bit Applications", MS docs), so a
@@ -809,10 +814,10 @@ void MSWindowsDesks::warpGrabLogDecision(
       const std::string suppressed =
           m_wgSuppressed != 0 ? " [+" + std::to_string(m_wgSuppressed) + " sessions not logged]" : std::string();
       LOG_INFO(
-          "warp-grab: session start token=%llx (%s) server=%d,%d cursor=%d,%d inject=%d,%d%s",
-          static_cast<unsigned long long>(d.token),
-          d.token == kWarpGrabHiddenCursorToken ? "hidden cursor" : (image.empty() ? "?" : image.c_str()), sx, sy,
-          c.x, c.y, d.inject.x, d.inject.y, suppressed.c_str()
+          "warp-grab: session start token=%llx (%s)%s server=%d,%d cursor=%d,%d inject=%d,%d%s",
+          static_cast<unsigned long long>(d.entryToken),
+          d.entryToken == kWarpGrabHiddenCursorToken ? "hidden cursor" : (image.empty() ? "?" : image.c_str()),
+          d.adoptedRemembered ? " at grab release" : "", sx, sy, c.x, c.y, d.inject.x, d.inject.y, suppressed.c_str()
       );
       m_wgEverLogged = true;
       m_wgLastLogMs = now;
@@ -839,7 +844,29 @@ void MSWindowsDesks::warpGrabLogDecision(
     }
   }
 
-  if (warpGrabTraceOn() && (d.tracked || d.token != WarpGrabTracker::kNoToken || d.entered)) {
+  // MT-warpgrab-snap: WE teleported the cursor -- a stock injection, on a move where something else had
+  // displaced it (so no grab evidence qualified), landing more than kMtJumpDiagPx from where the cursor
+  // really was. Only a displaced move counts: a plain coalesced server jump is the server's motion,
+  // not a teleport of ours. PERMANENTLY on, capped like MT-switchdiag (the MT-jumpdiag precedent: the
+  // decisive evidence must not depend on a flag having been set before the repro).
+  if (!d.tracked && d.displaced &&
+      (std::abs(d.inject.x - c.x) > kMtJumpDiagPx || std::abs(d.inject.y - c.y) > kMtJumpDiagPx) &&
+      m_wgSnapCount < kWarpGrabSnapDiagMax) {
+    ++m_wgSnapCount;
+    const bool button = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+                        (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    const std::string fg = windowImageLeaf(GetForegroundWindow());
+    LOG_INFO(
+        "MT-warpgrab-snap #%d: server=%d,%d cursor=%ld,%ld lastTarget=%d,%d lastLanded=%d,%d tok=%llx prevTok=%llx "
+        "sinceTok=%lldms fg=%s button=%d%s",
+        m_wgSnapCount, sx, sy, c.x, c.y, d.prevTarget.x, d.prevTarget.y, d.prevLanded.x, d.prevLanded.y,
+        static_cast<unsigned long long>(d.token), static_cast<unsigned long long>(d.prevMoveToken),
+        static_cast<long long>(d.msSinceTokenSeen), fg.c_str(), button ? 1 : 0,
+        m_wgSnapCount == kWarpGrabSnapDiagMax ? " (cap reached until the next enter/leave)" : ""
+    );
+  }
+
+  if (warpGrabTraceOn() && (d.tracked || d.entered || d.displaced)) {
     LOG_INFO(
         "MT-warpgrab: S=%d,%d C=%d,%d -> %d,%d landed=%ld,%ld mode=%s base=%d,%d delta=%+d,%+d tok=%llx warp=%d "
         "chain=%s%s resync=%s idle=%d",
@@ -853,11 +880,37 @@ void MSWindowsDesks::warpGrabLogDecision(
   }
 }
 
-// Who has grabbed the cursor, as a token (0 = nobody, or one of ours, or cannot tell). Evaluated only
-// when the tracker asks: in Idle after a real discrepancy, in Active once per server move. Per-move in
-// Active is deliberate rather than rate-limited: it is two win32k queries (no IPC, no WMI, no file)
-// plus a cached verdict, at most once per relayed motion, and it is what ends a session on the very
-// move after the app releases its grab instead of a timer tick later.
+// Image leaf name of hwnd's process, for diagnostics only ("?" if unreadable, ASCII-sanitised).
+std::string MSWindowsDesks::windowImageLeaf(HWND hwnd) const
+{
+  DWORD pid = 0;
+  if (hwnd == nullptr || GetWindowThreadProcessId(hwnd, &pid) == 0 || pid == 0) {
+    return "?";
+  }
+  std::string out = "?";
+  if (HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid); proc != nullptr) {
+    wchar_t buf[MAX_PATH];
+    DWORD n = MAX_PATH;
+    if (QueryFullProcessImageNameW(proc, 0, buf, &n)) {
+      const std::wstring leaf = leafName(std::wstring(buf, n));
+      out.clear();
+      for (wchar_t ch : leaf) {
+        out.push_back(ch > 0x7e || ch < 0x20 ? '?' : static_cast<char>(ch));
+      }
+    }
+    CloseHandle(proc);
+  }
+  return out;
+}
+
+// Who has grabbed the cursor, as a token (0 = nobody, or one of ours, or cannot tell). Evaluated on
+// EVERY server move in every mode -- the tracker must remember the token of the previous move, because
+// an app restores the cursor as it releases its grab and the restore is first seen on a move whose
+// token is already gone (the 2026-11-15 Blender teleport). The honest per-move cost: GetGUIThreadInfo,
+// plus either a cached own-process verdict (capture held) or GetCursorInfo + GetForegroundWindow (+ the
+// same cache); a cache MISS (a new capture window) costs one OpenProcess + QueryFullProcessImageNameW.
+// No IPC, no WMI, no file, no allocation on the hit path. Bounded by the relayed motion rate, which
+// ServerProxy's compression already coalesces, and it is exactly what Active already paid per move.
 WarpGrabTracker::Token MSWindowsDesks::warpGrabToken()
 {
   GUITHREADINFO gti{};
@@ -953,6 +1006,7 @@ void MSWindowsDesks::warpGrabReset()
     m_wgSessionLogged = false;
   }
   m_warpGrab.reset();
+  m_wgSnapCount = 0; // a new diagnostic window per visit, as MT-switchdiag opens one per switch
 }
 
 bool MSWindowsDesks::takeWarpGrabResync(int32_t &x, int32_t &y, uint32_t &id)
