@@ -170,7 +170,8 @@ private:
   void commit(Point target);
   void goIdle();
   static Point clampTo(Point p, const Shape &shape);
-  static bool near(Point a, Point b, int32_t tol);
+  // Not `near`: windef.h #defines near (and far) to nothing.
+  static bool isNear(Point a, Point b, int32_t tol);
   bool nearEdge(Point s, const Shape &shape) const;
 
   Config m_config;

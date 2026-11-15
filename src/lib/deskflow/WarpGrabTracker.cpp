@@ -31,7 +31,7 @@ WarpGrabTracker::WarpGrabTracker(const Config &config) : m_config(config)
   // nothing
 }
 
-bool WarpGrabTracker::near(Point a, Point b, int32_t tol)
+bool WarpGrabTracker::isNear(Point a, Point b, int32_t tol)
 {
   return std::abs(a.x - b.x) <= tol && std::abs(a.y - b.y) <= tol;
 }
@@ -73,8 +73,8 @@ WarpGrabTracker::Point WarpGrabTracker::chooseBase(Point cursor) const
   // point, our previous injection is simply not applied yet, so build on where it is going to be.
   // A warp moves the cursor away from the stale point, so it is never mistaken for this.
   const int32_t tol = m_config.roundingPx;
-  const bool landedFresh = near(m_lastLanded, m_lastTarget, tol);
-  if (!landedFresh && near(cursor, m_lastLanded, tol) && !near(cursor, m_lastTarget, tol)) {
+  const bool landedFresh = isNear(m_lastLanded, m_lastTarget, tol);
+  if (!landedFresh && isNear(cursor, m_lastLanded, tol) && !isNear(cursor, m_lastTarget, tol)) {
     return m_lastTarget;
   }
   return cursor;
@@ -230,7 +230,7 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
       // A recentre is still settling; one resync at a time, so the end resync follows it.
       m_mode = Mode::Ending;
       m_endWanted = true;
-    } else if (near(target, server, m_config.roundingPx)) {
+    } else if (isNear(target, server, m_config.roundingPx)) {
       // The server's virtual cursor already sits on the true cursor: nothing to re-seat.
       goIdle();
       d.returnedToIdle = true;
