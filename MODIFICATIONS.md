@@ -1661,3 +1661,54 @@ line per tracked move). Both read once at start-up. At default level the only ne
 **Not verified on hardware yet:** whether `GetCursorPos` immediately after `SendInput` reflects the
 injection (the tracker is built not to depend on it), and Blender's own capture/hide behaviour during
 its grabs. See the wrapper repo's `testing/designs/warp-grab-test-design.md`.
+
+## Secure desktop on the server: relayed motion stays alive, and the cursor comes home (2026-11-15)
+
+**Files:** `src/lib/deskflow/SecureDeskPolicy.h` (new, pure; tests
+`src/unittests/deskflow/SecureDeskPolicyTests.{h,cpp}`, 10 cases), `src/lib/platform/MSWindowsDesks.{h,cpp}`,
+`src/lib/platform/MSWindowsScreen.{h,cpp}`, `src/lib/platform/MSWindowsHook.h` (id map note),
+`src/lib/base/EventTypes.h`, `src/lib/deskflow/IPrimaryScreen.h`, `src/lib/server/Server.{h,cpp}`.
+
+**Symptom (FANTASY as server, owner):** Ctrl+Alt+Del on the server while the cursor was on a peer --
+mouse motion dead, clicks and keys still relayed to the peer; recovered only by a physical-mouse claim
+on another machine. `coreout.log`: an unbroken `MT-jumpdiag: large delta -697,-47 (event 583,673 vs
+saved 1280,720); recent: W(1280,720) H(583,673) B(-697,-47) ...` storm (every motion dropped by the
+`kMtJumpDiagPx` mis-stamp gate) from the very first motion after `desktop switch -- resyncing key
+state`, plus `failed to determine current keyboard layout` on every key.
+
+**Cause:** relay mode warps the cursor to its park and reads it back as the delta anchor
+(`MSWindowsScreen::onMouseMove`, `warpCursorNoFlush`) on the MAIN thread. That thread is attached for
+life to the desktop the process was spawned on: it owns windows, and `SetThreadDesktop` fails for a
+thread with windows or hooks on its current desktop, so `updateDesktopThread()` never moved it.
+`SetCursorPos`/`GetCursorPos` require the calling thread's desktop to be the input desktop, so once
+the input desktop was Winlogon the park never landed and the anchor fell back to the park point,
+while the low-level hook -- which `checkDesk` does move onto Winlogon (the desk thread) -- stamped
+every motion at the secure desktop's own cursor position (it differs per episode: 583,673 and
+1969,888, never the park). Every delta was the full park-to-cursor distance and was dropped.
+
+**Fix -- the class:** `MSWindowsDesks` records the main thread's desktop once (`enable()`) and, on every
+desk switch, whether it is the input desktop (`mainThreadOnInputDesk()`, one `MT-cursortruth` INFO
+line per change). While it is not, `getThisCursorPos`/`setThisCursorPos` go through the desk thread
+(`DESKFLOW_MSG_CURSOR_POS`, which now reports success, and the new `DESKFLOW_MSG_CURSOR_SET`,
+`LAST_MSG+15` -- `+14` is `DESKFLOW_MSG_TOUCH_ECHO`'s id); they also fall back to it whenever the main
+thread's own call fails. With the main thread on the input desktop nothing changes, so the three
+seam cross-bounce cases are untouched. Side effects, both intended: a deliberate crossing FROM the
+server's lock screen works (`canLeave` can read the cursor), and so does a core pinned to Winlogon
+after an unlock (the `coreDeskStranded` heal is kept as the backstop).
+
+**Fix -- owner decision:** when the input desktop SWITCHES to anything but "Default" (Winlogon:
+Ctrl+Alt+Del, lock, UAC consent; or one we cannot open) while the cursor is on a peer, the cursor comes
+home: `checkDesk` raises `PrimaryScreenSecureDesktopEntered` on the transition only (never on the
+first discovery, never for a crossing made while already on the lock screen), and
+`Server::handleSecureDesktopEntered` reuses `switchToScreenByName` (centre of the primary), so the
+usual `switch from ... to ...` / `entering screen` markers are emitted. One `MT-securedesk` INFO line
+names the desktop and the screen that was active.
+
+**Diagnostics:** `MT-cursortruth: relay park warp|relay cursor read FAILING (...)` and `... recovered
+after N failure(s)`, at most one failure report per 30 s globally (a single missed park under load is
+the known harmless lagging-warp case).
+
+**Not verified on hardware yet:** that `SetCursorPos` from the desk thread lands on the Winlogon
+desktop for this LocalSystem+UIAccess core (inferred: the same desk thread injects input there for the
+UAC-control feature), and the end-to-end owner procedure in the wrapper repo's
+`testing/designs/secure-desk-return-test-design.md`.
