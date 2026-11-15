@@ -576,6 +576,73 @@ void setCursorVisibility(bool visible)
   LOG_ERR("unable to set cursor visibility after %d attempts", attempts);
 }
 
+// MouseTransfer (RDP window handoff, 2026-11-15): DWMWA_CLOAKED, read through a run-time lookup so
+// the core gains no new import (dwmapi.dll exists on every supported Windows; the lookup failing just
+// means "not cloaked"). A cloaked window — a UWP frame on another virtual desktop, a shell-hidden
+// window — reports IsWindowVisible TRUE yet draws nothing.
+static bool deskWindowCloaked(HWND hwnd)
+{
+  using DwmGetWindowAttributeFn = HRESULT(WINAPI *)(HWND, DWORD, PVOID, DWORD);
+  static DwmGetWindowAttributeFn fn = []() -> DwmGetWindowAttributeFn {
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    return dwm != nullptr ? reinterpret_cast<DwmGetWindowAttributeFn>(GetProcAddress(dwm, "DwmGetWindowAttribute"))
+                          : nullptr;
+  }();
+  if (fn == nullptr) {
+    return false;
+  }
+  // DWMWA_CLOAKED = 14 (dwmapi.h, DWMWINDOWATTRIBUTE); the attribute is a DWORD of DWM_CLOAKED_* bits.
+  const DWORD kDwmwaCloaked = 14;
+  DWORD cloaked = 0;
+  return SUCCEEDED(fn(hwnd, kDwmwaCloaked, &cloaked, sizeof(cloaked))) && cloaked != 0;
+}
+
+// MouseTransfer (RDP window handoff, 2026-11-15): can the user SEE this window? False for a hidden or
+// cloaked window and for a layered window whose constant alpha is 0 (it draws nothing — the RDP
+// handoff's vanish). A layered window painted with UpdateLayeredWindow has no constant alpha
+// (GetLayeredWindowAttributes fails) and counts as visible.
+static bool deskWindowUserCanSee(HWND hwnd)
+{
+  if (!IsWindowVisible(hwnd) || deskWindowCloaked(hwnd)) {
+    return false;
+  }
+  if ((GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED) != 0) {
+    BYTE alpha = 255;
+    DWORD flags = 0;
+    if (GetLayeredWindowAttributes(hwnd, nullptr, &alpha, &flags) && (flags & LWA_ALPHA) != 0 && alpha == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// MouseTransfer (RDP window handoff, 2026-11-15): the top-most window in the normal (non-topmost)
+// Z-order band that the user can see and that takes activation — enabled, not minimised, not a tool
+// or no-activate window, not empty — other than the two skipped. Walked from the TOP rather than from
+// the invisible window, because a vanished window may sit anywhere in the Z-order; the window the user
+// sees in front is the one they expect to type into. Topmost windows (the taskbar, overlays) are
+// skipped. Bounded; nullptr when nothing qualifies (deskEnter then restores nothing, as stock does for
+// a window that has gone).
+static HWND deskNextActivatableBelow(HWND invisible, HWND skip)
+{
+  const int kMaxWalk = 4096; // real desktops hold hundreds of top-level windows, not thousands
+  int budget = kMaxWalk;
+  for (HWND w = GetTopWindow(nullptr); w != nullptr && budget-- > 0; w = GetWindow(w, GW_HWNDNEXT)) {
+    if (w == invisible || w == skip || !IsWindowEnabled(w) || IsIconic(w) || !deskWindowUserCanSee(w)) {
+      continue;
+    }
+    if ((GetWindowLongW(w, GWL_EXSTYLE) & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0) {
+      continue;
+    }
+    RECT r{};
+    if (!GetWindowRect(w, &r) || r.right <= r.left || r.bottom <= r.top) {
+      continue;
+    }
+    return w;
+  }
+  return nullptr;
+}
+
 void MSWindowsDesks::deskEnter(Desk *desk)
 {
   if (!m_isPrimary) {
@@ -592,10 +659,28 @@ void MSWindowsDesks::deskEnter(Desk *desk)
   // (mouse over activation) but i've no idea how to do that.
   // the obvious workaround of using SetWindowPos() to move it back
   // after being raised doesn't work.
+  //
+  // MouseTransfer (RDP window handoff, 2026-11-15): never restore a window the user CANNOT SEE. A
+  // window dragged across the seam is the foreground at the crossing, so deskLeave saves it — and the
+  // handoff then VANISHES it on this machine (layered, alpha 0, click-through) while the far side
+  // shows it. Restoring it here put the keyboard into an invisible window, and the user's first click
+  // on their own window only took the foreground back from it (owner-reported: "two clicks" after
+  // the first return home, one on every later return). The rule is the window's PROPERTY
+  // (deskWindowUserCanSee), not "is it a handoff", so any hidden, cloaked or fully transparent
+  // window is covered; the replacement is the front-most window the user CAN see — close to what
+  // Windows itself activates when the active window goes away.
+  HWND restore = desk->m_foregroundWindow;
+  if (restore != nullptr && IsWindow(restore) && !deskWindowUserCanSee(restore)) {
+    HWND next = deskNextActivatableBelow(restore, desk->m_window);
+    LOG_INFO("desk enter: the saved foreground 0x%08x is invisible to the user (hidden, cloaked or "
+             "alpha 0) — restoring 0x%08x, the front-most window the user can see, instead",
+             restore, next);
+    restore = next;
+  }
   DWORD thisThread = GetWindowThreadProcessId(desk->m_window, nullptr);
-  DWORD thatThread = GetWindowThreadProcessId(desk->m_foregroundWindow, nullptr);
+  DWORD thatThread = GetWindowThreadProcessId(restore, nullptr);
   AttachThreadInput(thatThread, thisThread, TRUE);
-  SetForegroundWindow(desk->m_foregroundWindow);
+  SetForegroundWindow(restore);
   AttachThreadInput(thatThread, thisThread, FALSE);
   EnableWindow(desk->m_window, desk->m_lowLevel ? FALSE : TRUE);
   desk->m_foregroundWindow = nullptr;

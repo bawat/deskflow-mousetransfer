@@ -1527,3 +1527,27 @@ send *into*, not on the handshake.
 
 Healthy behaviour is unchanged — a pumping window answers `WM_NULL` in microseconds and takes the
 identical path it did before.
+
+## Never restore the foreground to a window the user cannot see (2026-11-15)
+
+**File:** `src/lib/platform/MSWindowsDesks.cpp` (`deskEnter`, plus the helpers `deskWindowCloaked`,
+`deskWindowUserCanSee`, `deskNextActivatableBelow`).
+
+**Symptom (owner-reported):** after dragging a console across the seam (MouseTransfer's window
+handoff) and typing into it on the far machine, the FIRST return to the origin took two clicks
+before the user's own window took keyboard input; every later return took one.
+
+**Cause:** stock `deskLeave` saves the foreground window and `deskEnter` restores it. A window dragged
+across the seam IS the foreground at the crossing, so the leave saved it — and the handoff then
+vanishes it on the origin (layered, constant alpha 0, click-through) while the far side shows it.
+The first `deskEnter` handed the keyboard to that invisible window. Later leaves save whatever the
+user had clicked, which is why only the first return misbehaved. (The older exclusion in `deskLeave`
+was keyed on the fg-hold window, which the wrapper no longer sets since the FreeRDP path was removed.)
+
+**Fix:** the rule is the window's PROPERTY, not "is it a handoff": if the saved window is hidden,
+DWM-cloaked, or layered with constant alpha 0, `deskEnter` restores instead the front-most window in
+the normal (non-topmost) band that the user can see and that takes activation (enabled, not
+minimised, not `WS_EX_TOOLWINDOW`/`WS_EX_NOACTIVATE`, non-empty). Nothing qualifying = restore
+nothing, as stock does for a window that has gone. One `LOG_INFO` line each time the rule fires.
+`DwmGetWindowAttribute` is looked up at run time, so the core gains no new import. Every other
+return home takes the identical stock path.
