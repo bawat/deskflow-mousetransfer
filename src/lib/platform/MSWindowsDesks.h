@@ -15,6 +15,7 @@
 #include "mt/Mutex.h"
 
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -122,6 +123,31 @@ public:
   // keeps the screen centre. Public because MSWindowsScreen calls it; the poll that fills it
   // (checkRdpPark) stays private. Thread-safe (a single lock-free atomic).
   bool getRdpPark(int32_t &x, int32_t &y) const;
+
+  //! @name cursor truth on the INPUT desktop (MouseTransfer fork, secure-desk-return)
+  //@{
+  //! True while the thread that called enable() (the screen's MAIN thread) is attached to the
+  //! current input desktop -- i.e. its own SetCursorPos/GetCursorPos work. False once the input
+  //! desktop is a different one (the main thread can never follow: it owns windows, so
+  //! SetThreadDesktop refuses to move it). Main thread only.
+  bool mainThreadOnInputDesk() const
+  {
+    return m_mainOnInputDesk;
+  }
+  //! GetCursorPos on the desk thread, which checkDesk keeps attached to the input desktop. False if
+  //! there is no live desk thread or the read failed there too. Main thread; blocks for one desk-thread
+  //! round trip (the same sendMessage/waitForDesk every fake* call already makes).
+  bool getInputDeskCursorPos(POINT &pos) const;
+  //! SetCursorPos on the desk thread. Same contract as getInputDeskCursorPos.
+  bool setInputDeskCursorPos(int32_t x, int32_t y) const;
+  //! Called (main thread, from checkDesk) when the input desktop switches in a way that should bring
+  //! the shared cursor home -- see deskflow/SecureDeskPolicy.h. Primary only. The argument is the new
+  //! desktop's name (empty when it cannot be opened).
+  void setSecureDeskCallback(std::function<void(const std::wstring &)> cb)
+  {
+    m_onSecureDesk = std::move(cb);
+  }
+  //@}
 
   //! Install/uninstall screensaver hooks
   /*!
@@ -326,6 +352,14 @@ private:
   // the current desk and it's name
   Desk *m_activeDesk = nullptr;
   std::wstring m_activeDeskName;
+
+  // MouseTransfer secure-desk-return: the main thread's own desktop (resolved once in enable(), it can
+  // never change), whether it is the input desktop, whether any desk has been seen yet (so the very
+  // first discovery is not mistaken for a switch), and the return-home callback.
+  std::wstring m_mainDeskName;
+  bool m_mainOnInputDesk = true;
+  bool m_haveSeenDesk = false;
+  std::function<void(const std::wstring &)> m_onSecureDesk;
 
   // one desk per desktop and a cond var to communicate with it
   Mutex m_mutex;

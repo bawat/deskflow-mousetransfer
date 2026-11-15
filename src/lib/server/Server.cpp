@@ -113,6 +113,10 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
       EventTypes::PrimaryScreenSaverDeactivated, m_primaryClient->getEventTarget(),
       [this](const auto &) { onScreensaver(false); }
   );
+  m_events->addHandler(
+      EventTypes::PrimaryScreenSecureDesktopEntered, m_primaryClient->getEventTarget(),
+      [this](const auto &e) { handleSecureDesktopEntered(e); }
+  );
   m_events->addHandler(EventTypes::ServerSwitchToScreen, m_inputFilter, [this](const auto &e) {
     handleSwitchToScreenEvent(e);
   });
@@ -207,6 +211,7 @@ Server::~Server()
   m_events->removeHandler(PrimaryScreenWheel, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenSaverActivated, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenSaverDeactivated, m_primaryClient->getEventTarget());
+  m_events->removeHandler(PrimaryScreenSecureDesktopEntered, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenFakeInputBegin, m_inputFilter);
   m_events->removeHandler(PrimaryScreenFakeInputEnd, m_inputFilter);
   m_events->removeHandler(Timer, this);
@@ -1442,6 +1447,29 @@ void Server::handleClientCloseTimeout(BaseClientProxy *client)
   removeOldClient(client);
 
   delete client;
+}
+
+// MouseTransfer (secure-desk-return): the server's input desktop just switched to a secure/system
+// desktop (Ctrl+Alt+Del, lock, UAC consent) while the shared cursor was on a peer. Owner decision:
+// bring mouse and keyboard HOME so the user can use the screen that just appeared. Uses the cursor-jump
+// path (switchToScreenByName: centre of the primary) rather than a parallel one, so the ordinary
+// `switch from ... to ...` / `entering screen` markers the wrapper tracks the active screen from are
+// emitted exactly as for a "jump cursor to this computer". It is the TRANSITION that fires this (the
+// platform only raises it on a desktop switch), never the state: a user already on this machine's lock
+// screen who crosses to a peer changes no desktop, so that crossing is never undone.
+void Server::handleSecureDesktopEntered(const Event &event)
+{
+  const auto *info = static_cast<const IPrimaryScreen::SecureDesktopInfo *>(event.getDataObject());
+  const std::string desk = info != nullptr ? info->m_desktop : std::string("?");
+  if (m_active == m_primaryClient) {
+    LOG_DEBUG("input desktop switched to \"%s\" with the cursor already home", desk.c_str());
+    return;
+  }
+  LOG_INFO(
+      "MT-securedesk: input desktop switched to \"%s\" while \"%s\" was active; returning to \"%s\"",
+      desk.empty() ? "(unopenable)" : desk.c_str(), getName(m_active).c_str(), getName(m_primaryClient).c_str()
+  );
+  switchToScreenByName(getName(m_primaryClient));
 }
 
 void Server::handleSwitchToScreenEvent(const Event &event)

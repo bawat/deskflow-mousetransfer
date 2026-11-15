@@ -362,6 +362,8 @@ private:
   // MouseTransfer: centre-switch the cursor to a screen by name (shared by the switchToScreen input
   // filter action and the switch-request file poll); checkSwitchRequest reads the wrapper file.
   void switchToScreenByName(const std::string &name);
+  // MouseTransfer secure-desk-return: bring the cursor home on a secure-desktop switch.
+  void handleSecureDesktopEntered(const Event &event);
   void checkSwitchRequest();
   // MouseTransfer: poll a wrapper-written "layout reload request" file so the wrapper can apply an
   // edited external layout (changed edge-transition ranges) to the RUNNING server with no restart.

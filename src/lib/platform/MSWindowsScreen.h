@@ -11,6 +11,7 @@
 #include "deskflow/PlatformScreen.h"
 #include "platform/MSWindowsHook.h"
 #include "platform/MSWindowsPowerManager.h"
+#include "deskflow/SecureDeskPolicy.h"
 
 #include <map>
 #include <string>
@@ -298,6 +299,22 @@ private: // HACK
   // instrument that was already running).
   uint32_t m_mtSwitchTick = 0;
   int m_mtSwitchCount = 0;
+
+  // MouseTransfer secure-desk-return: rate-limited visibility for a PERSISTENT failure to land the
+  // relay park warp or to read cursor truth (until 2026-11-15 the only trace was an anonymous
+  // MT-jumpdiag storm). See mtNoteCursorTruth. Main thread only.
+  // Report a failing park warp / cursor read at most once per this interval (the first at once). Same
+  // reasoning and value as ServerProxy's kNoLaneWarningInterval: the first line carries the news; a
+  // persistent failure recurs on every relayed motion and must not flood coreout.log.
+  static constexpr int64_t kMtCursorTruthReportIntervalMs = 30000;
+  deskflow::securedesk::StreakReporter m_mtParkStreak{kMtCursorTruthReportIntervalMs};
+  deskflow::securedesk::StreakReporter m_mtReadStreak{kMtCursorTruthReportIntervalMs};
+  bool m_mtLastWarpLanded = true;
+  POINT m_mtLastWarpRead{0, 0};
+  void mtNoteCursorTruth(
+      deskflow::securedesk::StreakReporter &streak, bool ok, const char *what, int32_t wantX, int32_t wantY,
+      POINT got
+  );
 
   // check if it is a modifier key repeating message
   bool isModifierRepeat(KeyModifierMask oldState, KeyModifierMask state, WPARAM wParam) const;

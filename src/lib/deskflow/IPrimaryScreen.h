@@ -8,8 +8,11 @@
 
 #pragma once
 
+#include "base/Event.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
+
+#include <string>
 
 //! Primary screen interface
 /*!
@@ -74,6 +77,20 @@ public:
 
   public:
     int m_fd;
+  };
+
+  //! Secure-desktop switch data (MouseTransfer fork): the desktop the input switched to, for the log.
+  class SecureDesktopInfo : public EventData
+  {
+  public:
+    explicit SecureDesktopInfo(const std::string &desktop) : m_desktop(desktop)
+    {
+      // do nothing
+    }
+    ~SecureDesktopInfo() override = default;
+
+  public:
+    std::string m_desktop;
   };
 
   //! @name manipulators

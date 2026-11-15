@@ -186,6 +186,11 @@ enum class EventTypes : uint32_t
   /// This event is sent when screensaver is deactivated.
   PrimaryScreenSaverDeactivated,
 
+  /// MouseTransfer fork: the primary's input desktop switched to a secure/system desktop (Ctrl+Alt+Del,
+  /// lock, UAC consent) while the shared cursor was on another screen. Event data object is an
+  /// IPrimaryScreen::SecureDesktopInfo. The server brings the cursor home (deskflow/SecureDeskPolicy.h).
+  PrimaryScreenSecureDesktopEntered,
+
   /// This event is sent when hotkey is down. Event data is a pointer to HotKeyInfo.
   PrimaryScreenHotkeyDown,
 

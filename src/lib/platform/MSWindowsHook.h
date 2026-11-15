@@ -45,6 +45,8 @@ inline constexpr ULONG_PTR kDeskflowLocalInjectSignature = 0x0DF10CA1; // "DF lo
 // not input and must not be flushed as such) and NUMBERED PAST the MSWindowsDesks block --
 // Desks derives DESKFLOW_HOOK_LAST_MSG+1..+13 (0x1b..0x27), so the next free id is 0x28.
 // DESKFLOW_HOOK_LAST_MSG must NOT move (the Desks ids would shift with it).
+// 0x29 (DESKFLOW_HOOK_LAST_MSG+15) is taken by MSWindowsDesks' DESKFLOW_MSG_CURSOR_SET (secure-desk-
+// return), which skips +14 because that is this id. Next free: 0x2a.
 #define DESKFLOW_MSG_TOUCH_ECHO WM_APP + 0x0028 // x; y
 
 #define DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY VK_CANCEL

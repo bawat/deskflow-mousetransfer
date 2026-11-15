@@ -15,6 +15,7 @@
 #include "base/MTWatchdog.h" // TEMPORARY MouseTransfer diag: MT_HOOKBEAT for the desk-thread pump
 #include "base/TMethodJob.h"
 #include "deskflow/IScreenSaver.h"
+#include "deskflow/SecureDeskPolicy.h"
 #include "deskflow/ScreenException.h"
 #include "deskflow/win32/AppUtilWindows.h"
 #include "mt/Lock.h"
@@ -76,7 +77,7 @@
 #define DESKFLOW_MSG_FAKE_MOVE DESKFLOW_HOOK_LAST_MSG + 6
 // xDelta; yDelta
 #define DESKFLOW_MSG_FAKE_WHEEL DESKFLOW_HOOK_LAST_MSG + 7
-// POINT*; <unused>
+// POINT*; BOOL* ok (optional -- MouseTransfer secure-desk-return reads whether the read succeeded)
 #define DESKFLOW_MSG_CURSOR_POS DESKFLOW_HOOK_LAST_MSG + 8
 // IKeyState*; <unused>
 #define DESKFLOW_MSG_SYNC_KEYS DESKFLOW_HOOK_LAST_MSG + 9
@@ -88,6 +89,10 @@
 #define DESKFLOW_MSG_FAKE_INPUT DESKFLOW_HOOK_LAST_MSG + 12
 // MouseTransfer (RDP window handoff foreground hold): HWND to hold foreground (0 = release); <unused>
 #define DESKFLOW_MSG_RDP_FG_HOLD DESKFLOW_HOOK_LAST_MSG + 13
+// MouseTransfer (secure-desk-return): POINT* target; BOOL* ok. SetCursorPos on the desk thread, the one
+// thread checkDesk keeps attached to the INPUT desktop. +15, not +14: LAST_MSG+14 == 0x28 is
+// MSWindowsHook.h's DESKFLOW_MSG_TOUCH_ECHO (see the id map there).
+#define DESKFLOW_MSG_CURSOR_SET DESKFLOW_HOOK_LAST_MSG + 15
 
 static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
 {
@@ -360,6 +365,13 @@ void MSWindowsDesks::enable()
 {
   m_threadID = GetCurrentThreadId();
 
+  // MouseTransfer secure-desk-return: the desktop THIS (the main) thread is attached to. Fixed for the
+  // thread's life -- it owns windows, and SetThreadDesktop fails for a thread with windows or hooks on
+  // its current desktop -- so it is read once. checkDesk compares the input desktop against it.
+  m_mainDeskName = getDesktopName(GetThreadDesktop(GetCurrentThreadId()));
+  m_mainOnInputDesk = true;
+  m_haveSeenDesk = false;
+
   // set the active desk and (re)install the hooks
   checkDesk();
 
@@ -584,6 +596,26 @@ void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
 
   // do it
   sendMessage(DESKFLOW_MSG_FAKE_BUTTON, flags, data);
+}
+
+bool MSWindowsDesks::getInputDeskCursorPos(POINT &pos) const
+{
+  // ok stays FALSE if there is no live desk thread to ask (sendMessage then posts nothing).
+  BOOL ok = FALSE;
+  POINT p{0, 0};
+  sendMessage(DESKFLOW_MSG_CURSOR_POS, reinterpret_cast<WPARAM>(&p), reinterpret_cast<LPARAM>(&ok));
+  if (ok) {
+    pos = p;
+  }
+  return ok != FALSE;
+}
+
+bool MSWindowsDesks::setInputDeskCursorPos(int32_t x, int32_t y) const
+{
+  BOOL ok = FALSE;
+  POINT target{x, y};
+  sendMessage(DESKFLOW_MSG_CURSOR_SET, reinterpret_cast<WPARAM>(&target), reinterpret_cast<LPARAM>(&ok));
+  return ok != FALSE;
 }
 
 void MSWindowsDesks::fakeMouseMove(int32_t x, int32_t y) const
@@ -1383,9 +1415,22 @@ void MSWindowsDesks::deskThread(const void *vdesk)
 
     case DESKFLOW_MSG_CURSOR_POS: {
       POINT *pos = reinterpret_cast<POINT *>(msg.wParam);
-      if (!GetCursorPos(pos)) {
+      const BOOL ok = GetCursorPos(pos);
+      if (!ok) {
         pos->x = m_xCenter;
         pos->y = m_yCenter;
+      }
+      if (msg.lParam != 0) {
+        *reinterpret_cast<BOOL *>(msg.lParam) = ok;
+      }
+      break;
+    }
+
+    case DESKFLOW_MSG_CURSOR_SET: {
+      const POINT *target = reinterpret_cast<const POINT *>(msg.wParam);
+      const BOOL ok = SetCursorPos(target->x, target->y);
+      if (msg.lParam != 0) {
+        *reinterpret_cast<BOOL *>(msg.lParam) = ok;
       }
       break;
     }
@@ -1455,6 +1500,7 @@ void MSWindowsDesks::removeDesks()
   m_desks.clear();
   m_activeDesk = nullptr;
   m_activeDeskName = L"";
+  m_haveSeenDesk = false; // the next checkDesk is a fresh discovery, not a switch
 }
 
 void MSWindowsDesks::checkDesk()
@@ -1496,6 +1542,11 @@ void MSWindowsDesks::checkDesk()
       LOG_DEBUG("desktop is inaccessible");
     }
 
+    // MouseTransfer secure-desk-return: decide BEFORE m_activeDeskName moves on.
+    const bool returnHome =
+        m_isPrimary && deskflow::securedesk::isReturnTrigger(m_activeDeskName, name, !m_haveSeenDesk);
+    m_haveSeenDesk = true;
+
     // switch desk
     m_activeDesk = desk;
     m_activeDeskName = name;
@@ -1509,6 +1560,26 @@ void MSWindowsDesks::checkDesk()
     // update keys if necessary
     if (syncKeys) {
       updateKeys();
+    }
+
+    // MouseTransfer secure-desk-return: can the main thread still reach the cursor? It never follows a
+    // desk switch (see m_mainDeskName), so while the input desktop is another one its SetCursorPos/
+    // GetCursorPos fail -- that is what killed relayed motion on Ctrl+Alt+Del (the park never landed,
+    // the anchor fell back to the park while the hook stamped every motion at the real cursor, and the
+    // mis-stamp gate dropped them all). MSWindowsScreen routes its cursor calls through the desk
+    // thread while this is false. One INFO line per change: it only changes on a desk switch.
+    const bool mainOn = !deskflow::securedesk::mustRouteViaInputDeskThread(m_mainDeskName, name);
+    if (mainOn != m_mainOnInputDesk) {
+      LOG_INFO(
+          "MT-cursortruth: input desktop is now \"%ls\", main thread is on \"%ls\" -- cursor reads/warps %s",
+          name.c_str(), m_mainDeskName.c_str(), mainOn ? "back on the main thread" : "now go through the desk thread"
+      );
+      m_mainOnInputDesk = mainOn;
+    }
+
+    // Bring the shared cursor home (Server::handleSecureDesktopEntered decides whether it is away).
+    if (returnHome && m_onSecureDesk) {
+      m_onSecureDesk(name);
     }
   } else if (name != m_activeDeskName) {
     // screen saver might have started

@@ -106,6 +106,22 @@ MSWindowsScreen::MSWindowsScreen(bool isPrimary, bool useHooks, IEventQueue *eve
         m_isPrimary, m_useHooks, m_screensaver, m_events,
         new TMethodJob<MSWindowsScreen>(this, &MSWindowsScreen::updateKeysCB)
     );
+    // MouseTransfer secure-desk-return: when the input desktop switches to a secure one (C-A-D, lock,
+    // UAC consent), ask the server to bring the shared cursor home. Raised by MSWindowsDesks::checkDesk
+    // on the main thread, on the TRANSITION only; Server::handleSecureDesktopEntered ignores it when
+    // the cursor is already here. Primary only (a client has nothing to bring home).
+    if (m_isPrimary) {
+      m_desks->setSecureDeskCallback([this](const std::wstring &desk) {
+        std::string narrow;
+        for (wchar_t ch : desk) {
+          narrow.push_back(ch > 0x7e || ch < 0x20 ? '?' : static_cast<char>(ch)); // log text only
+        }
+        m_events->addEvent(Event(
+            EventTypes::PrimaryScreenSecureDesktopEntered, getEventTarget(),
+            static_cast<EventData *>(new IPrimaryScreen::SecureDesktopInfo(narrow))
+        ));
+      });
+    }
     m_keyState = new MSWindowsKeyState(
         m_desks, getEventTarget(), m_events, AppUtil::instance().getKeyboardLayoutList(), enableLangSync
     );
@@ -559,8 +575,27 @@ void MSWindowsScreen::getCursorPos(int32_t &x, int32_t &y) const
  * Although these functions did not fix the issue at hand (#5294) its worth
  * keeping them here anyway.
  */
+//
+// MouseTransfer secure-desk-return: GetCursorPos/SetCursorPos only work for a thread attached to the
+// INPUT desktop. This (the main) thread is attached for life to the desktop the process was spawned on
+// -- it owns windows, so SetThreadDesktop fails for it, which is also why updateDesktopThread() below
+// has never been able to rescue it -- so whenever the input desktop is another one (Ctrl+Alt+Del, the
+// lock screen, a UAC prompt on a core spawned on Default; or the reverse, a core pinned to Winlogon
+// while the user is back on Default) both calls fail here. Until 2026-11-15 that silently killed
+// relayed motion: the park warp never landed, the read-back anchor fell back to the park point while
+// the hook stamped every motion at the real cursor, and the mis-stamp gate dropped all of them. The
+// desk thread, which checkDesk moves onto every input desktop it can open, CAN make these calls, so
+// they go through it (one sendMessage round trip, the same one every fake* injection makes) while
+// MSWindowsDesks says the main thread is off the input desktop, and as a fallback when the main
+// thread's own call fails. While the main thread IS on the input desktop nothing changes.
+//
 bool MSWindowsScreen::getThisCursorPos(LPPOINT pos)
 {
+  const bool routed = m_desks != nullptr && !m_desks->mainThreadOnInputDesk();
+  if (routed && m_desks->getInputDeskCursorPos(*pos)) {
+    return true;
+  }
+
   auto result = GetCursorPos(pos);
   if (!result) {
     LOG_DEBUG("could not get cursor pos, error: %s", windowsErrorToString(GetLastError()).c_str());
@@ -574,11 +609,20 @@ bool MSWindowsScreen::getThisCursorPos(LPPOINT pos)
     }
   }
 
+  if (!result && !routed && m_desks != nullptr) {
+    result = m_desks->getInputDeskCursorPos(*pos);
+  }
+
   return result;
 }
 
 bool MSWindowsScreen::setThisCursorPos(int x, int y)
 {
+  const bool routed = m_desks != nullptr && !m_desks->mainThreadOnInputDesk();
+  if (routed && m_desks->setInputDeskCursorPos(x, y)) {
+    return true;
+  }
+
   auto result = SetCursorPos(x, y);
   if (!result) {
     LOG_DEBUG("could not set cursor pos, error: %s", windowsErrorToString(GetLastError()).c_str());
@@ -592,7 +636,34 @@ bool MSWindowsScreen::setThisCursorPos(int x, int y)
     }
   }
 
+  if (!result && !routed && m_desks != nullptr) {
+    result = m_desks->setInputDeskCursorPos(x, y);
+  }
+
   return result;
+}
+
+void MSWindowsScreen::mtNoteCursorTruth(
+    deskflow::securedesk::StreakReporter &streak, bool ok, const char *what, int32_t wantX, int32_t wantY, POINT got
+)
+{
+  using Action = deskflow::securedesk::StreakReporter::Action;
+  const bool routed = m_desks != nullptr && !m_desks->mainThreadOnInputDesk();
+  if (ok) {
+    uint64_t ended = 0;
+    if (streak.onSuccess(ended) == Action::ReportRecovered) {
+      LOG_INFO("MT-cursortruth: %s recovered after %llu failure(s)", what, static_cast<unsigned long long>(ended));
+    }
+    return;
+  }
+  if (streak.onFailure(static_cast<int64_t>(GetTickCount64())) == Action::ReportFailure) {
+    LOG_INFO(
+        "MT-cursortruth: %s FAILING (%llu in a row; wanted %d,%d, read %ld,%ld; via %s) -- relayed motion "
+        "cannot be anchored while this lasts",
+        what, static_cast<unsigned long long>(streak.streak()), wantX, wantY, got.x, got.y,
+        routed ? "desk thread" : "main thread"
+    );
+  }
 }
 
 void MSWindowsScreen::updateDesktopThread()
@@ -1601,6 +1672,7 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     if (!mtInjectionStream) {
       LOG_DEBUG2("centering cursor on motion: %+d,%+d", cx, cy);
       warpCursorNoFlush(cx, cy);
+      mtNoteCursorTruth(m_mtParkStreak, m_mtLastWarpLanded, "relay park warp", cx, cy, m_mtLastWarpRead);
     }
     // Merged-fork (2026-08-12, the seam cross-bounce): anchor the next delta at where the cursor
     // ACTUALLY RESTS -- GetCursorPos truth -- never at a position we merely intended. The eaten
@@ -1630,8 +1702,10 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
     // -> truth is wherever the cursor rests, not the stray's coordinates. GetCursorPos is a
     // cheap userland read (the per-motion GetAsyncKeyState above set the precedent). On the rare
     // GetCursorPos failure (desktop transition) fall back to the old intended positions.
-    POINT mtRest;
-    if (getThisCursorPos(&mtRest)) {
+    POINT mtRest{cx, cy};
+    const bool mtRestOk = getThisCursorPos(&mtRest);
+    mtNoteCursorTruth(m_mtReadStreak, mtRestOk, "relay cursor read", cx, cy, mtRest);
+    if (mtRestOk) {
       saveMousePosition(mtRest.x, mtRest.y);
     } else if (!mtInjectionStream) {
       saveMousePosition(cx, cy);
@@ -1798,11 +1872,16 @@ void MSWindowsScreen::warpCursorNoFlush(int32_t x, int32_t y)
 
   // warp mouse.  hopefully this inserts a mouse motion event
   // between the previous message and the following message.
-  setThisCursorPos(x, y);
+  const bool mtSetOk = setThisCursorPos(x, y);
 
   // check to see if the mouse pos was set correctly
-  POINT cursorPos;
-  getThisCursorPos(&cursorPos);
+  POINT cursorPos{x, y};
+  const bool mtReadOk = getThisCursorPos(&cursorPos);
+  // MouseTransfer secure-desk-return: remember whether this warp provably landed, for the relay
+  // branch's MT-cursortruth report. "Landed" uses the same tolerance as the client check below (a
+  // miss on BOTH axes) because of the DPI round-trip error that comment describes.
+  m_mtLastWarpLanded = mtSetOk && mtReadOk && !((cursorPos.x != x) && (cursorPos.y != y));
+  m_mtLastWarpRead = cursorPos;
 
   // there is a bug or round error in SetCursorPos and GetCursorPos on
   // a high DPI setting. The check here is for Vista/7 login screen.
