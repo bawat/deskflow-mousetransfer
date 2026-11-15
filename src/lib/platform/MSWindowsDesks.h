@@ -230,7 +230,11 @@ private:
   deskflow::WarpGrabTracker::Token warpGrabToken();
   // True iff hwnd belongs to a process whose image lives under the MouseTransfer bundle root.
   bool isOwnBundleWindow(HWND hwnd);
-  void warpGrabLogDecision(const deskflow::WarpGrabTracker::Decision &d, int32_t sx, int32_t sy, POINT c, uint64_t now);
+  // landed = the post-injection read, or INT32_MIN,INT32_MIN when it failed. The trace shows it so a
+  // machine's answer to "does GetCursorPos see a SendInput move immediately?" is on record.
+  void warpGrabLogDecision(
+      const deskflow::WarpGrabTracker::Decision &d, int32_t sx, int32_t sy, POINT c, POINT landed, uint64_t now
+  );
   void deskEnter(Desk *desk);
   void deskLeave(Desk *desk, HKL keyLayout);
   void deskThread(const void *vdesk);

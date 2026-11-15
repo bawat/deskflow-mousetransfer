@@ -776,14 +776,18 @@ void MSWindowsDesks::deskTrackedMouseMove(int32_t x, int32_t y)
   // The read-back. Whether SendInput's absolute move is already reflected here is NOT something the
   // design relies on: the tracker compares against both the request and this read, and treats a
   // read that still shows the old point as "not landed yet" (WarpGrabTracker::chooseBase).
-  if (POINT landed; GetCursorPos(&landed)) {
+  POINT landed{d.inject.x, d.inject.y};
+  const bool landedRead = GetCursorPos(&landed) != 0;
+  if (landedRead) {
     m_warpGrab.noteLanded({landed.x, landed.y});
   }
 
-  warpGrabLogDecision(d, x, y, c, now);
+  warpGrabLogDecision(d, x, y, c, landedRead ? landed : POINT{INT32_MIN, INT32_MIN}, now);
 }
 
-void MSWindowsDesks::warpGrabLogDecision(const WarpGrabTracker::Decision &d, int32_t sx, int32_t sy, POINT c, uint64_t now)
+void MSWindowsDesks::warpGrabLogDecision(
+    const WarpGrabTracker::Decision &d, int32_t sx, int32_t sy, POINT c, POINT landed, uint64_t now
+)
 {
   if (d.entered) {
     m_wgSessionStartMs = now;
@@ -829,9 +833,10 @@ void MSWindowsDesks::warpGrabLogDecision(const WarpGrabTracker::Decision &d, int
 
   if (warpGrabTraceOn() && (d.tracked || d.token != WarpGrabTracker::kNoToken || d.entered)) {
     LOG_INFO(
-        "MT-warpgrab: S=%d,%d C=%d,%d -> %d,%d mode=%s base=%d,%d delta=%+d,%+d tok=%llx warp=%d chain=%s%s "
-        "resync=%s idle=%d",
-        sx, sy, c.x, c.y, d.inject.x, d.inject.y, warpGrabModeName(m_warpGrab.mode()), d.base.x, d.base.y, d.delta.x,
+        "MT-warpgrab: S=%d,%d C=%d,%d -> %d,%d landed=%ld,%ld mode=%s base=%d,%d delta=%+d,%+d tok=%llx warp=%d "
+        "chain=%s%s resync=%s idle=%d",
+        sx, sy, c.x, c.y, d.inject.x, d.inject.y, landed.x, landed.y, warpGrabModeName(m_warpGrab.mode()), d.base.x,
+        d.base.y, d.delta.x,
         d.delta.y, static_cast<unsigned long long>(d.token), d.warpObserved ? 1 : 0,
         m_warpGrab.dualChain() ? "dual" : "single",
         d.newChainWon ? "(new won)" : (d.oldChainStraggler ? "(old straggler)" : ""), warpGrabResyncName(d.resync),
