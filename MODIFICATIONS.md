@@ -1581,7 +1581,7 @@ swapped (`SM_SWAPBUTTON`), since the async state is physical and the up flag log
 `src/lib/deskflow/IPlatformScreen.h` + `Screen.{h,cpp}` (three inert pass-through hooks),
 `src/lib/client/Client.{h,cpp}`, `src/lib/client/ServerProxy.{h,cpp}`,
 `src/lib/platform/MSWindowsDesks.{h,cpp}` + `MSWindowsScreen.{h,cpp}`; tests
-`src/unittests/deskflow/WarpGrabTrackerTests.{h,cpp}` (20 cases). **Client-side only. No protocol
+`src/unittests/deskflow/WarpGrabTrackerTests.{h,cpp}` (23 cases). **Client-side only. No protocol
 change, no server change** -- it works against any server version.
 
 **Symptom:** Blender (continuous grab, value scrubbing, viewport wrap) on a CLIENT goes haywire --
@@ -1611,7 +1611,17 @@ and asks `WarpGrabTracker`:
   it can still be old-chain: after the ack the tracker keeps both anchors and attributes each move to
   the chain with the smaller delta until the new chain first wins. Unlike `onInfoChanged`, a resync
   does NOT set `m_ignoreMouse`; a FIFO of pending DINF kinds routes each (payload-less) CIAK, so only a
-  genuine info's ack clears `m_ignoreMouse`.
+  genuine info's ack clears `m_ignoreMouse`. The FIFO cannot drift in normal operation: the server
+  answers every DINF it accepts with exactly one CIAK, written synchronously in
+  `ClientProxy1_0::recvInfo` (handshake-phase reply via `parseHandshakeMessage`, every later one via
+  `parseMessage`; the 1_3/1_5 overrides delegate DINF to it). Its ONE silent refusal -- a non-positive
+  (int16) width or height -- is mirrored in `ServerProxy::sendInfo`, which never queues an entry the
+  server will not answer and never sends a resync it would reject.
+- **Ack timeout.** A resync still unacknowledged after `warpTimeoutMs` (the same 1 s: it is the same
+  "how long may the server's virtual cursor stay off-position" bound, and a healthy CIAK is one round
+  trip away) ABANDONS the session to stock on that move -- full reset, the server position injected
+  (one snap) -- with end reason `AckTimeout`, logged at INFO even if the session's start line was
+  rate-limited, because it means a CIAK went missing. A late ack is discarded by the id check.
 - **Reset to Idle (no resync)** on enter (before the enter move, which then seeds the tracker), leave,
   genuine shape change, disconnect and any relative (DMRM) move. Move compression in
   `ServerProxy::mouseMove` is untouched (diff-of-absolutes is coalescing-proof).
