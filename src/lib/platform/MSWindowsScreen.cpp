@@ -253,6 +253,59 @@ void MSWindowsScreen::disable()
   m_isOnScreen = m_isPrimary;
 }
 
+// MouseTransfer (cross-seam drag, 2026-11-15): on entering the PRIMARY screen, release any mouse
+// button the OS still reports down although this screen's hook saw the hand let go of it.
+//
+// Stock Deskflow cannot get here (a held button locks the cursor to its screen); this fork lets a
+// drag cross the seam, so the PRESS happens locally and the RELEASE happens while relaying — the
+// hook eats it and sends it to the client, and the local OS never hears it. The button then stays
+// "down" here until the user's next real release: the first click on returning is spent on it
+// (owner-reported "two clicks to type into my console" after dragging a window across; measured
+// with a passive watcher: OS left button down from the instant of re-entry, the first click
+// deactivated the window under it, the second activated it). The wrapper cannot repair this: it
+// runs at Medium integrity, and UIPI both DISCARDS its SendInput and blinds its GetAsyncKeyState
+// whenever the foreground is higher-integrity (this core's hider while away, an elevated console
+// after). This process is LocalSystem + UIAccess, so neither restriction applies.
+//
+// m_buttons is the hook's view of the PHYSICAL buttons (onMouseButton updates it for every press and
+// release, relayed or not); GetAsyncKeyState is the OS's. Only a button the hand has RELEASED but the
+// OS still holds is touched, so a button the user is really holding as they come back is left alone.
+// The release is tagged kDeskflowLocalInjectSignature: the hook delivers it locally, relays nothing,
+// and does not feed it back into m_buttons. Skipped when the buttons are swapped (SM_SWAPBUTTON):
+// GetAsyncKeyState reads PHYSICAL buttons while MOUSEEVENTF_*UP names LOGICAL ones, and guessing the
+// mapping could release the wrong button.
+static void mtReleaseStaleButtons(const bool *physicalDown)
+{
+  if (GetSystemMetrics(SM_SWAPBUTTON) != 0) {
+    return;
+  }
+  struct StaleButton
+  {
+    ButtonID id;
+    int vk;
+    DWORD upFlag;
+    const char *name;
+  };
+  const StaleButton buttons[] = {
+      {kButtonLeft, VK_LBUTTON, MOUSEEVENTF_LEFTUP, "left"},
+      {kButtonRight, VK_RBUTTON, MOUSEEVENTF_RIGHTUP, "right"},
+      {kButtonMiddle, VK_MBUTTON, MOUSEEVENTF_MIDDLEUP, "middle"},
+  };
+  for (const auto &b : buttons) {
+    if (physicalDown[b.id] || (GetAsyncKeyState(b.vk) & 0x8000) == 0) {
+      continue;
+    }
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = b.upFlag;
+    in.mi.dwExtraInfo = kDeskflowLocalInjectSignature;
+    const UINT n = SendInput(1, &in, sizeof(in));
+    LOG_INFO("MT-stalebutton: entering with the %s button held by the OS but released by the hand "
+             "(its release was relayed while away) - released it locally, injected=%u, nowDown=%d",
+             b.name, n, (GetAsyncKeyState(b.vk) & 0x8000) != 0 ? 1 : 0);
+  }
+}
+
 void MSWindowsScreen::enter()
 {
   m_desks->enter();
@@ -272,6 +325,9 @@ void MSWindowsScreen::enter()
     // OS keyboard on return, so local typing on the server is clean even if a modifier latched
     // internally while the cursor was away. See leave() for the full rationale.
     m_keyState->updateKeyState();
+
+    // MouseTransfer: a cross-seam drag's press is still down in this OS (see mtReleaseStaleButtons).
+    mtReleaseStaleButtons(m_buttons);
   } else {
     // Entering a secondary screen. Ensure that no screensaver is active
     // and that the screen is not in powersave mode.

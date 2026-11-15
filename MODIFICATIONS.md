@@ -1551,3 +1551,26 @@ minimised, not `WS_EX_TOOLWINDOW`/`WS_EX_NOACTIVATE`, non-empty). Nothing qualif
 nothing, as stock does for a window that has gone. One `LOG_INFO` line each time the rule fires.
 `DwmGetWindowAttribute` is looked up at run time, so the core gains no new import. Every other
 return home takes the identical stock path.
+
+## Release a cross-seam drag's stale mouse button on entering the primary screen (2026-11-15)
+
+**Files:** `src/lib/platform/MSWindowsScreen.cpp` (`mtReleaseStaleButtons`, called from `enter()` on the
+primary), `src/lib/platform/MSWindowsHook.{h,cpp}` (`kDeskflowLocalInjectSignature` moved to the header
+so the screen can tag its own injection).
+
+**Symptom (owner-reported):** after dragging a window across the seam (MouseTransfer's window handoff),
+the first return to the server took two clicks before the user's window took keyboard input.
+
+**Cause:** stock Deskflow locks the cursor to its screen while a button is held; this fork lets a drag
+cross, so the PRESS is local and the RELEASE happens while relaying — the hook eats it and relays it,
+and the local OS never hears it. The OS keeps the left button down until the user's next real release,
+which the first click on returning is spent on (measured: OS button down from the instant of re-entry;
+first click deactivated the window under it, second activated it). The wrapper's own repair attempt
+cannot work: it is Medium integrity, and UIPI discards its SendInput and blinds its GetAsyncKeyState
+whenever the foreground is higher-integrity (the hider while away; an elevated console afterwards).
+
+**Fix:** on entering the primary screen, for left/right/middle: if the hook's physical view
+(`m_buttons`, updated by `onMouseButton` for every press/release, relayed or not) says released but
+`GetAsyncKeyState` says down, inject a tagged (`kDeskflowLocalInjectSignature`) button-up — delivered
+locally, never relayed. One `MT-stalebutton` log line when it fires. Skipped when the buttons are
+swapped (`SM_SWAPBUTTON`), since the async state is physical and the up flag logical.

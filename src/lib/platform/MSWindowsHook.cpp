@@ -45,7 +45,7 @@ static const char *g_name = "dfwhook";
 // wrapper's picture-in-picture keyboard passthrough types into the machine whose
 // screen is being viewed, and a paired machine's own keyboard can drive the
 // active screen, neither of which can work if the core eats the injected key.
-static const ULONG_PTR kDeskflowLocalInjectSignature = 0x0DF10CA1; // "DF local"
+// (kDeskflowLocalInjectSignature itself is defined in MSWindowsHook.h, shared with MSWindowsScreen.)
 
 // Windows stamps every mouse event it SYNTHESIZES from pen/touch pointer input with this
 // signature in the upper 24 bits of dwExtraInfo (Microsoft, "Distinguishing Pen Input from

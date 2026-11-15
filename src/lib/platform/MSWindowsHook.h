@@ -12,6 +12,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+// Merged-fork: dwExtraInfo tag of a LOCAL injection — delivered to this machine's OS, never relayed
+// or eaten by the low-level hooks (see MSWindowsHook.cpp for the full contract). Shared here so the
+// screen can tag its own local injections with the same value.
+inline constexpr ULONG_PTR kDeskflowLocalInjectSignature = 0x0DF10CA1; // "DF local"
+
 #define DESKFLOW_MSG_MARK WM_APP + 0x0011         // mark id; <unused>
 #define DESKFLOW_MSG_KEY WM_APP + 0x0012          // vk code; key data
 #define DESKFLOW_MSG_MOUSE_BUTTON WM_APP + 0x0013 // button msg; <unused>
