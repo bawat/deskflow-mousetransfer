@@ -1581,7 +1581,7 @@ swapped (`SM_SWAPBUTTON`), since the async state is physical and the up flag log
 `src/lib/deskflow/IPlatformScreen.h` + `Screen.{h,cpp}` (three inert pass-through hooks),
 `src/lib/client/Client.{h,cpp}`, `src/lib/client/ServerProxy.{h,cpp}`,
 `src/lib/platform/MSWindowsDesks.{h,cpp}` + `MSWindowsScreen.{h,cpp}`; tests
-`src/unittests/deskflow/WarpGrabTrackerTests.{h,cpp}` (23 cases). **Client-side only. No protocol
+`src/unittests/deskflow/WarpGrabTrackerTests.{h,cpp}` (28 cases). **Client-side only. No protocol
 change, no server change** -- it works against any server version.
 
 **Symptom:** Blender (continuous grab, value scrubbing, viewport wrap) on a CLIENT goes haywire --
@@ -1595,10 +1595,21 @@ absolute move snaps the cursor back; the app reads the whole snap-back as travel
 **Fix:** the `DESKFLOW_MSG_FAKE_MOVE` handler (desk thread) reads the true cursor before injecting
 and asks `WarpGrabTracker`:
 
-- **Idle** (stock): inject the server position. Only if the cursor is more than the entry threshold
-  (2x the system drag rectangle, either axis) away from BOTH where we last asked for and where we last
-  read it back -- i.e. something else moved it -- is the grab token evaluated. Token != 0 => **Active**
-  without injecting the server position at all (zero snap-back): inject true cursor + server delta.
+- **Idle** (stock): inject the server position. The grab token is evaluated on EVERY move and
+  remembered (previous move's token, time a token was last seen). If the cursor is more than the
+  entry threshold (2x the system drag rectangle, either axis) away from BOTH where we last asked for
+  and where we last read it back -- i.e. something else moved it -- and there is grab evidence =>
+  **Active** without injecting the server position at all (zero snap-back): inject true cursor +
+  server delta. Grab evidence = the current token, or (**grab teardown**) the remembered one if the
+  previous move had a token or one was seen within `warpTimeoutMs`.
+- **Grab teardown (2026-11-15, live on .12).** An app restores the cursor AS it releases its grab
+  (Blender's hide-grab on button-up), so the restore is first seen on a move whose token is already
+  0. Lazily evaluating the token only on a discrepancy therefore snapped exactly that restore -- the
+  "teleport on release", both after a session that had timed out mid-scrub (Blender only warps at a
+  window edge, so a steady scrub stops warping) and for a short scrub that never warped. Adopting the
+  remembered token enters a session whose very next move ends it (token differs from the entry
+  token): the ordinary End resync re-seats the server on the true cursor, with no snap anywhere. An
+  adopted entry never recentres. `reset()` forgets the memory.
 - **Active**: every server move becomes a delta against the previous server position, injected at
   the true cursor (absolute injection, not `deskMouseRelativeMove`, which toggles acceleration per
   event). When the server's virtual cursor is within a quarter screen of an edge, the client sends a
@@ -1635,6 +1646,12 @@ never counts, and ClipCursor is not evidence at all (Explorer's move loop clips 
 Else an application-hidden cursor (`GetCursorInfo` flags == 0, foreground not ours) gives a distinct
 constant. An unreadable image path counts as NOT ours. Other platforms: the `IPlatformScreen` hooks
 default to inert, so X11/macOS/Ei are byte-identical.
+
+**`MT-warpgrab-snap` (permanent, capped):** a stock Idle injection on a DISPLACED move (no grab
+evidence qualified) that lands more than `kMtJumpDiagPx` (128, now shared from `MSWindowsScreen.h`)
+from the true cursor logs one INFO line: server pos, cursor before, last target/landed, current and
+previous-move token, ms since a token was seen, foreground image, button down. At most 32 per screen
+visit (MT-switchdiag's cap), reset at every enter/leave. It is the client-side twin of MT-jumpdiag.
 
 **Toggles:** default ON. Kill switch `MOUSETRANSFER_WARPGRAB=0` or a `warpgrab-off` file in the core's
 working directory; trace `MOUSETRANSFER_WARPGRAB_TRACE=1` or `warpgrab-trace` (one `MT-warpgrab` INFO
