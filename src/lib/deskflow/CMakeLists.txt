@@ -79,6 +79,8 @@ add_library(${lib_name} STATIC ${PLATFORM_CODE}
   ServerApp.h
   StreamChunker.cpp
   StreamChunker.h
+  WarpGrabTracker.cpp
+  WarpGrabTracker.h
   languages/LanguageManager.cpp
   languages/LanguageManager.h
   ipc/DaemonIpcServer.cpp
