@@ -99,7 +99,8 @@ void WarpGrabTrackerTests::firstMoveIsStockAndSeeds()
   auto d = s.move(500, 500);
   COMPARE_POINT(d.inject, 500, 500);
   QVERIFY(!d.tracked);
-  QCOMPARE(s.tokenCalls, 0);
+  QCOMPARE(s.tokenCalls, 1); // evaluated on every move, the seeding one included
+  QVERIFY(d.seeded);
   QCOMPARE(s.tr.mode(), Mode::Idle);
 }
 
@@ -112,7 +113,8 @@ void WarpGrabTrackerTests::noTriggerWithoutToken()
   // ...but nobody holds a grab, so stock behaviour: the server position wins.
   COMPARE_POINT(d.inject, 510, 500);
   QVERIFY(!d.tracked);
-  QCOMPARE(s.tokenCalls, 1);
+  QCOMPARE(s.tokenCalls, 2);
+  QVERIFY(d.displaced);
   QCOMPARE(s.tr.mode(), Mode::Idle);
   Point p;
   uint32_t id = 0;
@@ -127,7 +129,7 @@ void WarpGrabTrackerTests::noTriggerBelowMinDisplacement()
   s.cursor = {500 + kTestEntryMin, 500 - kTestEntryMin}; // exactly AT the threshold: not beyond it
   auto d = s.move(510, 500);
   COMPARE_POINT(d.inject, 510, 500);
-  QCOMPARE(s.tokenCalls, 0); // the token is not even evaluated
+  QVERIFY(!d.displaced); // AT the threshold is not beyond it
   QCOMPARE(s.tr.mode(), Mode::Idle);
 }
 
@@ -145,7 +147,7 @@ void WarpGrabTrackerTests::ownNudgeImmunity()
     COMPARE_POINT(d.inject, 500 + i, 500);
     QCOMPARE(s.tr.mode(), Mode::Idle);
   }
-  QCOMPARE(s.tokenCalls, 0);
+  QCOMPARE(s.tokenCalls, 21); // evaluated on every move, yet nothing ever counted as displaced
 }
 
 void WarpGrabTrackerTests::clampedTargetIsNotAWarp()
@@ -164,7 +166,8 @@ void WarpGrabTrackerTests::clampedTargetIsNotAWarp()
   d = tr.onServerMove({505, 500}, {500, 470}, provider, 8, shape);
   COMPARE_POINT(d.inject, 505, 500);
   QCOMPARE(tr.mode(), Mode::Idle);
-  QCOMPARE(calls, 0);
+  QVERIFY(!d.displaced);
+  QCOMPARE(calls, 2); // evaluated on every move
 }
 
 void WarpGrabTrackerTests::immediateEntryWithZeroSnapBack()
@@ -323,12 +326,11 @@ void WarpGrabTrackerTests::endOnTokenChange()
   QCOMPARE(s.tr.mode(), Mode::Idle);
   COMPARE_POINT(d.inject, 1320, 600);
 
-  // Idle again: stock absolute injection, and the token is not consulted without a discrepancy.
-  const int calls = s.tokenCalls;
+  // Idle again: stock absolute injection.
   d = s.move(1322, 601);
   QVERIFY(!d.tracked);
+  QVERIFY(!d.displaced);
   COMPARE_POINT(d.inject, 1322, 601);
-  QCOMPARE(s.tokenCalls, calls);
 }
 
 void WarpGrabTrackerTests::endOnTimeout()
@@ -550,6 +552,155 @@ void WarpGrabTrackerTests::lateAckAfterAbandonIsIgnored()
   d = s.move(r.x + 3, r.y);
   QVERIFY(d.newChainWon);
   QCOMPARE(s.tr.mode(), Mode::Active);
+}
+
+// The live .12 Blender value-scrub sequence (2026-11-15): enter on a warp, the steady scrub stops
+// warping so the 1 s timeout ends the session while capture is STILL held, the end resync settles, a
+// few stock moves follow, then on button-up Blender restores the cursor to where the drag began and
+// releases capture -- the restore is first seen on a move whose token is already 0. It must be
+// followed (cursor + delta), never snapped to the server position.
+void WarpGrabTrackerTests::teardownRestoreAfterTimeoutIsAdopted()
+{
+  Sim s;
+  s.token = kGrab; // button down: capture held from the first move
+  s.move(1000, 424);
+  auto d = s.move(1010, 424);
+  QVERIFY(!d.tracked);
+  QCOMPARE(s.tr.mode(), Mode::Idle);
+
+  s.cursor = {300, 424}; // hide-grab warp at the window edge
+  d = s.move(1020, 424);
+  QVERIFY(d.entered);
+  COMPARE_POINT(d.inject, 310, 424);
+
+  // Steady scrub, no more warps: the warp timeout ends it, capture still held.
+  int32_t x = 1020;
+  int guard = 0;
+  do {
+    x += 2;
+    d = s.move(x, 424, 100);
+    QVERIFY(++guard < 20);
+  } while (d.ended == EndReason::None);
+  QCOMPARE(d.ended, EndReason::WarpTimeout);
+  QCOMPARE(d.resync, ResyncKind::End);
+  Point r;
+  uint32_t id = 0;
+  QVERIFY(s.takeResync(r, id));
+  COMPARE_POINT(r, d.inject.x, d.inject.y);
+  s.tr.onResyncAcknowledged(id);
+  d = s.move(r.x + 2, r.y);
+  QVERIFY(d.returnedToIdle);
+  COMPARE_POINT(d.inject, r.x + 2, r.y);
+
+  // Back in Idle with the token still held: ordinary stock moves.
+  d = s.move(r.x + 5, r.y);
+  QVERIFY(!d.tracked);
+  QCOMPARE(d.token, kGrab);
+  COMPARE_POINT(d.inject, r.x + 5, r.y);
+
+  // Button up: Blender restores the cursor far away and releases capture.
+  s.token = WarpGrabTracker::kNoToken;
+  s.cursor = {1600, 900};
+  d = s.move(r.x + 8, r.y);
+  QVERIFY(d.entered);
+  QVERIFY(d.adoptedRemembered);
+  QCOMPARE(d.entryToken, kGrab);
+  COMPARE_POINT(d.inject, 1603, 900);
+  QVERIFY(d.inject.x != r.x + 8 || d.inject.y != r.y); // NOT the server position: no teleport
+
+  // The next move's token (0) differs from the entry token: End resync on the true cursor.
+  d = s.move(r.x + 10, r.y);
+  QCOMPARE(d.ended, EndReason::TokenChanged);
+  QCOMPARE(d.resync, ResyncKind::End);
+  COMPARE_POINT(d.inject, 1605, 900);
+  Point e;
+  uint32_t eid = 0;
+  QVERIFY(s.takeResync(e, eid));
+  COMPARE_POINT(e, 1605, 900);
+  s.tr.onResyncAcknowledged(eid);
+  d = s.move(1605 + 1, 900); // the server now continues from the true cursor
+  QVERIFY(d.returnedToIdle);
+  COMPARE_POINT(d.inject, 1606, 900);
+  d = s.move(1608, 900);
+  QVERIFY(!d.tracked);
+  COMPARE_POINT(d.inject, 1608, 900);
+  QCOMPARE(s.tr.mode(), Mode::Idle);
+}
+
+void WarpGrabTrackerTests::teardownRestoreOfShortScrubIsAdopted()
+{
+  // A scrub that never reached an edge: no warp, no session -- but capture was held on every move.
+  Sim s;
+  s.token = kGrab;
+  s.move(800, 500);
+  for (int32_t i = 1; i <= 5; ++i) {
+    auto d = s.move(800 + i * 4, 500);
+    QVERIFY(!d.tracked);
+  }
+  s.token = WarpGrabTracker::kNoToken;
+  s.cursor = {400, 300}; // restored to where the drag began, capture released
+  auto d = s.move(823, 500);
+  QVERIFY(d.entered);
+  QVERIFY(d.adoptedRemembered);
+  COMPARE_POINT(d.inject, 403, 300);
+  d = s.move(825, 500);
+  QCOMPARE(d.ended, EndReason::TokenChanged);
+  QCOMPARE(d.resync, ResyncKind::End);
+  COMPARE_POINT(d.inject, 405, 300);
+}
+
+void WarpGrabTrackerTests::teardownRestoreWithinGraceIsAdopted()
+{
+  // Capture is released one move BEFORE the restore is seen.
+  Sim s;
+  s.token = kGrab;
+  s.move(800, 500);
+  s.move(804, 500);
+  s.token = WarpGrabTracker::kNoToken;
+  auto d = s.move(808, 500); // released, nothing displaced yet
+  QVERIFY(!d.tracked);
+  QCOMPARE(d.prevMoveToken, kGrab);
+  s.cursor = {400, 300};
+  d = s.move(812, 500, 50); // the restore: previous move had no token, but one was seen 58 ms ago
+  QCOMPARE(d.prevMoveToken, WarpGrabTracker::kNoToken);
+  QVERIFY(d.msSinceTokenSeen <= kTestTimeoutMs);
+  QVERIFY(d.entered);
+  QVERIFY(d.adoptedRemembered);
+  COMPARE_POINT(d.inject, 404, 300);
+}
+
+void WarpGrabTrackerTests::displacementWithNoRecentTokenStillSnaps()
+{
+  Sim s;
+  s.token = kGrab;
+  s.move(800, 500);
+  s.token = WarpGrabTracker::kNoToken;
+  s.move(804, 500);
+  s.move(808, 500, kTestTimeoutMs + 1); // the grace window has passed
+  s.cursor = {400, 300};
+  auto d = s.move(812, 500);
+  QVERIFY(d.displaced);
+  QVERIFY(!d.entered);
+  QVERIFY(!d.tracked);
+  COMPARE_POINT(d.inject, 812, 500); // stock, unchanged: the snap
+  QCOMPARE(s.tr.mode(), Mode::Idle);
+}
+
+void WarpGrabTrackerTests::resetForgetsRememberedToken()
+{
+  Sim s;
+  s.token = kGrab;
+  s.move(800, 500);
+  s.move(804, 500);
+  s.tr.reset(); // leave / enter / shape change / disconnect / relative move
+  s.token = WarpGrabTracker::kNoToken;
+  s.move(900, 500); // seeding move after the reset
+  s.cursor = {400, 300};
+  auto d = s.move(904, 500, 1);
+  QVERIFY(d.displaced);
+  QVERIFY(!d.entered);
+  QCOMPARE(d.msSinceTokenSeen, int64_t{-1});
+  COMPARE_POINT(d.inject, 904, 500);
 }
 
 QTEST_MAIN(WarpGrabTrackerTests)

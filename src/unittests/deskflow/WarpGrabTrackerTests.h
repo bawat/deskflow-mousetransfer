@@ -31,4 +31,9 @@ private Q_SLOTS:
   void ackTimeoutAbandonsActive();
   void ackTimeoutAbandonsEnding();
   void lateAckAfterAbandonIsIgnored();
+  void teardownRestoreAfterTimeoutIsAdopted();
+  void teardownRestoreOfShortScrubIsAdopted();
+  void teardownRestoreWithinGraceIsAdopted();
+  void displacementWithNoRecentTokenStillSnaps();
+  void resetForgetsRememberedToken();
 };

@@ -48,7 +48,11 @@ public:
   //! Identity of "who has grabbed the cursor". 0 means nobody, which keeps the tracker inert.
   using Token = uint64_t;
   static constexpr Token kNoToken = 0;
-  //! Evaluated lazily: in Idle only once a discrepancy has been seen, in Active once per move.
+  //! Evaluated once on EVERY server move, in every mode. It used to be lazy in Idle (only after a
+  //! discrepancy), and that is exactly what made grab TEARDOWN snap: an app restores the cursor as
+  //! it releases its grab, so by the time the restore is seen the evidence (capture, hidden cursor)
+  //! is already gone. The tracker therefore remembers the token of the previous move and when a
+  //! token was last seen, and adopts the remembered one for a displacement that follows it.
   using TokenProvider = std::function<Token()>;
 
   struct Point
@@ -75,7 +79,9 @@ public:
     //! Positions within this many pixels are "the same point" -- the round-trip error of the
     //! platform's absolute-injection coordinate normalisation. Used for warp liveness in Active.
     int32_t roundingPx = 0;
-    //! Active ends once no warp has been observed for this long. ALSO the bound on how long a resync
+    //! Active ends once no warp has been observed for this long. ALSO the teardown grace window (a
+    //! displacement in Idle adopts a token seen this recently -- the app may release its grab a move
+    //! before it restores the cursor), and the bound on how long a resync
     //! may stay unacknowledged before the session is abandoned (see onServerMove): both are "how long
     //! may the server's virtual cursor stay off-position", the same policy question. The ack itself is
     //! written synchronously inside the server's recvInfo, so a healthy one arrives within a network
@@ -117,7 +123,15 @@ public:
     bool warpObserved = false;            //!< Active/Ending: the cursor was moved by someone else
     bool newChainWon = false;             //!< the post-ack ambiguity resolved on this move
     bool oldChainStraggler = false;       //!< attributed to the old chain while both were live
-    Token token = kNoToken;               //!< the token as evaluated on this move (if it was)
+    Token token = kNoToken;               //!< the token as evaluated on this move
+    Token entryToken = kNoToken;          //!< entered: the token the session is keyed on
+    bool adoptedRemembered = false;       //!< entered on a REMEMBERED token (grab teardown)
+    bool displaced = false;               //!< Idle: cursor moved beyond the entry threshold by someone else
+    Token prevMoveToken = kNoToken;       //!< the token seen on the previous move
+    int64_t msSinceTokenSeen = -1;        //!< ms since a non-zero token was last seen (-1 = never)
+    Point prevTarget;                     //!< last target BEFORE this move (diagnostics)
+    Point prevLanded;                     //!< last read-back BEFORE this move (diagnostics)
+    bool seeded = false;                  //!< first move after a reset (no history)
     Point base;                           //!< delta mode: the point the delta was added to
     Point delta;                          //!< delta mode: the server delta applied
   };
@@ -187,6 +201,12 @@ private:
   Point m_prevS;      // last server position on the current (old) chain
   Point m_lastTarget; // last position we asked the OS for
   Point m_lastLanded; // true cursor read right after that injection
+
+  // Token memory (grab-teardown adoption). Cleared by reset().
+  Token m_prevMoveToken = kNoToken;  // token seen on the previous move
+  Token m_lastSeenToken = kNoToken;  // most recent non-zero token
+  int64_t m_lastTokenSeenMs = 0;
+  bool m_haveSeenToken = false;
 
   // Session.
   Token m_entryToken = kNoToken;

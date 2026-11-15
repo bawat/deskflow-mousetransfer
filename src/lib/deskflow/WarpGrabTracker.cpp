@@ -147,23 +147,50 @@ WarpGrabTracker::Decision
 WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &token, int64_t nowMs, const Shape &shape)
 {
   Decision d;
+  d.prevTarget = m_lastTarget;
+  d.prevLanded = m_lastLanded;
+
+  // The token, on EVERY move (see TokenProvider for why lazily is not good enough), and the memory
+  // the next move needs: what the previous move saw, and when a token was last seen at all.
+  const Token t = token ? token() : kNoToken;
+  d.token = t;
+  const Token prevMoveToken = m_prevMoveToken;
+  const Token remembered = m_lastSeenToken;
+  const bool seenWithinGrace = m_haveSeenToken && nowMs - m_lastTokenSeenMs <= m_config.warpTimeoutMs;
+  d.prevMoveToken = prevMoveToken;
+  d.msSinceTokenSeen = m_haveSeenToken ? nowMs - m_lastTokenSeenMs : -1;
+  m_prevMoveToken = t;
+  if (t != kNoToken) {
+    m_lastSeenToken = t;
+    m_lastTokenSeenMs = nowMs;
+    m_haveSeenToken = true;
+  }
 
   if (!m_haveHistory) {
     // First move after a reset (e.g. the enter move): stock injection, and it seeds the chain.
     m_prevS = server;
     commit(server);
     d.inject = server;
+    d.seeded = true;
     return d;
   }
 
   if (m_mode == Mode::Idle) {
-    Token t = kNoToken;
+    Token effective = kNoToken;
     if (differsFromBoth(cursor, m_config.entryMinDx, m_config.entryMinDy)) {
-      // Only now is the (comparatively expensive) token worth evaluating.
-      t = token ? token() : kNoToken;
-      d.token = t;
+      d.displaced = true;
+      // Grab evidence NOW, or -- the teardown case -- evidence that was there a moment ago: the app
+      // restores the cursor as it releases its grab, so the restore is routinely first SEEN on a move
+      // whose token is already 0. Either the previous move had a token, or one was seen within the
+      // grace window (the app may release one move before it restores).
+      if (t != kNoToken) {
+        effective = t;
+      } else if (prevMoveToken != kNoToken || seenWithinGrace) {
+        effective = remembered;
+        d.adoptedRemembered = effective != kNoToken;
+      }
     }
-    if (t == kNoToken) {
+    if (effective == kNoToken) {
       // Stock behaviour, byte for byte: inject the server position.
       m_prevS = server;
       commit(server);
@@ -171,9 +198,12 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
       return d;
     }
 
-    // ENTER without injecting the server position at all -- no snap-back, not even once.
+    // ENTER without injecting the server position at all -- no snap-back, not even once. Entered on
+    // a remembered token, the very next move's token differs from it, so the ordinary end path
+    // re-seats the server on the true cursor (End resync) and returns to Idle -- no snap anywhere.
     m_mode = Mode::Active;
-    m_entryToken = t;
+    m_entryToken = effective;
+    d.entryToken = effective;
     m_lastWarpMs = nowMs;
     d.entered = true;
     d.warpObserved = true;
@@ -181,7 +211,9 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
     d.base = cursor;
     d.delta = chainDelta(server, d);
     const Point target = clampTo({cursor.x + d.delta.x, cursor.y + d.delta.y}, shape);
-    if (m_pendingId == 0 && !m_dual && nearEdge(server, shape)) {
+    // No recentre for an adopted (teardown) entry: that session ends on the very next move, and a
+    // recentre in flight would only defer its End resync by a round trip.
+    if (!d.adoptedRemembered && m_pendingId == 0 && !m_dual && nearEdge(server, shape)) {
       issueResync({shape.x + shape.w / 2, shape.y + shape.h / 2}, ResyncKind::Recentre, d, nowMs);
     }
     commit(target);
@@ -234,8 +266,6 @@ WarpGrabTracker::onServerMove(Point server, Point cursor, const TokenProvider &t
   }
 
   // Active.
-  const Token t = token ? token() : kNoToken;
-  d.token = t;
   if (t != m_entryToken) {
     d.ended = EndReason::TokenChanged;
   } else if (nowMs - m_lastWarpMs > m_config.warpTimeoutMs) {
@@ -294,6 +324,10 @@ void WarpGrabTracker::onResyncAcknowledged(uint32_t id)
 void WarpGrabTracker::reset()
 {
   goIdle();
+  m_prevMoveToken = kNoToken;
+  m_lastSeenToken = kNoToken;
+  m_lastTokenSeenMs = 0;
+  m_haveSeenToken = false;
   m_haveHistory = false;
   m_pendingId = 0;
   m_requestReady = false;
