@@ -1712,3 +1712,18 @@ the known harmless lagging-warp case).
 desktop for this LocalSystem+UIAccess core (inferred: the same desk thread injects input there for the
 UAC-control feature), and the end-to-end owner procedure in the wrapper repo's
 `testing/designs/secure-desk-return-test-design.md`.
+
+## A window being handed off stops following the cursor before the screen is left (2026-11-18)
+
+`MSWindowsScreen::leave()` now starts with `mtDropDraggedWindowBeforeLeave()`. Leaving warps the
+cursor (the primary parks it mid-screen); a window in its modal move loop follows, so a window being
+dragged across the seam jumped to the park spot and was visible there for a frame or more before the
+MouseTransfer wrapper -- which hears of the crossing only from this process's output -- hid it.
+
+If a `leave-drop` file exists in the working directory (env override `MOUSETRANSFER_LEAVEDROPFILE`)
+naming a window handle in decimal, and that exact window is the one the foreground thread is moving
+(`GetGUIThreadInfo`, `GUI_INMOVESIZE`), the left button is released locally (tagged
+`kDeskflowLocalInjectSignature`, so nothing is relayed and `m_buttons` is untouched) and the function
+waits up to 50 ms for the move loop to end. One `MT-leavedrop` INFO line per use. With no file --
+stock Deskflow never writes one -- the cost is one failed file open per leave and behaviour is
+unchanged.

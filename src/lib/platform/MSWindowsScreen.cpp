@@ -322,6 +322,76 @@ static void mtReleaseStaleButtons(const bool *physicalDown)
   }
 }
 
+// MouseTransfer (RDP window handoff, 2026-11-18): END the title-bar drag of a window the wrapper is
+// about to hand to another machine, BEFORE this screen is left.
+//
+// Leaving warps the cursor away from where the hand had it (the primary parks it mid-screen; a
+// secondary hides it). A window being dragged is in its modal move loop and follows the cursor, so
+// it jumped to the park spot and was visibly THERE until the wrapper -- which only learns of the
+// crossing from this process's output, some milliseconds later -- made it invisible. Owner report:
+// "there's still a frame where I can see it flicker at the centre of the screen". Only this process
+// knows the instant of the warp, so only it can act before it.
+//
+// What it does: if the wrapper has named a window in the `leave-drop` file (it does so while a
+// window it would hand off is being dragged toward a seam) AND that exact window is the one the
+// foreground thread is moving right now (GUI_INMOVESIZE), release the left button locally and wait,
+// briefly and boundedly, for the move loop to end. The window then stays where the hand left it, at
+// the seam edge, and the warp that follows moves nothing.
+//
+// Safe by construction: with no file this is one failed open per leave and stock behaviour; a stale
+// file names a window that is not being moved, which is a no-op; and it never names a window itself.
+// The release is tagged kDeskflowLocalInjectSignature exactly like mtReleaseStaleButtons' -- the hook
+// delivers it locally, relays nothing and does not feed it into m_buttons, so the server still knows
+// the hand is DOWN and still relays the real release to the screen the cursor is on. Skipped when
+// the buttons are swapped, for mtReleaseStaleButtons' reason.
+static void mtDropDraggedWindowBeforeLeave()
+{
+  const char *env = std::getenv("MOUSETRANSFER_LEAVEDROPFILE");
+  const char *file = (env != nullptr && *env != '\0') ? env : "leave-drop";
+  const HANDLE h = CreateFileA(
+      file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL, nullptr
+  );
+  if (h == INVALID_HANDLE_VALUE) {
+    return; // the ordinary case: nothing is being handed off
+  }
+  char buf[32] = {};
+  DWORD n = 0;
+  ReadFile(h, buf, sizeof(buf) - 1, &n, nullptr);
+  CloseHandle(h);
+  const unsigned long long want = std::strtoull(buf, nullptr, 10);
+  if (want == 0 || GetSystemMetrics(SM_SWAPBUTTON) != 0) {
+    return;
+  }
+  GUITHREADINFO gti{};
+  gti.cbSize = sizeof(gti);
+  if (!GetGUIThreadInfo(0, &gti) || (gti.flags & GUI_INMOVESIZE) == 0 || gti.hwndMoveSize == nullptr ||
+      static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(gti.hwndMoveSize)) != want) {
+    return;
+  }
+  INPUT in{};
+  in.type = INPUT_MOUSE;
+  in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+  in.mi.dwExtraInfo = kDeskflowLocalInjectSignature;
+  const UINT sent = SendInput(1, &in, sizeof(in));
+  // The loop must have SEEN the release before the cursor moves, or it would follow the warp first.
+  // Bounded: a window that will not let go costs this one leave 50 ms, never a hang.
+  const DWORD t0 = GetTickCount();
+  bool ended = false;
+  while (GetTickCount() - t0 < 50) {
+    GUITHREADINFO g{};
+    g.cbSize = sizeof(g);
+    if (!GetGUIThreadInfo(0, &g) || (g.flags & GUI_INMOVESIZE) == 0) {
+      ended = true;
+      break;
+    }
+    Sleep(1);
+  }
+  LOG_INFO("MT-leavedrop: ended the drag of window 0x%llx before leaving (injected=%u, moveLoopEnded=%d, "
+           "waited=%lums)",
+           want, sent, ended ? 1 : 0, static_cast<unsigned long>(GetTickCount() - t0));
+}
+
 void MSWindowsScreen::enter()
 {
   m_desks->enter();
@@ -379,6 +449,10 @@ bool MSWindowsScreen::canLeave()
 
 void MSWindowsScreen::leave()
 {
+  // MouseTransfer: a window being handed off stops following the cursor BEFORE the cursor is
+  // warped away (see mtDropDraggedWindowBeforeLeave). First, ahead of everything that moves it.
+  mtDropDraggedWindowBeforeLeave();
+
   // get keyboard layout of foreground window.  we'll use this
   // keyboard layout for translating keys sent to clients.
   m_keyLayout = AppUtilWindows::instance().getCurrentKeyboardLayout();
